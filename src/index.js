@@ -20,7 +20,7 @@ const PRICE_ORACLE_IDS = (process.env.PRICE_ORACLE_IDS || process.env.PRICE_ORAC
 
 const FREQUENCY = process.env.FREQUENCY || 'hourly';
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
-const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 1;
+const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 2;
 const TARGET_PROFIT_PCT = process.env.TARGET_PROFIT_PCT ? Number(process.env.TARGET_PROFIT_PCT) : 12;
 const STOP_LOSS_PCT = process.env.STOP_LOSS_PCT ? Number(process.env.STOP_LOSS_PCT) : -8;
 const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 150;
@@ -33,7 +33,9 @@ const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND)
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
 const STATE_FILE = process.env.STATE_FILE || path.join('data', 'state.json');
 const TRADES_LOG_FILE = process.env.TRADES_LOG_FILE || path.join('data', 'trades.log');
+const TRADES_CSV_FILE = process.env.TRADES_CSV_FILE || path.join('data', 'trades.csv');
 const SUMMARY_FILE = process.env.SUMMARY_FILE || path.join('data', 'summary.json');
+const ANALYTICS_FILE = process.env.ANALYTICS_FILE || path.join('data', 'analytics.json');
 
 // Validation
 if (!RPC_URL) {
@@ -95,7 +97,7 @@ function markMarketCompleted(addr, marketAddress) {
 }
 
 // ========= Trade Logging =========
-function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, amount, pnl = null, pnlPct = null) {
+function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, amount, pnl = null, pnlPct = null, entryPrice = null, exitPrice = null, holdTimeMinutes = null, gasUsed = null) {
   const timestamp = new Date().toISOString();
   const record = {
     timestamp,
@@ -105,23 +107,176 @@ function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, am
     outcome,
     action, // 'BUY' or 'SELL'
     amount,
+    entryPrice,
+    exitPrice,
     pnl: pnl !== null ? Number(pnl) : null,
-    pnlPct: pnlPct !== null ? Number(pnlPct) : null
+    pnlPct: pnlPct !== null ? Number(pnlPct) : null,
+    holdTimeMinutes,
+    gasUsed: gasUsed !== null ? Number(gasUsed) : null
   };
   
   tradeHistory.push(record);
   
-  // Append to log file
+  // Append to human-readable log file
   try {
     ensureDirSync(path.dirname(TRADES_LOG_FILE));
-    const logLine = `${timestamp} | ${walletAddress.slice(0, 8)} | ${action} | ${marketTitle} | Outcome ${outcome} | Amount: ${amount}${pnl !== null ? ` | PnL: ${pnlPct.toFixed(2)}%` : ''}\n`;
-    fs.appendFileSync(TRADES_LOG_FILE, logLine);
+    if (action === 'BUY') {
+      const logLine = `${timestamp} | ${walletAddress.slice(0, 8)} | BUY | ${marketTitle} | Outcome ${outcome} | Amount: ${amount} | Price: ${entryPrice}%\n`;
+      fs.appendFileSync(TRADES_LOG_FILE, logLine);
+    } else {
+      const logLine = `${timestamp} | ${walletAddress.slice(0, 8)} | SELL | ${marketTitle} | Outcome ${outcome} | Amount: ${amount} | PnL: ${pnlPct.toFixed(2)}% | Hold: ${holdTimeMinutes}m | Gas: ${gasUsed.toFixed(4)}\n`;
+      fs.appendFileSync(TRADES_LOG_FILE, logLine);
+    }
   } catch (e) {
     console.warn('Failed to write trade log:', e.message);
   }
   
+  // Append to CSV for analysis
+  try {
+    ensureDirSync(path.dirname(TRADES_CSV_FILE));
+    const csvExists = fs.existsSync(TRADES_CSV_FILE);
+    
+    if (!csvExists) {
+      // Write header
+      const header = 'timestamp,wallet,market,marketTitle,outcome,action,amount,entryPrice,exitPrice,pnl,pnlPct,holdTimeMinutes,gasUsed\n';
+      fs.writeFileSync(TRADES_CSV_FILE, header);
+    }
+    
+    const csvLine = `${timestamp},${walletAddress},${marketAddress},"${marketTitle}",${outcome},${action},${amount},${entryPrice || ''},${exitPrice || ''},${pnl || ''},${pnlPct || ''},${holdTimeMinutes || ''},${gasUsed || ''}\n`;
+    fs.appendFileSync(TRADES_CSV_FILE, csvLine);
+  } catch (e) {
+    console.warn('Failed to write CSV:', e.message);
+  }
+  
   // Update summary
   updateSummary();
+  
+  // Update analytics
+  updateAnalytics();
+}
+
+function updateAnalytics() {
+  try {
+    ensureDirSync(path.dirname(ANALYTICS_FILE));
+    
+    const completedTrades = tradeHistory.filter(t => t.action === 'SELL' && t.pnl !== null);
+    
+    if (completedTrades.length === 0) return;
+    
+    // Overall stats
+    const wins = completedTrades.filter(t => t.pnl > 0);
+    const losses = completedTrades.filter(t => t.pnl < 0);
+    const totalPnL = completedTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+    const totalGas = completedTrades.reduce((sum, t) => sum + (t.gasUsed || 0), 0);
+    const netPnL = totalPnL - totalGas;
+    
+    // By outcome
+    const outcome0Trades = completedTrades.filter(t => t.outcome === 0);
+    const outcome1Trades = completedTrades.filter(t => t.outcome === 1);
+    
+    const outcome0Wins = outcome0Trades.filter(t => t.pnl > 0).length;
+    const outcome1Wins = outcome1Trades.filter(t => t.pnl > 0).length;
+    
+    // By price range at entry
+    const priceRanges = {
+      '50-60': completedTrades.filter(t => t.entryPrice >= 50 && t.entryPrice < 60),
+      '60-70': completedTrades.filter(t => t.entryPrice >= 60 && t.entryPrice < 70),
+      '70-80': completedTrades.filter(t => t.entryPrice >= 70 && t.entryPrice < 80),
+      '80-90': completedTrades.filter(t => t.entryPrice >= 80 && t.entryPrice < 90),
+      '90-100': completedTrades.filter(t => t.entryPrice >= 90)
+    };
+    
+    const priceRangeStats = {};
+    for (const [range, trades] of Object.entries(priceRanges)) {
+      if (trades.length > 0) {
+        const rangeWins = trades.filter(t => t.pnl > 0).length;
+        const avgPnL = trades.reduce((sum, t) => sum + t.pnlPct, 0) / trades.length;
+        priceRangeStats[range] = {
+          count: trades.length,
+          wins: rangeWins,
+          winRate: ((rangeWins / trades.length) * 100).toFixed(1) + '%',
+          avgPnLPct: avgPnL.toFixed(2) + '%'
+        };
+      }
+    }
+    
+    // Hold time analysis
+    const avgHoldTime = completedTrades.reduce((sum, t) => sum + (t.holdTimeMinutes || 0), 0) / completedTrades.length;
+    const shortTrades = completedTrades.filter(t => t.holdTimeMinutes < 15);
+    const mediumTrades = completedTrades.filter(t => t.holdTimeMinutes >= 15 && t.holdTimeMinutes < 30);
+    const longTrades = completedTrades.filter(t => t.holdTimeMinutes >= 30);
+    
+    // Best and worst trades
+    const sortedByPnL = [...completedTrades].sort((a, b) => b.pnlPct - a.pnlPct);
+    const bestTrades = sortedByPnL.slice(0, 5).map(t => ({
+      market: t.marketTitle,
+      outcome: t.outcome,
+      pnlPct: t.pnlPct.toFixed(2) + '%',
+      entryPrice: t.entryPrice + '%',
+      holdTime: t.holdTimeMinutes + 'm'
+    }));
+    const worstTrades = sortedByPnL.slice(-5).reverse().map(t => ({
+      market: t.marketTitle,
+      outcome: t.outcome,
+      pnlPct: t.pnlPct.toFixed(2) + '%',
+      entryPrice: t.entryPrice + '%',
+      holdTime: t.holdTimeMinutes + 'm'
+    }));
+    
+    const analytics = {
+      lastUpdated: new Date().toISOString(),
+      summary: {
+        totalTrades: completedTrades.length,
+        wins: wins.length,
+        losses: losses.length,
+        winRate: ((wins.length / completedTrades.length) * 100).toFixed(2) + '%',
+        totalPnL: totalPnL.toFixed(4),
+        totalGas: totalGas.toFixed(4),
+        netPnL: netPnL.toFixed(4),
+        avgPnLPerTrade: (totalPnL / completedTrades.length).toFixed(4),
+        avgPnLPct: (completedTrades.reduce((sum, t) => sum + t.pnlPct, 0) / completedTrades.length).toFixed(2) + '%',
+        avgHoldTimeMinutes: avgHoldTime.toFixed(1)
+      },
+      byOutcome: {
+        outcome0: {
+          trades: outcome0Trades.length,
+          wins: outcome0Wins,
+          winRate: outcome0Trades.length > 0 ? ((outcome0Wins / outcome0Trades.length) * 100).toFixed(1) + '%' : '0%',
+          avgPnLPct: outcome0Trades.length > 0 ? (outcome0Trades.reduce((sum, t) => sum + t.pnlPct, 0) / outcome0Trades.length).toFixed(2) + '%' : '0%'
+        },
+        outcome1: {
+          trades: outcome1Trades.length,
+          wins: outcome1Wins,
+          winRate: outcome1Trades.length > 0 ? ((outcome1Wins / outcome1Trades.length) * 100).toFixed(1) + '%' : '0%',
+          avgPnLPct: outcome1Trades.length > 0 ? (outcome1Trades.reduce((sum, t) => sum + t.pnlPct, 0) / outcome1Trades.length).toFixed(2) + '%' : '0%'
+        }
+      },
+      byEntryPriceRange: priceRangeStats,
+      byHoldTime: {
+        short: {
+          label: '< 15 minutes',
+          count: shortTrades.length,
+          avgPnLPct: shortTrades.length > 0 ? (shortTrades.reduce((sum, t) => sum + t.pnlPct, 0) / shortTrades.length).toFixed(2) + '%' : '0%'
+        },
+        medium: {
+          label: '15-30 minutes',
+          count: mediumTrades.length,
+          avgPnLPct: mediumTrades.length > 0 ? (mediumTrades.reduce((sum, t) => sum + t.pnlPct, 0) / mediumTrades.length).toFixed(2) + '%' : '0%'
+        },
+        long: {
+          label: '30+ minutes',
+          count: longTrades.length,
+          avgPnLPct: longTrades.length > 0 ? (longTrades.reduce((sum, t) => sum + t.pnlPct, 0) / longTrades.length).toFixed(2) + '%' : '0%'
+        }
+      },
+      bestTrades,
+      worstTrades
+    };
+    
+    fs.writeFileSync(ANALYTICS_FILE, JSON.stringify(analytics, null, 2));
+  } catch (e) {
+    console.warn('Failed to update analytics:', e.message);
+  }
 }
 
 function updateSummary() {
@@ -342,16 +497,22 @@ async function fetchAllMarkets() {
 
 // ========= Strategy =========
 function pickOutcome(prices) {
+  const [p0, p1] = prices;
+  
   if (STRATEGY_MODE === 'dominant') {
-    const p0ok = prices[0] >= TRIGGER_PCT;
-    const p1ok = prices[1] >= TRIGGER_PCT;
-    if (p0ok || p1ok) return prices[0] >= prices[1] ? 0 : 1;
+    // DOMINANT: Buy the side that is >= TRIGGER_PCT (choose the higher if both)
+    const p0ok = p0 >= TRIGGER_PCT;
+    const p1ok = p1 >= TRIGGER_PCT;
+    if (p0ok || p1ok) {
+      return p0 >= p1 ? 0 : 1;
+    }
     return null;
   } else {
+    // OPPOSITE/CONTRARIAN: if a side is within TRIGGER_BAND of TRIGGER_PCT, buy the opposite side
     const low = TRIGGER_PCT - TRIGGER_BAND;
     const high = TRIGGER_PCT + TRIGGER_BAND;
-    if (prices[0] >= low && prices[0] <= high) return 1;
-    if (prices[1] >= low && prices[1] <= high) return 0;
+    if (p0 >= low && p0 <= high) return 1;
+    if (p1 >= low && p1 <= high) return 0;
     return null;
   }
 }
@@ -535,17 +696,40 @@ async function getContracts(wallet, provider, marketAddress, collateralTokenAddr
     const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
     const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
     
-    // Try to get conditionalTokens address
+    // Try to get conditionalTokens address with multiple strategies
     let conditionalTokensAddress;
     try {
+      // Strategy 1: Direct call
       conditionalTokensAddress = await market.conditionalTokens();
       
       // Verify it returned a valid address
       if (!conditionalTokensAddress || conditionalTokensAddress === ethers.ZeroAddress) {
-        throw new Error('conditionalTokens returned zero address');
+        throw new Error('returned zero address');
       }
     } catch (e) {
-      throw new Error(`Failed to get conditionalTokens address: ${e.message}`);
+      // Strategy 2: Try with staticCall
+      try {
+        conditionalTokensAddress = await market.conditionalTokens.staticCall();
+        if (!conditionalTokensAddress || conditionalTokensAddress === ethers.ZeroAddress) {
+          throw new Error('returned zero address');
+        }
+      } catch (e2) {
+        // Strategy 3: Manual encoding
+        try {
+          const iface = market.interface;
+          const data = iface.encodeFunctionData('conditionalTokens', []);
+          const result = await provider.call({
+            to: marketAddress,
+            data: data
+          });
+          conditionalTokensAddress = iface.decodeFunctionResult('conditionalTokens', result)[0];
+          if (!conditionalTokensAddress || conditionalTokensAddress === ethers.ZeroAddress) {
+            throw new Error('returned zero address');
+          }
+        } catch (e3) {
+          throw new Error(`All strategies failed. Last error: ${e3.message}`);
+        }
+      }
     }
     
     const erc1155 = new ethers.Contract(ethers.getAddress(conditionalTokensAddress), ERC1155_ABI, wallet);
@@ -554,11 +738,11 @@ async function getContracts(wallet, provider, marketAddress, collateralTokenAddr
     const contracts = { market, usdc, erc1155, decimals };
     contractCache.set(cacheKey, contracts);
     
-    logInfo(wallet.address, '✅', `Contracts loaded for market`);
+    logInfo(wallet.address, '✅', `Contracts loaded (CT: ${conditionalTokensAddress.slice(0, 10)}...)`);
     
     return contracts;
   } catch (e) {
-    throw new Error(`Contract init failed: ${e.message}`);
+    throw new Error(`${e.message}`);
   }
 }
 
