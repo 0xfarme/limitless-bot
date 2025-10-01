@@ -382,15 +382,31 @@ function validateMarketTiming(marketInfo, wallet) {
 // ========= Approval Functions =========
 async function readAllowance(usdc, owner, spender) {
   try {
-    return await usdc.allowance(owner, spender);
+    // Try direct call first
+    const allowance = await usdc.allowance(owner, spender);
+    return allowance;
   } catch (e) {
+    // Fallback 1: Try staticCall
     try {
-      const fn = usdc.getFunction ? usdc.getFunction('allowance') : null;
-      if (fn && fn.staticCall) {
-        return await fn.staticCall(owner, spender);
+      const allowance = await usdc.allowance.staticCall(owner, spender);
+      return allowance;
+    } catch (e2) {
+      // Fallback 2: Manual call encoding
+      try {
+        const iface = usdc.interface;
+        const data = iface.encodeFunctionData('allowance', [owner, spender]);
+        const result = await usdc.runner.provider.call({
+          to: await usdc.getAddress(),
+          data: data
+        });
+        const decoded = iface.decodeFunctionResult('allowance', result);
+        return decoded[0];
+      } catch (e3) {
+        // If all methods fail, assume zero allowance and log warning
+        console.warn(`Warning: Could not read allowance, assuming 0. Error: ${e3.message}`);
+        return 0n;
       }
-    } catch (_) {}
-    throw e;
+    }
   }
 }
 
@@ -398,38 +414,63 @@ async function ensureUsdcApproval(wallet, usdc, marketAddress, needed) {
   let current;
   try {
     current = await readAllowance(usdc, wallet.address, marketAddress);
+    logInfo(wallet.address, '🔍', `Current allowance: ${ethers.formatUnits(current, 6)} USDC`);
   } catch (e) {
-    logWarn(wallet.address, '⚠️', `Allowance read failed`);
+    logWarn(wallet.address, '⚠️', `Allowance read failed, assuming 0`);
     current = 0n;
   }
   
-  if (current >= needed) return true;
+  if (current >= needed) {
+    logInfo(wallet.address, '✅', `Sufficient allowance already set`);
+    return true;
+  }
   
-  logInfo(wallet.address, '🔓', `Approving USDC...`);
+  logInfo(wallet.address, '🔓', `Approving ${ethers.formatUnits(needed, 6)} USDC...`);
   
+  // Some tokens require resetting to 0 first (like USDT)
   if (current > 0n) {
     try {
+      logInfo(wallet.address, '🔄', `Resetting allowance to 0 first...`);
       const gasEst0 = await estimateGasFor(usdc, wallet, 'approve', [marketAddress, 0n]);
-      if (!gasEst0) return false;
-      const pad0 = (gasEst0 * 120n) / 100n + 10000n;
-      const tx0 = await usdc.approve(marketAddress, 0n, await txOverrides(wallet.provider, pad0));
-      await tx0.wait(CONFIRMATIONS);
+      if (!gasEst0) {
+        logWarn(wallet.address, '⚠️', 'Skipping reset, proceeding to approve');
+      } else {
+        const pad0 = (gasEst0 * 120n) / 100n + 10000n;
+        const tx0 = await usdc.approve(marketAddress, 0n, await txOverrides(wallet.provider, pad0));
+        logInfo(wallet.address, '🧾', `Reset tx: ${tx0.hash.slice(0, 10)}...`);
+        await tx0.wait(CONFIRMATIONS);
+        await delay(1000); // Give it time to settle
+      }
     } catch (e) {
-      logErr(wallet.address, '💥', 'approve(0) failed', e.message);
-      return false;
+      logWarn(wallet.address, '⚠️', `Reset to 0 failed: ${e.message}`);
+      // Continue anyway, might still work
     }
   }
   
   try {
     const gasEst = await estimateGasFor(usdc, wallet, 'approve', [marketAddress, needed]);
-    if (!gasEst) return false;
+    if (!gasEst) {
+      logErr(wallet.address, '❌', 'Gas estimate for approve failed');
+      return false;
+    }
+    
     const pad = (gasEst * 120n) / 100n + 10000n;
     const tx = await usdc.approve(marketAddress, needed, await txOverrides(wallet.provider, pad));
+    logInfo(wallet.address, '🧾', `Approve tx: ${tx.hash.slice(0, 10)}...`);
     await tx.wait(CONFIRMATIONS);
     
-    await delay(500);
-    const after = await readAllowance(usdc, wallet.address, marketAddress);
-    return after >= needed;
+    // Wait and verify
+    await delay(1000);
+    try {
+      const after = await readAllowance(usdc, wallet.address, marketAddress);
+      const success = after >= needed;
+      logInfo(wallet.address, success ? '✅' : '⚠️', `Allowance after: ${ethers.formatUnits(after, 6)} USDC`);
+      return success;
+    } catch (e) {
+      // Assume success if we can't read
+      logWarn(wallet.address, '⚠️', 'Could not verify allowance, assuming success');
+      return true;
+    }
   } catch (e) {
     logErr(wallet.address, '💥', 'Approval failed', e.message);
     return false;
