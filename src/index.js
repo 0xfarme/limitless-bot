@@ -19,18 +19,21 @@ const PRICE_ORACLE_IDS = (process.env.PRICE_ORACLE_IDS || process.env.PRICE_ORAC
   .filter(Boolean);
 
 const FREQUENCY = process.env.FREQUENCY || 'hourly';
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '20000', 10);
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
 const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 1;
-const TARGET_PROFIT_PCT = process.env.TARGET_PROFIT_PCT ? Number(process.env.TARGET_PROFIT_PCT) : 50;
-const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 100;
+const TARGET_PROFIT_PCT = process.env.TARGET_PROFIT_PCT ? Number(process.env.TARGET_PROFIT_PCT) : 12;
+const STOP_LOSS_PCT = process.env.STOP_LOSS_PCT ? Number(process.env.STOP_LOSS_PCT) : -8;
+const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 150;
 const GAS_PRICE_GWEI = process.env.GAS_PRICE_GWEI ? String(process.env.GAS_PRICE_GWEI) : '0.005';
-const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '2', 10);
+const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '1', 10);
 const STRATEGY_MODE = (process.env.STRATEGY_MODE || 'dominant').toLowerCase();
-const TRIGGER_PCT = process.env.TRIGGER_PCT ? Number(process.env.TRIGGER_PCT) : 60;
+const TRIGGER_PCT = process.env.TRIGGER_PCT ? Number(process.env.TRIGGER_PCT) : 55;
 const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND) : 5;
 
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
 const STATE_FILE = process.env.STATE_FILE || path.join('data', 'state.json');
+const TRADES_LOG_FILE = process.env.TRADES_LOG_FILE || path.join('data', 'trades.log');
+const SUMMARY_FILE = process.env.SUMMARY_FILE || path.join('data', 'summary.json');
 
 // Validation
 if (!RPC_URL) {
@@ -52,6 +55,9 @@ const MAX_GAS_WEI = ethers.parseEther(String(MAX_GAS_ETH));
 // ========= State Management =========
 // Structure: Map<walletAddress, Map<marketAddress, { holding, completed }>>
 const userState = new Map();
+
+// Trade tracking for summary
+const tradeHistory = []; // Array of trade records
 
 function getWalletState(addr) {
   if (!userState.has(addr)) {
@@ -86,6 +92,71 @@ function markMarketCompleted(addr, marketAddress) {
   marketState.completed = true;
   walletState.set(marketAddress, marketState);
   scheduleSave();
+}
+
+// ========= Trade Logging =========
+function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, amount, pnl = null, pnlPct = null) {
+  const timestamp = new Date().toISOString();
+  const record = {
+    timestamp,
+    wallet: walletAddress,
+    market: marketAddress,
+    marketTitle,
+    outcome,
+    action, // 'BUY' or 'SELL'
+    amount,
+    pnl: pnl !== null ? Number(pnl) : null,
+    pnlPct: pnlPct !== null ? Number(pnlPct) : null
+  };
+  
+  tradeHistory.push(record);
+  
+  // Append to log file
+  try {
+    ensureDirSync(path.dirname(TRADES_LOG_FILE));
+    const logLine = `${timestamp} | ${walletAddress.slice(0, 8)} | ${action} | ${marketTitle} | Outcome ${outcome} | Amount: ${amount}${pnl !== null ? ` | PnL: ${pnlPct.toFixed(2)}%` : ''}\n`;
+    fs.appendFileSync(TRADES_LOG_FILE, logLine);
+  } catch (e) {
+    console.warn('Failed to write trade log:', e.message);
+  }
+  
+  // Update summary
+  updateSummary();
+}
+
+function updateSummary() {
+  try {
+    ensureDirSync(path.dirname(SUMMARY_FILE));
+    
+    const completedTrades = tradeHistory.filter(t => t.action === 'SELL' && t.pnl !== null);
+    const wins = completedTrades.filter(t => t.pnl > 0).length;
+    const losses = completedTrades.filter(t => t.pnl < 0).length;
+    const totalPnL = completedTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+    const totalPnLPct = completedTrades.reduce((sum, t) => sum + (t.pnlPct || 0), 0);
+    const avgPnLPct = completedTrades.length > 0 ? totalPnLPct / completedTrades.length : 0;
+    
+    const summary = {
+      lastUpdated: new Date().toISOString(),
+      totalTrades: completedTrades.length,
+      wins,
+      losses,
+      winRate: completedTrades.length > 0 ? ((wins / completedTrades.length) * 100).toFixed(2) + '%' : '0%',
+      totalPnL: totalPnL.toFixed(4),
+      avgPnLPerTrade: (totalPnL / Math.max(completedTrades.length, 1)).toFixed(4),
+      avgPnLPct: avgPnLPct.toFixed(2) + '%',
+      recentTrades: completedTrades.slice(-10).reverse() // Last 10 trades
+    };
+    
+    fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summary, null, 2));
+  } catch (e) {
+    console.warn('Failed to update summary:', e.message);
+  }
+}
+
+function loadTradeHistory() {
+  // Trade history is ephemeral per session, but we could load from log file if needed
+  // For now, just initialize empty
+  return [];
 }
 
 // ========= Logging =========
@@ -463,6 +534,9 @@ async function processMarket(wallet, provider, oracleId, marketData) {
     const hasPosition = (bal0 > 0n) || (bal1 > 0n) || !!localHolding;
 
     if (hasPosition) {
+      // CRITICAL: Already have a position in this market, do not open another
+      logInfo(wallet.address, '🔒', `Already holding position in this market - managing exit`);
+      
       // Manage existing position
       let outcomeIndex = bal0 > 0n ? 0 : 1;
       let tokenId = bal0 > 0n ? pid0 : pid1;
@@ -497,7 +571,7 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       const valueHuman = fmtUnitsPrec(positionValue, decimals);
       const pnlSign = pnlAbs >= 0n ? '📈' : '📉';
       
-      logInfo(wallet.address, pnlSign, `Value: $${valueHuman} | PnL: ${pnlPct.toFixed(1)}%`);
+      logInfo(wallet.address, pnlSign, `Value: ${valueHuman} | PnL: ${pnlPct.toFixed(1)}%`);
 
       if (pnlAbs > 0n && pnlPct >= TARGET_PROFIT_PCT) {
         const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
@@ -522,6 +596,19 @@ async function processMarket(wallet, provider, oracleId, marketData) {
         await tx.wait(CONFIRMATIONS);
         logInfo(wallet.address, '✅', `SOLD at ${pnlPct.toFixed(1)}% profit`);
         
+        // Log the trade
+        const pnlAmount = Number(ethers.formatUnits(pnlAbs, decimals));
+        logTrade(
+          wallet.address,
+          marketAddress,
+          marketInfo.title || 'Unknown Market',
+          outcomeIndex,
+          'SELL',
+          Number(ethers.formatUnits(cost, decimals)),
+          pnlAmount,
+          pnlPct
+        );
+        
         setHolding(wallet.address, marketAddress, null);
         markMarketCompleted(wallet.address, marketAddress);
         
@@ -538,6 +625,14 @@ async function processMarket(wallet, provider, oracleId, marketData) {
     }
 
     if (isMarketCompleted(wallet.address, marketAddress)) {
+      logInfo(wallet.address, '🧭', 'Market already completed - skipping');
+      return;
+    }
+    
+    // CRITICAL CHECK: Ensure we don't have any position in this market
+    // This prevents opening multiple positions in the same market
+    if (bal0 > 0n || bal1 > 0n || localHolding) {
+      logInfo(wallet.address, '🔒', 'Position exists - cannot open another in same market');
       return;
     }
 
@@ -586,6 +681,19 @@ async function processMarket(wallet, provider, oracleId, marketData) {
     logInfo(wallet.address, '✅', 'BUY completed');
 
     const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
+    
+    // Log the buy trade
+    logTrade(
+      wallet.address,
+      marketAddress,
+      marketInfo.title || 'Unknown Market',
+      outcomeToBuy,
+      'BUY',
+      BUY_AMOUNT_USDC,
+      null,
+      null
+    );
+    
     setHolding(wallet.address, marketAddress, {
       outcomeIndex: outcomeToBuy,
       tokenId,
@@ -635,11 +743,14 @@ async function runForWallet(wallet, provider) {
 // ========= Main Entry Point =========
 async function main() {
   console.log('🚀 Starting Multi-Market Limitless Bot');
-  console.log(`🎯 Tracking ${PRICE_ORACLE_IDS.length} oracle(s): ${PRICE_ORACLE_IDS.join(', ')}`);
+  console.log('🎯 VOLUME + CAPITAL PRESERVATION MODE');
   console.log(`📊 Strategy: ${STRATEGY_MODE.toUpperCase()}`);
-  console.log(`💰 Position size: $${BUY_AMOUNT_USDC}`);
-  console.log(`📈 Target profit: ${TARGET_PROFIT_PCT}%`);
-  console.log(`⏱️ Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
+  console.log(`💰 Position size: ${BUY_AMOUNT_USDC}`);
+  console.log(`📈 Target profit: ${TARGET_PROFIT_PCT}% | Stop loss: ${STOP_LOSS_PCT}%`);
+  console.log(`🎚️ Entry trigger: ${TRIGGER_PCT}% | Slippage: ${(SLIPPAGE_BPS / 100).toFixed(2)}%`);
+  console.log(`⏱️ Poll interval: ${POLL_INTERVAL_MS / 1000}s | Confirmations: ${CONFIRMATIONS}`);
+  console.log(`🎯 Tracking ${PRICE_ORACLE_IDS.length} oracle(s): ${PRICE_ORACLE_IDS.join(', ')}`);
+  console.log('');
   
   const provider = new ethers.JsonRpcProvider(RPC_URL);
 
@@ -665,9 +776,22 @@ async function main() {
   for (const [addr, marketMap] of persisted.entries()) {
     userState.set(addr, marketMap);
   }
+  
+  // Initialize trade history (starts fresh each session)
+  loadTradeHistory();
 
   for (const w of wallets) {
     console.log(`🔑 Loaded wallet: ${w.address.slice(0, 6)}...${w.address.slice(-4)}`);
+  }
+  
+  // Print initial summary if exists
+  if (fs.existsSync(SUMMARY_FILE)) {
+    try {
+      const summary = JSON.parse(fs.readFileSync(SUMMARY_FILE, 'utf8'));
+      console.log(`📊 Previous session: ${summary.totalTrades} trades | Win rate: ${summary.winRate} | Total PnL: ${summary.totalPnL}`);
+    } catch (e) {
+      // Ignore
+    }
   }
 
   const timers = [];
