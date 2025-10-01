@@ -310,8 +310,15 @@ async function fetchMarket(oracleId) {
   const url = `https://api.limitless.exchange/markets/prophet?priceOracleId=${oracleId}&frequency=${FREQUENCY}`;
   try {
     const res = await axios.get(url, { timeout: 15000 });
+    
+    // Log the response for debugging
+    if (res.data && res.data.market) {
+      console.log(`📡 Oracle ${oracleId}: ${res.data.market.title || 'Untitled'} | Active: ${res.data.isActive} | Address: ${res.data.market.address}`);
+    }
+    
     return res.data;
   } catch (e) {
+    console.warn(`Failed to fetch oracle ${oracleId}: ${e.message}`);
     return null;
   }
 }
@@ -511,31 +518,55 @@ async function getContracts(wallet, provider, marketAddress, collateralTokenAddr
     return contractCache.get(cacheKey);
   }
   
-  const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
-  const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
-  const conditionalTokensAddress = await market.conditionalTokens();
-  const erc1155 = new ethers.Contract(ethers.getAddress(conditionalTokensAddress), ERC1155_ABI, wallet);
-  const decimals = Number(await usdc.decimals());
-  
-  const [marketHasCode, usdcHasCode] = await Promise.all([
-    isContract(provider, marketAddress),
-    isContract(provider, collateralTokenAddress)
-  ]);
-  
-  if (!marketHasCode || !usdcHasCode) {
-    throw new Error('Contract verification failed');
+  try {
+    // Verify contracts have code before trying to interact
+    const [marketHasCode, usdcHasCode] = await Promise.all([
+      isContract(provider, marketAddress),
+      isContract(provider, collateralTokenAddress)
+    ]);
+    
+    if (!marketHasCode) {
+      throw new Error(`Market contract has no code at ${marketAddress}`);
+    }
+    if (!usdcHasCode) {
+      throw new Error(`USDC contract has no code at ${collateralTokenAddress}`);
+    }
+    
+    const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
+    const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
+    
+    // Try to get conditionalTokens address
+    let conditionalTokensAddress;
+    try {
+      conditionalTokensAddress = await market.conditionalTokens();
+      
+      // Verify it returned a valid address
+      if (!conditionalTokensAddress || conditionalTokensAddress === ethers.ZeroAddress) {
+        throw new Error('conditionalTokens returned zero address');
+      }
+    } catch (e) {
+      throw new Error(`Failed to get conditionalTokens address: ${e.message}`);
+    }
+    
+    const erc1155 = new ethers.Contract(ethers.getAddress(conditionalTokensAddress), ERC1155_ABI, wallet);
+    const decimals = Number(await usdc.decimals());
+    
+    const contracts = { market, usdc, erc1155, decimals };
+    contractCache.set(cacheKey, contracts);
+    
+    logInfo(wallet.address, '✅', `Contracts loaded for market`);
+    
+    return contracts;
+  } catch (e) {
+    throw new Error(`Contract init failed: ${e.message}`);
   }
-  
-  const contracts = { market, usdc, erc1155, decimals };
-  contractCache.set(cacheKey, contracts);
-  
-  return contracts;
 }
 
 // ========= Main Trading Logic for Single Market =========
 async function processMarket(wallet, provider, oracleId, marketData) {
   try {
     if (!marketData || !marketData.market || !marketData.market.address || !marketData.isActive) {
+      logWarn(wallet.address, '⏸️', `Oracle ${oracleId}: Market not active or missing data`);
       return;
     }
 
@@ -545,8 +576,12 @@ async function processMarket(wallet, provider, oracleId, marketData) {
     const positionIds = marketInfo.positionIds || [];
     const collateralTokenAddress = ethers.getAddress(marketInfo.collateralToken.address);
 
-    // Log market
     logInfo(wallet.address, '📊', `Oracle ${oracleId}: ${marketInfo.title || 'Untitled'}`);
+    
+    // Log key market info for debugging
+    if (prices.length >= 2) {
+      logInfo(wallet.address, '💹', `Prices: ${prices[0]}/${prices[1]}`);
+    }
 
     // Validate timing
     if (!validateMarketTiming(marketInfo, wallet)) {
