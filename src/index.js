@@ -30,6 +30,12 @@ const STRATEGY_MODE = (process.env.STRATEGY_MODE || 'dominant').toLowerCase();
 const TRIGGER_PCT = process.env.TRIGGER_PCT ? Number(process.env.TRIGGER_PCT) : 55;
 const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND) : 5;
 
+// Time-based risk management
+const MIN_TIME_TO_ENTER_MINUTES = process.env.MIN_TIME_TO_ENTER_MINUTES ? Number(process.env.MIN_TIME_TO_ENTER_MINUTES) : 20;
+const MIN_TIME_TO_EXIT_MINUTES = process.env.MIN_TIME_TO_EXIT_MINUTES ? Number(process.env.MIN_TIME_TO_EXIT_MINUTES) : 5;
+const TIME_DECAY_THRESHOLD_MINUTES = process.env.TIME_DECAY_THRESHOLD_MINUTES ? Number(process.env.TIME_DECAY_THRESHOLD_MINUTES) : 15;
+const ENABLE_TIME_BASED_EXITS = process.env.ENABLE_TIME_BASED_EXITS !== 'false'; // Default true
+
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
 const STATE_FILE = process.env.STATE_FILE || path.join('data', 'state.json');
 const TRADES_LOG_FILE = process.env.TRADES_LOG_FILE || path.join('data', 'trades.log');
