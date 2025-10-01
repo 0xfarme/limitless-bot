@@ -11,29 +11,34 @@ const ERC1155_ABI = require('./abis/ERC1155.json');
 // ========= Config =========
 const RPC_URL = process.env.RPC_URL;
 const CHAIN_ID = parseInt(process.env.CHAIN_ID || '8453', 10);
-const PRICE_ORACLE_ID = process.env.PRICE_ORACLE_ID;
+
+// NEW: Support multiple oracle IDs (comma-separated)
+const PRICE_ORACLE_IDS = (process.env.PRICE_ORACLE_IDS || process.env.PRICE_ORACLE_ID || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
 const FREQUENCY = process.env.FREQUENCY || 'hourly';
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
-const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 5; // human units
-const TARGET_PROFIT_PCT = process.env.TARGET_PROFIT_PCT ? Number(process.env.TARGET_PROFIT_PCT) : 20; // 20%
-const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 100; // 1%
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '20000', 10);
+const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 1;
+const TARGET_PROFIT_PCT = process.env.TARGET_PROFIT_PCT ? Number(process.env.TARGET_PROFIT_PCT) : 50;
+const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 100;
 const GAS_PRICE_GWEI = process.env.GAS_PRICE_GWEI ? String(process.env.GAS_PRICE_GWEI) : '0.005';
-const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '1', 10);
+const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '2', 10);
 const STRATEGY_MODE = (process.env.STRATEGY_MODE || 'dominant').toLowerCase();
 const TRIGGER_PCT = process.env.TRIGGER_PCT ? Number(process.env.TRIGGER_PCT) : 60;
 const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND) : 5;
-const LOOKBACK_BLOCKS = parseInt(process.env.LOOKBACK_BLOCKS || '500000', 10);
 
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
-const CALC_SELL_DECIMALS = 8; // calcSellAmount returns values scaled by 1e8 per spec
 const STATE_FILE = process.env.STATE_FILE || path.join('data', 'state.json');
 
+// Validation
 if (!RPC_URL) {
   console.error('RPC_URL is required');
   process.exit(1);
 }
-if (!PRICE_ORACLE_ID) {
-  console.error('PRICE_ORACLE_ID is required');
+if (PRICE_ORACLE_IDS.length === 0) {
+  console.error('PRICE_ORACLE_IDS or PRICE_ORACLE_ID is required');
   process.exit(1);
 }
 if (PRIVATE_KEYS.length === 0) {
@@ -42,65 +47,56 @@ if (PRIVATE_KEYS.length === 0) {
 }
 
 const MAX_GAS_ETH = process.env.MAX_GAS_ETH ? Number(process.env.MAX_GAS_ETH) : 0.015;
-const MAX_GAS_WEI = (() => { try { return ethers.parseEther(String(MAX_GAS_ETH)); } catch { return ethers.parseEther('0.015'); } })();
+const MAX_GAS_WEI = ethers.parseEther(String(MAX_GAS_ETH));
 
-// Dynamic gas overrides: caps total fee per tx to MAX_GAS_ETH by capping per-gas price
-async function txOverrides(provider, gasLimit) {
-  const ov = {};
-  let gl = null;
-  if (gasLimit != null) {
-    try { gl = BigInt(gasLimit); ov.gasLimit = gl; } catch { gl = null; }
+// ========= State Management =========
+// Structure: Map<walletAddress, Map<marketAddress, { holding, completed }>>
+const userState = new Map();
+
+function getWalletState(addr) {
+  if (!userState.has(addr)) {
+    userState.set(addr, new Map());
   }
-  const fee = await provider.getFeeData();
-  let suggested = fee.maxFeePerGas ?? fee.gasPrice ?? ethers.parseUnits(GAS_PRICE_GWEI, 'gwei');
-  let priority = fee.maxPriorityFeePerGas ?? ethers.parseUnits('0.1', 'gwei');
-  if (gl && gl > 0n) {
-    const capPerGas = MAX_GAS_WEI / gl;
-    if (suggested > capPerGas) suggested = capPerGas;
-    if (priority > suggested) priority = suggested;
-  }
-  // Prefer EIP-1559 fields
-  ov.maxFeePerGas = suggested;
-  ov.maxPriorityFeePerGas = priority;
-  return ov;
+  return userState.get(addr);
 }
 
-// In-memory state: per-user cost basis to compute PnL
-const userState = new Map(); // key: wallet.address, value: { holding: { marketAddress, outcomeIndex, tokenId: bigint, amount: bigint, cost: bigint } | null, completedMarkets: Set<string> }
+function setHolding(addr, marketAddress, holding) {
+  const walletState = getWalletState(addr);
+  const marketState = walletState.get(marketAddress) || { holding: null, completed: false };
+  marketState.holding = holding;
+  walletState.set(marketAddress, marketState);
+  scheduleSave();
+}
 
-// ========= Logging helpers with emojis =========
+function getHolding(addr, marketAddress) {
+  const walletState = getWalletState(addr);
+  const marketState = walletState.get(marketAddress);
+  return marketState ? marketState.holding : null;
+}
+
+function isMarketCompleted(addr, marketAddress) {
+  const walletState = getWalletState(addr);
+  const marketState = walletState.get(marketAddress);
+  return marketState ? marketState.completed : false;
+}
+
+function markMarketCompleted(addr, marketAddress) {
+  const walletState = getWalletState(addr);
+  const marketState = walletState.get(marketAddress) || { holding: null, completed: false };
+  marketState.completed = true;
+  walletState.set(marketAddress, marketState);
+  scheduleSave();
+}
+
+// ========= Logging =========
 function logInfo(addr, emoji, msg) {
-  console.log(`${emoji} [${addr}] ${msg}`);
+  console.log(`${emoji} [${addr.slice(0, 6)}...${addr.slice(-4)}] ${msg}`);
 }
 function logWarn(addr, emoji, msg) {
-  console.warn(`${emoji} [${addr}] ${msg}`);
+  console.warn(`${emoji} [${addr.slice(0, 6)}...${addr.slice(-4)}] ${msg}`);
 }
 function logErr(addr, emoji, msg, err) {
-  const base = `${emoji} [${addr}] ${msg}`;
-  if (err) console.error(base, err);
-  else console.error(base);
-}
-
-function setHolding(addr, holding) {
-  const prev = userState.get(addr) || {};
-  userState.set(addr, { ...prev, holding });
-  scheduleSave();
-}
-function getHolding(addr) {
-  const st = userState.get(addr);
-  return st ? st.holding : null;
-}
-
-function getCompletedMarkets(addr) {
-  const st = userState.get(addr);
-  return st && st.completedMarkets ? st.completedMarkets : new Set();
-}
-function markMarketCompleted(addr, marketAddress) {
-  const prev = userState.get(addr) || {};
-  const set = prev.completedMarkets || new Set();
-  set.add(marketAddress.toLowerCase());
-  userState.set(addr, { ...prev, completedMarkets: set });
-  scheduleSave();
+  console.error(`${emoji} [${addr.slice(0, 6)}...${addr.slice(-4)}] ${msg}`, err || '');
 }
 
 // ========= Persistence =========
@@ -110,17 +106,19 @@ function ensureDirSync(dir) {
 
 function serializeState() {
   const out = {};
-  for (const [addr, val] of userState.entries()) {
-    out[addr] = {
-      holding: val.holding ? {
-        marketAddress: val.holding.marketAddress,
-        outcomeIndex: val.holding.outcomeIndex,
-        tokenId: val.holding.tokenId != null ? String(val.holding.tokenId) : null,
-        amount: val.holding.amount != null ? String(val.holding.amount) : null,
-        cost: val.holding.cost != null ? String(val.holding.cost) : null,
-      } : null,
-      completedMarkets: Array.from(val.completedMarkets || new Set())
-    };
+  for (const [addr, marketMap] of userState.entries()) {
+    out[addr] = {};
+    for (const [marketAddr, state] of marketMap.entries()) {
+      out[addr][marketAddr] = {
+        holding: state.holding ? {
+          outcomeIndex: state.holding.outcomeIndex,
+          tokenId: state.holding.tokenId != null ? String(state.holding.tokenId) : null,
+          amount: state.holding.amount != null ? String(state.holding.amount) : null,
+          cost: state.holding.cost != null ? String(state.holding.cost) : null,
+        } : null,
+        completed: state.completed
+      };
+    }
   }
   return out;
 }
@@ -129,16 +127,21 @@ function deserializeState(obj) {
   const map = new Map();
   if (!obj || typeof obj !== 'object') return map;
   for (const addr of Object.keys(obj)) {
-    const entry = obj[addr] || {};
-    const holding = entry.holding ? {
-      marketAddress: entry.holding.marketAddress,
-      outcomeIndex: entry.holding.outcomeIndex,
-      tokenId: entry.holding.tokenId != null ? BigInt(entry.holding.tokenId) : null,
-      amount: entry.holding.amount != null ? BigInt(entry.holding.amount) : null,
-      cost: entry.holding.cost != null ? BigInt(entry.holding.cost) : null,
-    } : null;
-    const completedMarkets = new Set((entry.completedMarkets || []).map(s => String(s).toLowerCase()))
-    map.set(addr, { holding, completedMarkets });
+    const marketMap = new Map();
+    const markets = obj[addr] || {};
+    for (const marketAddr of Object.keys(markets)) {
+      const state = markets[marketAddr] || {};
+      marketMap.set(marketAddr, {
+        holding: state.holding ? {
+          outcomeIndex: state.holding.outcomeIndex,
+          tokenId: state.holding.tokenId != null ? BigInt(state.holding.tokenId) : null,
+          amount: state.holding.amount != null ? BigInt(state.holding.amount) : null,
+          cost: state.holding.cost != null ? BigInt(state.holding.cost) : null,
+        } : null,
+        completed: state.completed || false
+      });
+    }
+    map.set(addr, marketMap);
   }
   return map;
 }
@@ -149,11 +152,10 @@ function scheduleSave() {
   saveTimer = setTimeout(async () => {
     try {
       ensureDirSync(path.dirname(STATE_FILE));
-      const data = serializeState();
-      fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2));
-      console.log(`💾 [STATE] Saved to ${STATE_FILE}`);
+      fs.writeFileSync(STATE_FILE, JSON.stringify(serializeState(), null, 2));
+      console.log(`💾 State saved`);
     } catch (e) {
-      console.warn('⚠️ [STATE] Failed to save state:', e && e.message ? e.message : e);
+      console.warn('⚠️ Save failed:', e.message);
     } finally {
       saveTimer = null;
     }
@@ -164,15 +166,15 @@ function loadStateSync() {
   try {
     if (!fs.existsSync(STATE_FILE)) return new Map();
     const raw = fs.readFileSync(STATE_FILE, 'utf8');
-    const obj = JSON.parse(raw);
-    console.log(`📂 [STATE] Loaded from ${STATE_FILE}`);
-    return deserializeState(obj);
+    console.log(`📂 State loaded`);
+    return deserializeState(JSON.parse(raw));
   } catch (e) {
-    console.warn('⚠️ [STATE] Failed to load state:', e && e.message ? e.message : e);
+    console.warn('⚠️ Load failed:', e.message);
     return new Map();
   }
 }
 
+// ========= Utilities =========
 async function isContract(provider, address) {
   const code = await provider.getCode(address);
   return code && code !== '0x';
@@ -194,21 +196,120 @@ function fmtUnitsPrec(amount, decimals, precision = 4) {
   try {
     const s = ethers.formatUnits(amount, decimals);
     const n = parseFloat(s);
-    if (Number.isNaN(n)) return s;
-    return n.toFixed(precision);
+    return Number.isNaN(n) ? s : n.toFixed(precision);
   } catch (_) {
     return String(amount);
   }
 }
 
-async function fetchMarket() {
-  const url = `https://api.limitless.exchange/markets/prophet?priceOracleId=${PRICE_ORACLE_ID}&frequency=${FREQUENCY}`;
-  const res = await axios.get(url, { timeout: 15000 });
-  return res.data;
+async function txOverrides(provider, gasLimit) {
+  const ov = {};
+  let gl = null;
+  if (gasLimit != null) {
+    try { gl = BigInt(gasLimit); ov.gasLimit = gl; } catch { gl = null; }
+  }
+  const fee = await provider.getFeeData();
+  let suggested = fee.maxFeePerGas ?? fee.gasPrice ?? ethers.parseUnits(GAS_PRICE_GWEI, 'gwei');
+  let priority = fee.maxPriorityFeePerGas ?? ethers.parseUnits('0.1', 'gwei');
+  if (gl && gl > 0n) {
+    const capPerGas = MAX_GAS_WEI / gl;
+    if (suggested > capPerGas) suggested = capPerGas;
+    if (priority > suggested) priority = suggested;
+  }
+  ov.maxFeePerGas = suggested;
+  ov.maxPriorityFeePerGas = priority;
+  return ov;
 }
 
+async function estimateGasFor(contract, wallet, fnName, args) {
+  try {
+    const data = contract.interface.encodeFunctionData(fnName, args);
+    return await wallet.provider.estimateGas({
+      from: wallet.address,
+      to: contract.target,
+      data
+    });
+  } catch (e) {
+    return null;
+  }
+}
+
+// ========= Market Fetching =========
+async function fetchMarket(oracleId) {
+  const url = `https://api.limitless.exchange/markets/prophet?priceOracleId=${oracleId}&frequency=${FREQUENCY}`;
+  try {
+    const res = await axios.get(url, { timeout: 15000 });
+    return res.data;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function fetchAllMarkets() {
+  const promises = PRICE_ORACLE_IDS.map(id => fetchMarket(id));
+  const results = await Promise.allSettled(promises);
+  
+  const markets = [];
+  results.forEach((result, idx) => {
+    if (result.status === 'fulfilled' && result.value) {
+      markets.push({
+        oracleId: PRICE_ORACLE_IDS[idx],
+        data: result.value
+      });
+    }
+  });
+  
+  return markets;
+}
+
+// ========= Strategy =========
+function pickOutcome(prices) {
+  if (STRATEGY_MODE === 'dominant') {
+    const p0ok = prices[0] >= TRIGGER_PCT;
+    const p1ok = prices[1] >= TRIGGER_PCT;
+    if (p0ok || p1ok) return prices[0] >= prices[1] ? 0 : 1;
+    return null;
+  } else {
+    const low = TRIGGER_PCT - TRIGGER_BAND;
+    const high = TRIGGER_PCT + TRIGGER_BAND;
+    if (prices[0] >= low && prices[0] <= high) return 1;
+    if (prices[1] >= low && prices[1] <= high) return 0;
+    return null;
+  }
+}
+
+function validateMarketTiming(marketInfo, wallet) {
+  const nowMs = Date.now();
+  
+  if (marketInfo.createdAt) {
+    const createdMs = new Date(marketInfo.createdAt).getTime();
+    if (!Number.isNaN(createdMs)) {
+      const ageMs = nowMs - createdMs;
+      if (ageMs < 10 * 60 * 1000) {
+        const ageMin = Math.floor(ageMs / 60000);
+        logInfo(wallet.address, '⏳', `Market age ${ageMin}m < 10m - skip`);
+        return false;
+      }
+    }
+  }
+  
+  if (marketInfo.deadline) {
+    const deadlineMs = new Date(marketInfo.deadline).getTime();
+    if (!Number.isNaN(deadlineMs)) {
+      const remainingMs = deadlineMs - nowMs;
+      if (remainingMs < 5 * 60 * 1000) {
+        const remMin = Math.floor(remainingMs / 60000);
+        logInfo(wallet.address, '⏰', `Deadline in ${remMin}m < 5m - skip`);
+        return false;
+      }
+    }
+  }
+  
+  return true;
+}
+
+// ========= Approval Functions =========
 async function readAllowance(usdc, owner, spender) {
-  // Try normal call, then staticCall as fallback
   try {
     return await usdc.allowance(owner, spender);
   } catch (e) {
@@ -222,494 +323,351 @@ async function readAllowance(usdc, owner, spender) {
   }
 }
 
-function pickOutcome(prices) {
-  // prices: [p0, p1]
-  if (STRATEGY_MODE === 'dominant') {
-    // Buy the side that is >= TRIGGER_PCT (choose the higher if both)
-    const p0ok = prices[0] >= TRIGGER_PCT;
-    const p1ok = prices[1] >= TRIGGER_PCT;
-    if (p0ok || p1ok) return prices[0] >= prices[1] ? 0 : 1;
-    return null;
-  } else {
-    // opposite mode: if a side is around TRIGGER_PCT within band, buy the opposite side
-    const low = TRIGGER_PCT - TRIGGER_BAND;
-    const high = TRIGGER_PCT + TRIGGER_BAND;
-    if (prices[0] >= low && prices[0] <= high) return 1;
-    if (prices[1] >= low && prices[1] <= high) return 0;
-    return null;
-  }
-}
-
 async function ensureUsdcApproval(wallet, usdc, marketAddress, needed) {
-  // Always require a confirmed allowance read before buying
   let current;
   try {
-    logInfo(wallet.address, '🔎', `Checking USDC allowance to market ${marketAddress} ...`);
     current = await readAllowance(usdc, wallet.address, marketAddress);
   } catch (e) {
-    logWarn(wallet.address, '⚠️', `Allowance read failed. Will try to approve, then re-check. Details: ${(e && e.message) ? e.message : e}`);
+    logWarn(wallet.address, '⚠️', `Allowance read failed`);
     current = 0n;
   }
+  
   if (current >= needed) return true;
-  logInfo(wallet.address, '🔓', `Approving USDC ${needed} to ${marketAddress} ...`);
-  // Some tokens require setting to 0 before non-zero
+  
+  logInfo(wallet.address, '🔓', `Approving USDC...`);
+  
   if (current > 0n) {
     try {
       const gasEst0 = await estimateGasFor(usdc, wallet, 'approve', [marketAddress, 0n]);
-      if (!gasEst0) { logWarn(wallet.address, '🛑', 'Gas estimate approve(0) failed; skipping approval.'); return false; }
+      if (!gasEst0) return false;
       const pad0 = (gasEst0 * 120n) / 100n + 10000n;
-      const ov0 = await txOverrides(wallet.provider, pad0);
-      const tx0 = await usdc.approve(marketAddress, 0n, ov0);
-      logInfo(wallet.address, '🧾', `approve(0) tx: ${tx0.hash}`);
+      const tx0 = await usdc.approve(marketAddress, 0n, await txOverrides(wallet.provider, pad0));
       await tx0.wait(CONFIRMATIONS);
     } catch (e) {
-      logErr(wallet.address, '💥', 'approve(0) failed', (e && e.message) ? e.message : e);
+      logErr(wallet.address, '💥', 'approve(0) failed', e.message);
       return false;
     }
   }
+  
   try {
-    const gasEst1 = await estimateGasFor(usdc, wallet, 'approve', [marketAddress, needed]);
-    if (!gasEst1) { logWarn(wallet.address, '🛑', 'Gas estimate approve failed; skipping approval.'); return false; }
-    const pad1 = (gasEst1 * 120n) / 100n + 10000n;
-    const ov1 = await txOverrides(wallet.provider, pad1);
-    const tx = await usdc.approve(marketAddress, needed, ov1);
-    logInfo(wallet.address, '🧾', `approve tx: ${tx.hash}`);
+    const gasEst = await estimateGasFor(usdc, wallet, 'approve', [marketAddress, needed]);
+    if (!gasEst) return false;
+    const pad = (gasEst * 120n) / 100n + 10000n;
+    const tx = await usdc.approve(marketAddress, needed, await txOverrides(wallet.provider, pad));
     await tx.wait(CONFIRMATIONS);
-  } catch (e) {
-    // Fallback: try increaseAllowance if approve fails (some tokens prefer increasing)
-    logWarn(wallet.address, '⚠️', `approve failed, trying increaseAllowance. Details: ${(e && e.message) ? e.message : e}`);
-    try {
-      const gasEst2 = await estimateGasFor(usdc, wallet, 'increaseAllowance', [marketAddress, needed]);
-      if (!gasEst2) { logWarn(wallet.address, '🛑', 'Gas estimate increaseAllowance failed; skipping approval.'); return false; }
-      const pad2 = (gasEst2 * 120n) / 100n + 10000n;
-      const ov2 = await txOverrides(wallet.provider, pad2);
-      const tx2 = await usdc.increaseAllowance(marketAddress, needed, ov2);
-      logInfo(wallet.address, '🧾', `increaseAllowance tx: ${tx2.hash}`);
-      await tx2.wait(CONFIRMATIONS);
-    } catch (e2) {
-      logErr(wallet.address, '💥', 'increaseAllowance also failed', (e2 && e2.message) ? e2.message : e2);
-      return false;
-    }
-  }
-  // Re-check allowance to confirm
-  try {
+    
+    await delay(500);
     const after = await readAllowance(usdc, wallet.address, marketAddress);
-    const ok = after >= needed;
-    logInfo(wallet.address, ok ? '✅' : '⚠️', `Allowance after approve: ${after.toString()} (need ${needed.toString()})`);
-    return ok;
+    return after >= needed;
   } catch (e) {
-    logWarn(wallet.address, '⚠️', `Allowance re-check failed. Skipping buy this tick. Details: ${(e && e.message) ? e.message : e}`);
+    logErr(wallet.address, '💥', 'Approval failed', e.message);
     return false;
   }
 }
 
 async function ensureErc1155Approval(wallet, erc1155, operator) {
-  // Try to read approval state up to 3 times
   for (let i = 0; i < 3; i++) {
     try {
-      logInfo(wallet.address, '🔎', `Checking ERC1155 isApprovedForAll(${wallet.address}, ${operator}) ...`);
       const approved = await erc1155.isApprovedForAll(wallet.address, operator);
-      if (approved) return true; // already approved
-      break; // definite false -> proceed to approve
+      if (approved) return true;
+      break;
     } catch (e) {
-      logWarn(wallet.address, '⚠️', `isApprovedForAll read failed (attempt ${i + 1}/3): ${(e && e.message) ? e.message : e}`);
       await delay(400);
     }
   }
-  // Estimate gas for setApprovalForAll; if estimate fails, skip
+  
   const gasEst = await estimateGasFor(erc1155, wallet, 'setApprovalForAll', [operator, true]);
-  if (!gasEst) {
-    logWarn(wallet.address, '🛑', 'Gas estimate setApprovalForAll failed; skipping approval this tick.');
-    return false;
-  }
-  logInfo(wallet.address, '⛽', `Gas estimate setApprovalForAll: ${gasEst}`);
-  const padded = (gasEst * 120n) / 100n + 10000n;
+  if (!gasEst) return false;
+  
   try {
-    logInfo(wallet.address, '🔓', `Setting ERC1155 setApprovalForAll(${operator}, true) ...`);
-    const ov = await txOverrides(wallet.provider, padded);
-    const tx = await erc1155.setApprovalForAll(operator, true, ov);
-    logInfo(wallet.address, '🧾', `setApprovalForAll tx: ${tx.hash}`);
+    const pad = (gasEst * 120n) / 100n + 10000n;
+    const tx = await erc1155.setApprovalForAll(operator, true, await txOverrides(wallet.provider, pad));
     await tx.wait(CONFIRMATIONS);
+    return true;
   } catch (e) {
-    logWarn(wallet.address, '🛑', `setApprovalForAll send failed; skipping approval this tick. Details: ${(e && e.message) ? e.message : e}`);
+    logErr(wallet.address, '💥', 'ERC1155 approval failed', e.message);
     return false;
   }
-  // Confirm state once after tx
-  try {
-    const ok = await erc1155.isApprovedForAll(wallet.address, operator);
-    return !!ok;
-  } catch (_) {
-    // Best-effort
-    return true;
-  }
 }
 
-async function estimateReturnForSellAll(market, outcomeIndex, tokenBalance, collateralDecimals) {
-  // We need to find max returnAmount s.t. calcSellAmount(returnAmount, outcomeIndex, maxOutcomeTokensToSell=tokenBalance) <= tokenBalance.
-  // Exponential search for upper bound, then binary search.
-  const one = 1n;
-  const unit = 10n ** BigInt(collateralDecimals);
-  let low = 0n;
-  let high = unit; // start with 1 unit of collateral
+// ========= Contract Cache =========
+const contractCache = new Map(); // key: marketAddress, value: { market, usdc, erc1155, decimals }
 
-  const need = async (ret) => {
+async function getContracts(wallet, provider, marketAddress, collateralTokenAddress) {
+  const cacheKey = marketAddress;
+  if (contractCache.has(cacheKey)) {
+    return contractCache.get(cacheKey);
+  }
+  
+  const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
+  const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
+  const conditionalTokensAddress = await market.conditionalTokens();
+  const erc1155 = new ethers.Contract(ethers.getAddress(conditionalTokensAddress), ERC1155_ABI, wallet);
+  const decimals = Number(await usdc.decimals());
+  
+  const [marketHasCode, usdcHasCode] = await Promise.all([
+    isContract(provider, marketAddress),
+    isContract(provider, collateralTokenAddress)
+  ]);
+  
+  if (!marketHasCode || !usdcHasCode) {
+    throw new Error('Contract verification failed');
+  }
+  
+  const contracts = { market, usdc, erc1155, decimals };
+  contractCache.set(cacheKey, contracts);
+  
+  return contracts;
+}
+
+// ========= Main Trading Logic for Single Market =========
+async function processMarket(wallet, provider, oracleId, marketData) {
+  try {
+    if (!marketData || !marketData.market || !marketData.market.address || !marketData.isActive) {
+      return;
+    }
+
+    const marketInfo = marketData.market;
+    const marketAddress = ethers.getAddress(marketInfo.address);
+    const prices = marketInfo.prices || [];
+    const positionIds = marketInfo.positionIds || [];
+    const collateralTokenAddress = ethers.getAddress(marketInfo.collateralToken.address);
+
+    // Log market
+    logInfo(wallet.address, '📊', `Oracle ${oracleId}: ${marketInfo.title || 'Untitled'}`);
+
+    // Validate timing
+    if (!validateMarketTiming(marketInfo, wallet)) {
+      return;
+    }
+
+    // Get contracts
+    let contracts;
     try {
-      return await market.calcSellAmount(ret, outcomeIndex);
+      contracts = await getContracts(wallet, provider, marketAddress, collateralTokenAddress);
     } catch (e) {
-      return null;
+      logErr(wallet.address, '❌', `Contract load failed: ${e.message}`);
+      return;
     }
-  };
 
-  // grow high until tokens needed exceed our balance, or cap at some large value
-  for (let i = 0; i < 40; i++) {
-    const needed = await need(high);
-    if (needed === null) break;
-    if (needed > tokenBalance) break;
-    low = high;
-    high = high * 2n;
-  }
+    const { market, usdc, erc1155, decimals } = contracts;
 
-  // binary search between low and high
-  for (let i = 0; i < 50; i++) {
-    const mid = (low + high) / 2n;
-    const needed = await need(mid);
-    if (needed !== null && needed <= tokenBalance) {
-      low = mid + one;
-    } else {
-      high = mid - one;
+    // Check position
+    const localHolding = getHolding(wallet.address, marketAddress);
+    const pid0 = positionIds[0] ? BigInt(positionIds[0]) : null;
+    const pid1 = positionIds[1] ? BigInt(positionIds[1]) : null;
+
+    let bal0 = pid0 !== null ? await safeBalanceOf(erc1155, wallet.address, pid0) : 0n;
+    let bal1 = pid1 !== null ? await safeBalanceOf(erc1155, wallet.address, pid1) : 0n;
+
+    const hasPosition = (bal0 > 0n) || (bal1 > 0n) || !!localHolding;
+
+    if (hasPosition) {
+      // Manage existing position
+      let outcomeIndex = bal0 > 0n ? 0 : 1;
+      let tokenId = bal0 > 0n ? pid0 : pid1;
+      let tokenBalance = bal0 > 0n ? bal0 : bal1;
+
+      let holding = localHolding;
+      if (!holding || holding.tokenId !== tokenId) {
+        const assumedCost = ethers.parseUnits(BUY_AMOUNT_USDC.toString(), decimals);
+        holding = { outcomeIndex, tokenId, amount: tokenBalance, cost: assumedCost };
+        setHolding(wallet.address, marketAddress, holding);
+        logInfo(wallet.address, '💾', `Initialized cost: $${BUY_AMOUNT_USDC}`);
+      }
+
+      const cost = holding.cost;
+      let tokensNeededForCost;
+      try {
+        tokensNeededForCost = await market.calcSellAmount(cost, outcomeIndex);
+      } catch (e) {
+        logErr(wallet.address, '💥', 'calcSellAmount failed', e.message);
+        return;
+      }
+
+      if (tokensNeededForCost === 0n) {
+        logWarn(wallet.address, '⚠️', 'calcSellAmount returned 0');
+        return;
+      }
+
+      const positionValue = (tokenBalance * cost) / tokensNeededForCost;
+      const pnlAbs = positionValue - cost;
+      const pnlPct = cost > 0n ? Number((pnlAbs * 10000n) / cost) / 100 : 0;
+
+      const valueHuman = fmtUnitsPrec(positionValue, decimals);
+      const pnlSign = pnlAbs >= 0n ? '📈' : '📉';
+      
+      logInfo(wallet.address, pnlSign, `Value: $${valueHuman} | PnL: ${pnlPct.toFixed(1)}%`);
+
+      if (pnlAbs > 0n && pnlPct >= TARGET_PROFIT_PCT) {
+        const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
+        if (!approvedOk) {
+          logWarn(wallet.address, '🛑', 'ERC1155 approval failed');
+          return;
+        }
+
+        const maxOutcomeTokensToSell = tokenBalance;
+        const returnAmountForSell = positionValue - (positionValue / 100n);
+        
+        const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
+        if (!gasEst) {
+          logWarn(wallet.address, '🛑', 'Sell gas estimate failed');
+          return;
+        }
+
+        const padded = (gasEst * 120n) / 100n + 10000n;
+        const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, await txOverrides(wallet.provider, padded));
+        
+        logInfo(wallet.address, '🧾', `Sell tx: ${tx.hash.slice(0, 10)}...`);
+        await tx.wait(CONFIRMATIONS);
+        logInfo(wallet.address, '✅', `SOLD at ${pnlPct.toFixed(1)}% profit`);
+        
+        setHolding(wallet.address, marketAddress, null);
+        markMarketCompleted(wallet.address, marketAddress);
+        
+        return;
+      }
+
+      logInfo(wallet.address, '⏳', 'Holding position');
+      return;
     }
-    if (high < low) break;
-  }
-  // 'high' is the last value that failed, so best feasible is high
-  // But after loop condition, best feasible is low-1
-  const best = low - 1n;
-  return best < 0n ? 0n : best;
-}
 
-// Note: We removed event-based cost reconstruction to avoid RPC filter errors.
+    // No position - look for entry
+    if (!Array.isArray(prices) || prices.length < 2) {
+      return;
+    }
 
-async function estimateGasFor(contract, wallet, fnName, args) {
-  try {
-    const data = contract.interface.encodeFunctionData(fnName, args);
-    const gas = await wallet.provider.estimateGas({
-      from: wallet.address,
-      to: contract.target,
-      data
+    if (isMarketCompleted(wallet.address, marketAddress)) {
+      return;
+    }
+
+    const positionIdsValid = Array.isArray(positionIds) && positionIds.length >= 2 && positionIds[0] && positionIds[1];
+    if (!positionIdsValid) {
+      logWarn(wallet.address, '🛑', 'Invalid position IDs');
+      return;
+    }
+
+    const outcomeToBuy = pickOutcome(prices);
+    if (outcomeToBuy === null) {
+      logInfo(wallet.address, '🔎', `No signal (${prices[0]}/${prices[1]})`);
+      return;
+    }
+
+    const investment = ethers.parseUnits(BUY_AMOUNT_USDC.toString(), decimals);
+
+    const usdcBal = await usdc.balanceOf(wallet.address);
+    if (usdcBal < investment) {
+      logWarn(wallet.address, '⚠️', 'Insufficient USDC');
+      return;
+    }
+
+    const allowanceOk = await ensureUsdcApproval(wallet, usdc, marketAddress, investment);
+    if (!allowanceOk) {
+      logWarn(wallet.address, '🛑', 'USDC approval failed');
+      return;
+    }
+
+    const expectedTokens = await market.calcBuyAmount(investment, outcomeToBuy);
+    const minOutcomeTokensToBuy = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
+    
+    logInfo(wallet.address, '🛒', `BUY outcome ${outcomeToBuy} for $${BUY_AMOUNT_USDC}`);
+
+    const gasEst = await estimateGasFor(market, wallet, 'buy', [investment, outcomeToBuy, minOutcomeTokensToBuy]);
+    if (!gasEst) {
+      logWarn(wallet.address, '🛑', 'Buy gas estimate failed');
+      return;
+    }
+
+    const padded = (gasEst * 120n) / 100n + 10000n;
+    const tx = await market.buy(investment, outcomeToBuy, minOutcomeTokensToBuy, await txOverrides(wallet.provider, padded));
+    
+    logInfo(wallet.address, '🧾', `Buy tx: ${tx.hash.slice(0, 10)}...`);
+    await tx.wait(CONFIRMATIONS);
+    logInfo(wallet.address, '✅', 'BUY completed');
+
+    const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
+    setHolding(wallet.address, marketAddress, {
+      outcomeIndex: outcomeToBuy,
+      tokenId,
+      amount: investment,
+      cost: investment
     });
-    return gas;
-  } catch (e) {
-    console.error(e)
-    return null;
+
+    // Confirm balance
+    for (let i = 0; i < 3; i++) {
+      const balNow = await safeBalanceOf(erc1155, wallet.address, tokenId);
+      if (balNow > 0n) {
+        logInfo(wallet.address, '🎟️', `Balance: ${balNow} tokens`);
+        break;
+      }
+      await delay(1000);
+    }
+
+  } catch (err) {
+    logErr(wallet.address, '💥', 'Error processing market', err.message);
   }
 }
 
+// ========= Main Wallet Worker =========
 async function runForWallet(wallet, provider) {
-  logInfo(wallet.address, '🚀', 'Worker started');
-  let lastMarketAddr = null;
-  let cachedContracts = null;
+  logInfo(wallet.address, '🚀', `Worker started for ${PRICE_ORACLE_IDS.length} markets`);
 
   async function tick() {
-    try {
-      const data = await fetchMarket();
-      if (!data || !data.market || !data.market.address || !data.isActive) {
-        logWarn(wallet.address, '⏸️', 'Market inactive or missing data');
-        return;
-      }
+    const markets = await fetchAllMarkets();
+    
+    if (markets.length === 0) {
+      logWarn(wallet.address, '⏸️', 'No active markets');
+      return;
+    }
 
-      const marketInfo = data.market;
-      // Log market title to console for visibility
-      if (marketInfo && marketInfo.title) {
-        logInfo(wallet.address, '📰', `Market: ${marketInfo.title}`);
-      }
-      const marketAddress = ethers.getAddress(marketInfo.address);
-      const prices = marketInfo.prices || [];
-      const positionIds = marketInfo.positionIds || [];
-      const collateralTokenAddress = ethers.getAddress(marketInfo.collateralToken.address);
+    logInfo(wallet.address, '🔄', `Processing ${markets.length} markets...`);
 
-      // Pre-compute timing guardrails for buying
-      const nowMs = Date.now();
-      let tooNewForBet = false;
-      let nearDeadlineForBet = false;
-      if (marketInfo.createdAt) {
-        const createdMs = new Date(marketInfo.createdAt).getTime();
-        if (!Number.isNaN(createdMs)) {
-          const ageMs = nowMs - createdMs;
-          if (ageMs < 10 * 60 * 1000) {
-            tooNewForBet = true;
-            const ageMin = Math.max(0, Math.floor(ageMs / 60000));
-            logInfo(wallet.address, '⏳', `Market age ${ageMin}m < 10m — skip betting`);
-          }
-        }
-      }
-      if (marketInfo.deadline) {
-        const deadlineMs = new Date(marketInfo.deadline).getTime();
-        if (!Number.isNaN(deadlineMs)) {
-          const remainingMs = deadlineMs - nowMs;
-          if (remainingMs < 5 * 60 * 1000) {
-            nearDeadlineForBet = true;
-            const remMin = Math.max(0, Math.floor(remainingMs / 60000));
-            logInfo(wallet.address, '⏳', `Time to deadline ${remMin}m < 5m — skip betting`);
-          }
-        }
-      }
-
-      if (lastMarketAddr !== marketAddress || !cachedContracts) {
-        // Attach contracts directly to the wallet (signer) for ethers v6 compatibility
-        const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
-        const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
-        // Use market.conditionalTokens() to get ERC1155 address
-        const conditionalTokensAddress = await market.conditionalTokens();
-        const erc1155 = new ethers.Contract(ethers.getAddress(conditionalTokensAddress), ERC1155_ABI, wallet);
-        const decimals = Number(await usdc.decimals());
-        // Sanity: verify contracts have code
-        const [marketHasCode, usdcHasCode] = await Promise.all([
-          isContract(provider, marketAddress),
-          isContract(provider, collateralTokenAddress)
-        ]);
-        if (!marketHasCode) {
-          logErr(wallet.address, '❌', `Market address has no code on this chain: ${marketAddress}`);
-          return;
-        }
-        if (!usdcHasCode) {
-          logErr(wallet.address, '❌', `USDC address has no code on this chain: ${collateralTokenAddress}. Check RPC/network.`);
-          return;
-        }
-        cachedContracts = { market, usdc, erc1155, decimals };
-        lastMarketAddr = marketAddress;
-        logInfo(wallet.address, '🧩', `Loaded contracts: market=${marketAddress}, usdc=${collateralTokenAddress}, erc1155=${conditionalTokensAddress}, usdcDecimals=${decimals}`);
-      }
-
-      const { market, usdc, erc1155, decimals } = cachedContracts;
-
-      // Check if user already holds any position (either outcome token)
-      const localHolding = getHolding(wallet.address);
-      const localHoldingThisMarket = localHolding && localHolding.marketAddress === marketAddress ? localHolding : null;
-      const pid0 = positionIds[0] ? BigInt(positionIds[0]) : null;
-      const pid1 = positionIds[1] ? BigInt(positionIds[1]) : null;
-
-      let bal0 = 0n, bal1 = 0n;
-      if (pid0 !== null) {
-        bal0 = await safeBalanceOf(erc1155, wallet.address, pid0);
-      }
-      if (pid1 !== null) {
-        bal1 = await safeBalanceOf(erc1155, wallet.address, pid1);
-      }
-      logInfo(wallet.address, '🎟️', `Positions: pid0=${pid0 ?? 'null'} bal0=${bal0} | pid1=${pid1 ?? 'null'} bal1=${bal1}`);
-      const hasOnchain = (bal0 > 0n) || (bal1 > 0n);
-      const hasAny = hasOnchain || !!localHoldingThisMarket;
-      if (hasAny) {
-        // Determine which outcome is held, then ensure we have cost basis
-        let outcomeIndex = null;
-        let tokenId = null;
-        let tokenBalance = 0n;
-        if (bal0 > 0n) { outcomeIndex = 0; tokenId = pid0; tokenBalance = bal0; }
-        if (bal1 > 0n) { outcomeIndex = 1; tokenId = pid1; tokenBalance = bal1; }
-
-        // Initialize cost basis from env if missing
-        let holding = localHoldingThisMarket;
-        if (!holding || holding.tokenId !== tokenId) {
-          const assumedCost = ethers.parseUnits(BUY_AMOUNT_USDC.toString(), decimals);
-          holding = { marketAddress, outcomeIndex, tokenId, amount: tokenBalance, cost: assumedCost };
-          setHolding(wallet.address, holding);
-          logInfo(wallet.address, '💾', `Initialized cost basis from env: ${BUY_AMOUNT_USDC} USDC (tokenId=${tokenId})`);
-        }
-
-        // Position value per provided formula:
-        // tokensNeededForCost = calcSellAmount(initialInvestment, outcomeIndex)
-        // positionValue = (balance / tokensNeededForCost) * initialInvestment
-        const cost = holding.cost; // initial investment in collateral units
-        let tokensNeededForCost;
-        try {
-          tokensNeededForCost = await market.calcSellAmount(cost, outcomeIndex);
-        } catch (e) {
-          logErr(wallet.address, '💥', 'calcSellAmount(cost) failed for value calc', e && e.message ? e.message : e);
-          return;
-        }
-        if (tokensNeededForCost === 0n) {
-          logWarn(wallet.address, '⚠️', 'calcSellAmount returned 0 for cost; skipping PnL calc this tick.');
-          return;
-        }
-        const positionValue = (tokenBalance * cost) / tokensNeededForCost; // floor
-        const pnlAbs = positionValue - cost; // signed
-        const pnlPct = cost > 0n ? Number((pnlAbs * 10000n) / cost) / 100 : 0;
-        const signEmoji = pnlAbs >= 0n ? '🔺' : '🔻';
-        const valueHuman = fmtUnitsPrec(positionValue, decimals, 4);
-        const costHuman = fmtUnitsPrec(cost, decimals, 4);
-        const pnlAbsHuman = fmtUnitsPrec(pnlAbs >= 0n ? pnlAbs : -pnlAbs, decimals, 4);
-        logInfo(wallet.address, '📈', `Holding tokenId=${tokenId} balance=${tokenBalance} positionValue=${valueHuman} USDC cost=${costHuman} USDC PnL≈${pnlPct.toFixed(2)}% ${signEmoji} ${pnlAbsHuman} USDC`);
-        if (pnlAbs > 0n && pnlPct >= TARGET_PROFIT_PCT) {
-          const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
-          if (!approvedOk) {
-            logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping sell this tick.');
-            return;
-          }
-          // Only proceed if gas estimation works
-          // Per spec: sell with maxOutcomeTokensToSell == balance; returnAmount reduced by 1% fee safety
-          const maxOutcomeTokensToSell = tokenBalance;
-          const returnAmountForSell = positionValue - (positionValue / 100n); // minus 1% safety
-          const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
-          if (!gasEst) {
-            logWarn(wallet.address, '🛑', 'Gas estimate sell failed; skipping sell this tick.');
-            return;
-          }
-          logInfo(wallet.address, '⛽', `Gas estimate sell: ${gasEst}`);
-          const padded = (gasEst * 120n) / 100n + 10000n;
-          const sellOv = await txOverrides(wallet.provider, padded);
-          const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
-          logInfo(wallet.address, '🧾', `Sell tx: ${tx.hash}`);
-          await tx.wait(CONFIRMATIONS);
-          logInfo(wallet.address, '✅', 'Sell completed.');
-          setHolding(wallet.address, null);
-          markMarketCompleted(wallet.address, marketAddress);
-          logInfo(wallet.address, '🧭', `Market ${marketAddress} marked as completed; will not buy again in this run.`);
-          return;
-        }
-
-        // Already holding; do not buy more
-        logInfo(wallet.address, '🛑', 'Already holding a position. Skipping buy.');
-        return;
-      }
-
-      // Not holding any position -> maybe buy per strategy
-      if (!Array.isArray(prices) || prices.length < 2) {
-        logWarn(wallet.address, '⚠️', 'Prices unavailable; skipping.');
-        return;
-      }
-
-      // Do not re-enter a market once completed (bought & sold) in this run
-      const completed = getCompletedMarkets(wallet.address);
-      if (completed.has(marketAddress.toLowerCase())) {
-        logInfo(wallet.address, '🧭', `Market ${marketAddress} previously completed; skipping buy.`);
-        return;
-      }
-
-      // Additional guardrails for betting:
-      const positionIdsValid = Array.isArray(positionIds) && positionIds.length >= 2 && positionIds[0] && positionIds[1];
-      if (!positionIdsValid) {
-        logWarn(wallet.address, '🛑', 'Position IDs missing/invalid — skip betting');
-        return;
-      }
-      if (tooNewForBet || nearDeadlineForBet) {
-        // Reasons already logged above
-        return;
-      }
-
-      const outcomeToBuy = pickOutcome(prices);
-      if (outcomeToBuy === null) {
-        logInfo(wallet.address, '🔎', `No trigger (mode=${STRATEGY_MODE}, prices=${prices.join(', ')}).`);
-        return;
-      }
-
-      const investmentHuman = BUY_AMOUNT_USDC;
-      const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
-
-      // Check USDC balance sufficient for bet
-      const usdcBal = await usdc.balanceOf(wallet.address);
-      const usdcBalHuman = ethers.formatUnits(usdcBal, decimals);
-      const needHuman = ethers.formatUnits(investment, decimals);
-      logInfo(wallet.address, '💰', `USDC balance=${usdcBalHuman}, need=${needHuman} for buy`);
-      if (usdcBal < investment) {
-        logWarn(wallet.address, '⚠️', `Saldo USDC tidak cukup untuk bet. Dibutuhkan ${needHuman}, saldo ${usdcBalHuman}.`);
-        return;
-      }
-
-      // Ensure USDC allowance
-      const allowanceOk = await ensureUsdcApproval(wallet, usdc, marketAddress, investment);
-      if (!allowanceOk) {
-        logWarn(wallet.address, '🛑', 'Allowance not confirmed. Skip buy this tick.');
-        return;
-      }
-
-      // Compute minOutcomeTokensToBuy via calcBuyAmount and slippage
-      const expectedTokens = await market.calcBuyAmount(investment, outcomeToBuy);
-      const minOutcomeTokensToBuy = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
-      logInfo(wallet.address, '🛒', `Trigger hit (mode=${STRATEGY_MODE}). Buying outcome=${outcomeToBuy} invest=${investment} minTokens=${minOutcomeTokensToBuy}`);
-
-      // Estimate gas then buy
-      const gasEst = await estimateGasFor(market, wallet, 'buy', [investment, outcomeToBuy, minOutcomeTokensToBuy]);
-      if (!gasEst) {
-        logWarn(wallet.address, '🛑', 'Gas estimate buy failed; skipping buy this tick.');
-        return;
-      }
-      logInfo(wallet.address, '⛽', `Gas estimate buy: ${gasEst}`);
-      const padded = (gasEst * 120n) / 100n + 10000n;
-      const buyOv = await txOverrides(wallet.provider, padded);
-      const buyTx = await market.buy(investment, outcomeToBuy, minOutcomeTokensToBuy, buyOv);
-      logInfo(wallet.address, '🧾', `Buy tx: ${buyTx.hash}`);
-      const receipt = await buyTx.wait(CONFIRMATIONS);
-      logInfo(wallet.address, '✅', `Buy completed in block ${receipt.blockNumber}`);
-
-      const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
-      // After buy, record cost basis
-      setHolding(wallet.address, {
-        marketAddress,
-        outcomeIndex: outcomeToBuy,
-        tokenId,
-        amount: investment,
-        cost: investment
-      });
-      // Try to confirm on-chain ERC1155 balance right away (best-effort)
-      // Try to confirm on-chain ERC1155 balance right away (best-effort with retries)
-      try {
-        let balNow = 0n;
-        for (let i = 0; i < 3; i++) {
-          balNow = await safeBalanceOf(erc1155, wallet.address, tokenId);
-          if (balNow > 0n) break;
-          await delay(1000);
-        }
-        logInfo(wallet.address, '🎟️', `Position balance after buy: ${balNow}`);
-      } catch (e) {
-        logWarn(wallet.address, '⚠️', `Failed to read position balance after buy: ${(e && e.message) ? e.message : e}`);
-      }
-    } catch (err) {
-      logErr(wallet.address, '💥', 'Error in tick:', err && err.message ? err.message : err);
+    // Process markets sequentially to avoid race conditions
+    for (const { oracleId, data } of markets) {
+      await processMarket(wallet, provider, oracleId, data);
     }
   }
 
-  // initial tick immediately, then interval
   await tick();
   return setInterval(tick, POLL_INTERVAL_MS);
 }
 
+// ========= Main Entry Point =========
 async function main() {
-  console.log('🚀 Starting Limitless bot on Base...');
+  console.log('🚀 Starting Multi-Market Limitless Bot');
+  console.log(`🎯 Tracking ${PRICE_ORACLE_IDS.length} oracle(s): ${PRICE_ORACLE_IDS.join(', ')}`);
+  console.log(`📊 Strategy: ${STRATEGY_MODE.toUpperCase()}`);
+  console.log(`💰 Position size: $${BUY_AMOUNT_USDC}`);
+  console.log(`📈 Target profit: ${TARGET_PROFIT_PCT}%`);
+  console.log(`⏱️ Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
+  
   const provider = new ethers.JsonRpcProvider(RPC_URL);
 
-  // Verify connected chain
   try {
     const net = await provider.getNetwork();
-    logInfo('GLOBAL', '🌐', `Connected to chainId=${net.chainId} (${net.name || 'unknown'})`);
+    console.log(`🌐 Connected to chainId=${net.chainId}`);
     if (Number(net.chainId) !== CHAIN_ID) {
-      logErr('GLOBAL', '❌', `Wrong network. Expected chainId=${CHAIN_ID} but connected to ${net.chainId}. Update RPC_URL/CHAIN_ID.`);
+      console.error(`❌ Wrong network: expected ${CHAIN_ID}, got ${net.chainId}`);
       process.exit(1);
     }
   } catch (e) {
-    logErr('GLOBAL', '💥', 'Failed to fetch network from RPC_URL', e && e.message ? e.message : e);
+    console.error('💥 Network check failed:', e.message);
     process.exit(1);
   }
 
-  const wallets = PRIVATE_KEYS.map(pkRaw => {
-    const pk = pkRaw.startsWith('0x') ? pkRaw : '0x' + pkRaw;
-    const wallet = new ethers.Wallet(pk, provider);
-    return wallet;
+  const wallets = PRIVATE_KEYS.map(pk => {
+    const key = pk.startsWith('0x') ? pk : '0x' + pk;
+    return new ethers.Wallet(key, provider);
   });
 
-  // Load persisted state (if any) before initializing wallets
+  // Load state
   const persisted = loadStateSync();
+  for (const [addr, marketMap] of persisted.entries()) {
+    userState.set(addr, marketMap);
+  }
 
   for (const w of wallets) {
-    logInfo(w.address, '🔑', `Loaded wallet`);
-    // init user state
-    const existing = persisted.get(w.address);
-    if (existing) {
-      userState.set(w.address, {
-        holding: existing.holding || null,
-        completedMarkets: existing.completedMarkets || new Set()
-      });
-      logInfo(w.address, '📂', `State restored: holding=${existing.holding ? 'yes' : 'no'}, completedMarkets=${(existing.completedMarkets || new Set()).size}`);
-    } else {
-      userState.set(w.address, { holding: null, completedMarkets: new Set() });
-    }
+    console.log(`🔑 Loaded wallet: ${w.address.slice(0, 6)}...${w.address.slice(-4)}`);
   }
 
   const timers = [];
@@ -729,10 +687,3 @@ main().catch((e) => {
   console.error('Fatal error:', e);
   process.exit(1);
 });
-function scaleToCalcSell(amount, tokenDecimals) {
-  const d = BigInt(tokenDecimals);
-  const target = BigInt(CALC_SELL_DECIMALS);
-  if (d === target) return amount;
-  if (d < target) return amount * (10n ** (target - d));
-  return amount / (10n ** (d - target));
-}
