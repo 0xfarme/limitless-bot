@@ -42,6 +42,7 @@ const TRADES_LOG_FILE = process.env.TRADES_LOG_FILE || path.join('data', 'trades
 const TRADES_CSV_FILE = process.env.TRADES_CSV_FILE || path.join('data', 'trades.csv');
 const SUMMARY_FILE = process.env.SUMMARY_FILE || path.join('data', 'summary.json');
 const ANALYTICS_FILE = process.env.ANALYTICS_FILE || path.join('data', 'analytics.json');
+const FAILED_EXITS_FILE = process.env.FAILED_EXITS_FILE || path.join('data', 'failed_exits.json');
 
 // Validation
 if (!RPC_URL) {
@@ -67,11 +68,75 @@ const userState = new Map();
 // Trade tracking for summary
 const tradeHistory = []; // Array of trade records
 
+// Failed exits tracking - prevents re-entry until manually resolved
+const failedExits = new Map(); // key: marketAddress, value: { timestamp, reason, pnl, attempts }
+
 function getWalletState(addr) {
   if (!userState.has(addr)) {
     userState.set(addr, new Map());
   }
   return userState.get(addr);
+}
+
+function loadFailedExits() {
+  try {
+    if (!fs.existsSync(FAILED_EXITS_FILE)) return new Map();
+    const raw = fs.readFileSync(FAILED_EXITS_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    const map = new Map();
+    for (const [market, info] of Object.entries(data)) {
+      map.set(market.toLowerCase(), info);
+    }
+    console.log(`⚠️ Loaded ${map.size} markets with failed exits`);
+    return map;
+  } catch (e) {
+    console.warn('Failed to load failed exits:', e.message);
+    return new Map();
+  }
+}
+
+function saveFailedExits() {
+  try {
+    ensureDirSync(path.dirname(FAILED_EXITS_FILE));
+    const obj = {};
+    for (const [market, info] of failedExits.entries()) {
+      obj[market] = info;
+    }
+    fs.writeFileSync(FAILED_EXITS_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) {
+    console.warn('Failed to save failed exits:', e.message);
+  }
+}
+
+function markExitFailed(marketAddress, wallet, reason, pnl, marketTitle) {
+  const key = marketAddress.toLowerCase();
+  const existing = failedExits.get(key);
+  
+  const record = {
+    marketAddress,
+    marketTitle,
+    wallet,
+    firstFailure: existing?.firstFailure || new Date().toISOString(),
+    lastFailure: new Date().toISOString(),
+    reason,
+    pnl,
+    attempts: (existing?.attempts || 0) + 1,
+    status: 'BLOCKED' // Manual intervention required
+  };
+  
+  failedExits.set(key, record);
+  saveFailedExits();
+  
+  console.error(`🚫 Market ${marketAddress} BLOCKED due to failed exit. Check failed_exits.json`);
+}
+
+function isMarketBlocked(marketAddress) {
+  const blocked = failedExits.has(marketAddress.toLowerCase());
+  if (blocked) {
+    const info = failedExits.get(marketAddress.toLowerCase());
+    console.warn(`🚫 Skipping blocked market: ${info.marketTitle} (failed ${info.attempts}x, last: ${info.lastFailure})`);
+  }
+  return blocked;
 }
 
 function setHolding(addr, marketAddress, holding) {
