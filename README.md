@@ -1,3 +1,8 @@
+
+https://limitless.exchange/?r=7EWN40FT4N 
+
+DONOT USE THIS STILL IN TEST MODE
+
 # Limitless AMM Bot (Base)
 
 Automates buying/selling YES/NO outcome tokens on Limitless AMM markets on Base, following rules:
