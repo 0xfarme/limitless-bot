@@ -1038,10 +1038,48 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
       const valueHuman = fmtUnitsPrec(positionValue, decimals);
       const pnlSign = pnlAbs >= 0n ? '📈' : '📉';
-      
-      logInfo(wallet.address, pnlSign, `Value: ${valueHuman} | PnL: ${pnlPct.toFixed(1)}%`);
 
-      if (pnlAbs > 0n && pnlPct >= TARGET_PROFIT_PCT) {
+      // Calculate time remaining until market deadline
+      let minutesRemaining = Infinity;
+      if (marketInfo.deadline) {
+        const deadlineMs = new Date(marketInfo.deadline).getTime();
+        if (!Number.isNaN(deadlineMs)) {
+          const remainingMs = deadlineMs - Date.now();
+          minutesRemaining = remainingMs / 60000;
+        }
+      }
+
+      // Track peak PnL for trailing stop
+      if (!holding.peakPnLPct || pnlPct > holding.peakPnLPct) {
+        holding.peakPnLPct = pnlPct;
+        setHolding(wallet.address, marketAddress, holding);
+      }
+      const peakPnLPct = holding.peakPnLPct || pnlPct;
+
+      logInfo(wallet.address, pnlSign, `Value: ${valueHuman} | PnL: ${pnlPct.toFixed(1)}% | Peak: ${peakPnLPct.toFixed(1)}% | Time left: ${minutesRemaining.toFixed(0)}m`);
+
+      // Check for exit conditions:
+      let shouldSell = false;
+      let exitReason = '';
+
+      // 1. Trailing stop: Once we hit profit target, use 3% trailing stop
+      if (peakPnLPct >= TARGET_PROFIT_PCT) {
+        const trailingStop = peakPnLPct - TRAILING_DISTANCE_PCT;
+        if (pnlPct <= trailingStop) {
+          shouldSell = true;
+          exitReason = `TRAILING_STOP (Peak: ${peakPnLPct.toFixed(1)}%, Now: ${pnlPct.toFixed(1)}%)`;
+          logInfo(wallet.address, '📉', `Trailing stop hit: ${exitReason}`);
+        }
+      }
+
+      // 2. Stop loss: Only in last 10 minutes
+      if (!shouldSell && minutesRemaining <= 10 && pnlPct <= STOP_LOSS_PCT) {
+        shouldSell = true;
+        exitReason = 'STOP_LOSS';
+        logInfo(wallet.address, '⚠️', `Stop loss active in final 10 minutes`);
+      }
+
+      if (shouldSell) {
         const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
         if (!approvedOk) {
           logWarn(wallet.address, '🛑', 'ERC1155 approval failed');
@@ -1062,7 +1100,9 @@ async function processMarket(wallet, provider, oracleId, marketData) {
         
         logInfo(wallet.address, '🧾', `Sell tx: ${tx.hash.slice(0, 10)}...`);
         await tx.wait(CONFIRMATIONS);
-        logInfo(wallet.address, '✅', `SOLD at ${pnlPct.toFixed(1)}% profit`);
+
+        const exitEmoji = pnlPct >= 0 ? '✅' : '🛑';
+        logInfo(wallet.address, exitEmoji, `SOLD at ${pnlPct.toFixed(1)}% (${exitReason || 'EXIT'})`);
         
         const pnlAmount = Number(ethers.formatUnits(pnlAbs, decimals));
         logTrade(
