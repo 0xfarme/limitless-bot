@@ -76,6 +76,9 @@ const tradeHistory = []; // Array of trade records
 // Failed exits tracking - prevents re-entry until manually resolved
 const failedExits = new Map(); // key: marketAddress, value: { timestamp, reason, pnl, attempts }
 
+// Trading locks to prevent concurrent buys on same market
+const tradingLocks = new Map(); // key: `${walletAddress}-${marketAddress}`, value: timestamp
+
 function getWalletState(addr) {
   if (!userState.has(addr)) {
     userState.set(addr, new Map());
