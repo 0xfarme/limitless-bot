@@ -30,6 +30,11 @@ const STRATEGY_MODE = (process.env.STRATEGY_MODE || 'dominant').toLowerCase();
 const TRIGGER_PCT = process.env.TRIGGER_PCT ? Number(process.env.TRIGGER_PCT) : 55;
 const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND) : 5;
 
+// Trailing profit settings
+const ENABLE_TRAILING_PROFIT = process.env.ENABLE_TRAILING_PROFIT === 'true';
+const TRAILING_DISTANCE_PCT = process.env.TRAILING_DISTANCE_PCT ? Number(process.env.TRAILING_DISTANCE_PCT) : 3;
+const TRAILING_MAX_TIME_MINUTES = process.env.TRAILING_MAX_TIME_MINUTES ? Number(process.env.TRAILING_MAX_TIME_MINUTES) : 10;
+
 // Time-based risk management
 const MIN_TIME_TO_ENTER_MINUTES = process.env.MIN_TIME_TO_ENTER_MINUTES ? Number(process.env.MIN_TIME_TO_ENTER_MINUTES) : 20;
 const MIN_TIME_TO_EXIT_MINUTES = process.env.MIN_TIME_TO_EXIT_MINUTES ? Number(process.env.MIN_TIME_TO_EXIT_MINUTES) : 5;
@@ -887,6 +892,12 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
     const marketInfo = marketData.market;
     const marketAddress = ethers.getAddress(marketInfo.address);
+    
+    // Check if market is blocked due to previous failed exit
+    if (isMarketBlocked(marketAddress)) {
+      return;
+    }
+
     const prices = marketInfo.prices || [];
     const positionIds = marketInfo.positionIds || [];
     const collateralTokenAddress = ethers.getAddress(marketInfo.collateralToken.address);
