@@ -1,5 +1,5 @@
 
-https://limitless.exchange/?r=7EWN40FT4N 
+ - New to Limitless? Please consider joining via this referral to support the bot: https://limitless.exchange/?r=7EWN40FT4N 
 
 DONOT USE THIS STILL IN TEST MODE
 
@@ -43,7 +43,7 @@ npm start
 - Sell uses `calcSellAmount(returnAmount, outcomeIndex)` to determine how many outcome tokens to sell for a chosen return. The bot estimates the maximum feasible `returnAmount` to exit fully using a bounded search and then executes `sell(returnAmount, outcomeIndex, maxOutcomeTokensToSell)`.
 - The fixed gas price may be underpriced during network congestion; adjust `GAS_PRICE_GWEI` if needed.
  - All submitted transactions await confirmation (`wait(CONFIRMATIONS)`), default 1.
- - New to Limitless? Please consider joining via this referral to support the bot: https://limitless.exchange/?r=9C6LBRWFI8
+
 
 ### Strategy
 - `STRATEGY_MODE=dominant`: Buy the side whose probability is ≥ `TRIGGER_PCT` (if both are ≥, buy the higher one). Default: 60.
