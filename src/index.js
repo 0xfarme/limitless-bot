@@ -32,14 +32,26 @@ const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND)
 
 // Trailing profit settings
 const ENABLE_TRAILING_PROFIT = process.env.ENABLE_TRAILING_PROFIT === 'true';
-const TRAILING_DISTANCE_PCT = process.env.TRAILING_DISTANCE_PCT ? Number(process.env.TRAILING_DISTANCE_PCT) : 3;
+const TRAILING_DISTANCE_PCT = process.env.TRAILING_DISTANCE_PCT ? Number(process.env.TRAILING_DISTANCE_PCT) : 5;
 const TRAILING_MAX_TIME_MINUTES = process.env.TRAILING_MAX_TIME_MINUTES ? Number(process.env.TRAILING_MAX_TIME_MINUTES) : 10;
+
+// Partial exit strategy
+const ENABLE_PARTIAL_EXITS = process.env.ENABLE_PARTIAL_EXITS === 'true';
+const PARTIAL_EXIT_PCT = process.env.PARTIAL_EXIT_PCT ? Number(process.env.PARTIAL_EXIT_PCT) : 50; // Sell 50% at target
+const PARTIAL_EXIT_TRIGGER = process.env.PARTIAL_EXIT_TRIGGER ? Number(process.env.PARTIAL_EXIT_TRIGGER) : 8; // Trigger at 8% profit
 
 // Time-based risk management
 const MIN_TIME_TO_ENTER_MINUTES = process.env.MIN_TIME_TO_ENTER_MINUTES ? Number(process.env.MIN_TIME_TO_ENTER_MINUTES) : 20;
 const MIN_TIME_TO_EXIT_MINUTES = process.env.MIN_TIME_TO_EXIT_MINUTES ? Number(process.env.MIN_TIME_TO_EXIT_MINUTES) : 5;
 const TIME_DECAY_THRESHOLD_MINUTES = process.env.TIME_DECAY_THRESHOLD_MINUTES ? Number(process.env.TIME_DECAY_THRESHOLD_MINUTES) : 15;
 const ENABLE_TIME_BASED_EXITS = process.env.ENABLE_TIME_BASED_EXITS !== 'false'; // Default true
+
+// Global position management
+const MAX_CONCURRENT_POSITIONS = process.env.MAX_CONCURRENT_POSITIONS ? Number(process.env.MAX_CONCURRENT_POSITIONS) : 5;
+
+// Simulation mode
+const SIMULATION_MODE = process.env.SIMULATION_MODE === 'true';
+const SIMULATION_BALANCE_USDC = process.env.SIMULATION_BALANCE_USDC ? Number(process.env.SIMULATION_BALANCE_USDC) : 100;
 
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
 const STATE_FILE = process.env.STATE_FILE || path.join('data', 'state.json');
@@ -75,6 +87,9 @@ const tradeHistory = []; // Array of trade records
 
 // Failed exits tracking - prevents re-entry until manually resolved
 const failedExits = new Map(); // key: marketAddress, value: { timestamp, reason, pnl, attempts }
+
+// Simulation state
+const simulationBalances = new Map(); // key: walletAddress, value: balance in USDC
 
 // Trading locks to prevent concurrent buys on same market
 const tradingLocks = new Map(); // key: `${walletAddress}-${marketAddress}`, value: timestamp
@@ -155,6 +170,17 @@ function setHolding(addr, marketAddress, holding) {
   scheduleSave();
 }
 
+function updatePeakPnL(addr, marketAddress, currentPnL) {
+  const walletState = getWalletState(addr);
+  const marketState = walletState.get(marketAddress);
+  if (!marketState || !marketState.holding) return;
+
+  if (marketState.holding.peakPnLPct === undefined || currentPnL > marketState.holding.peakPnLPct) {
+    marketState.holding.peakPnLPct = currentPnL;
+    scheduleSave();
+  }
+}
+
 function getHolding(addr, marketAddress) {
   const walletState = getWalletState(addr);
   const marketState = walletState.get(marketAddress);
@@ -167,6 +193,31 @@ function isMarketCompleted(addr, marketAddress) {
   return marketState ? marketState.completed : false;
 }
 
+function countActivePositions(addr) {
+  const walletState = getWalletState(addr);
+  let count = 0;
+  for (const [marketAddr, state] of walletState.entries()) {
+    if (state.holding && !state.completed) {
+      count++;
+    }
+  }
+  return count;
+}
+
+function getSimulationBalance(addr) {
+  if (!simulationBalances.has(addr)) {
+    simulationBalances.set(addr, SIMULATION_BALANCE_USDC);
+  }
+  return simulationBalances.get(addr);
+}
+
+function updateSimulationBalance(addr, delta) {
+  const current = getSimulationBalance(addr);
+  const newBalance = current + delta;
+  simulationBalances.set(addr, newBalance);
+  return newBalance;
+}
+
 function markMarketCompleted(addr, marketAddress) {
   const walletState = getWalletState(addr);
   const marketState = walletState.get(marketAddress) || { holding: null, completed: false };
@@ -176,7 +227,7 @@ function markMarketCompleted(addr, marketAddress) {
 }
 
 // ========= Trade Logging =========
-function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, amount, pnl = null, pnlPct = null, entryPrice = null, exitPrice = null, holdTimeMinutes = null, gasUsed = null) {
+function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, amount, pnl = null, pnlPct = null, entryPrice = null, exitPrice = null, holdTimeMinutes = null, gasUsed = null, exitReason = null, peakPnLPct = null) {
   const timestamp = new Date().toISOString();
   const record = {
     timestamp,
@@ -191,7 +242,9 @@ function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, am
     pnl: pnl !== null ? Number(pnl) : null,
     pnlPct: pnlPct !== null ? Number(pnlPct) : null,
     holdTimeMinutes,
-    gasUsed: gasUsed !== null ? Number(gasUsed) : null
+    gasUsed: gasUsed !== null ? Number(gasUsed) : null,
+    exitReason,
+    peakPnLPct: peakPnLPct !== null ? Number(peakPnLPct) : null
   };
   
   tradeHistory.push(record);
@@ -203,7 +256,9 @@ function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, am
       const logLine = `${timestamp} | ${walletAddress.slice(0, 8)} | BUY | ${marketTitle} | Outcome ${outcome} | Amount: ${amount} | Price: ${entryPrice}%\n`;
       fs.appendFileSync(TRADES_LOG_FILE, logLine);
     } else {
-      const logLine = `${timestamp} | ${walletAddress.slice(0, 8)} | SELL | ${marketTitle} | Outcome ${outcome} | Amount: ${amount} | PnL: ${pnlPct.toFixed(2)}% | Hold: ${holdTimeMinutes}m | Gas: ${gasUsed.toFixed(4)}\n`;
+      const exitReasonStr = exitReason ? ` | Reason: ${exitReason}` : '';
+      const peakStr = peakPnLPct ? ` | Peak: ${peakPnLPct.toFixed(2)}%` : '';
+      const logLine = `${timestamp} | ${walletAddress.slice(0, 8)} | SELL | ${marketTitle} | Outcome ${outcome} | Amount: ${amount} | PnL: ${pnlPct.toFixed(2)}%${peakStr} | Hold: ${holdTimeMinutes}m | Gas: ${gasUsed.toFixed(4)}${exitReasonStr}\n`;
       fs.appendFileSync(TRADES_LOG_FILE, logLine);
     }
   } catch (e) {
@@ -217,11 +272,11 @@ function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, am
     
     if (!csvExists) {
       // Write header
-      const header = 'timestamp,wallet,market,marketTitle,outcome,action,amount,entryPrice,exitPrice,pnl,pnlPct,holdTimeMinutes,gasUsed\n';
+      const header = 'timestamp,wallet,market,marketTitle,outcome,action,amount,entryPrice,exitPrice,pnl,pnlPct,holdTimeMinutes,gasUsed,exitReason,peakPnLPct\n';
       fs.writeFileSync(TRADES_CSV_FILE, header);
     }
-    
-    const csvLine = `${timestamp},${walletAddress},${marketAddress},"${marketTitle}",${outcome},${action},${amount},${entryPrice || ''},${exitPrice || ''},${pnl || ''},${pnlPct || ''},${holdTimeMinutes || ''},${gasUsed || ''}\n`;
+
+    const csvLine = `${timestamp},${walletAddress},${marketAddress},"${marketTitle}",${outcome},${action},${amount},${entryPrice || ''},${exitPrice || ''},${pnl || ''},${pnlPct || ''},${holdTimeMinutes || ''},${gasUsed || ''},${exitReason || ''},${peakPnLPct || ''}\n`;
     fs.appendFileSync(TRADES_CSV_FILE, csvLine);
   } catch (e) {
     console.warn('Failed to write CSV:', e.message);
@@ -420,6 +475,10 @@ function serializeState() {
           tokenId: state.holding.tokenId != null ? String(state.holding.tokenId) : null,
           amount: state.holding.amount != null ? String(state.holding.amount) : null,
           cost: state.holding.cost != null ? String(state.holding.cost) : null,
+          peakPnLPct: state.holding.peakPnLPct !== undefined ? state.holding.peakPnLPct : undefined,
+          entryTime: state.holding.entryTime || null,
+          entryPrice: state.holding.entryPrice || null,
+          partialExitDone: state.holding.partialExitDone || false,
         } : null,
         completed: state.completed
       };
@@ -442,6 +501,10 @@ function deserializeState(obj) {
           tokenId: state.holding.tokenId != null ? BigInt(state.holding.tokenId) : null,
           amount: state.holding.amount != null ? BigInt(state.holding.amount) : null,
           cost: state.holding.cost != null ? BigInt(state.holding.cost) : null,
+          peakPnLPct: state.holding.peakPnLPct !== undefined ? state.holding.peakPnLPct : undefined,
+          entryTime: state.holding.entryTime || null,
+          entryPrice: state.holding.entryPrice || null,
+          partialExitDone: state.holding.partialExitDone || false,
         } : null,
         completed: state.completed || false
       });
@@ -575,10 +638,29 @@ async function fetchAllMarkets() {
 }
 
 // ========= Strategy =========
-function pickOutcome(prices) {
+function pickOutcome(prices, marketInfo = null) {
   const [p0, p1] = prices;
-  
-  if (STRATEGY_MODE === 'dominant') {
+
+  // Hybrid strategy: Mode switches based on time remaining
+  let effectiveMode = STRATEGY_MODE;
+
+  if (STRATEGY_MODE === 'hybrid' && marketInfo && marketInfo.deadline) {
+    const nowMs = Date.now();
+    const deadlineMs = new Date(marketInfo.deadline).getTime();
+    if (!Number.isNaN(deadlineMs)) {
+      const remainingMinutes = (deadlineMs - nowMs) / 60000;
+
+      // Early phase (>30 min): Mean reversion (opposite)
+      // Late phase (<=30 min): Momentum (dominant)
+      if (remainingMinutes > 30) {
+        effectiveMode = 'opposite';
+      } else {
+        effectiveMode = 'dominant';
+      }
+    }
+  }
+
+  if (effectiveMode === 'dominant') {
     // DOMINANT: Buy the side that is >= TRIGGER_PCT (choose the higher if both)
     const p0ok = p0 >= TRIGGER_PCT;
     const p1ok = p1 >= TRIGGER_PCT;
@@ -603,9 +685,10 @@ function validateMarketTiming(marketInfo, wallet) {
     const createdMs = new Date(marketInfo.createdAt).getTime();
     if (!Number.isNaN(createdMs)) {
       const ageMs = nowMs - createdMs;
-      if (ageMs < 10 * 60 * 1000) {
+      const minAgeMinutes = 3; // Reduced from 10 to 3 minutes
+      if (ageMs < minAgeMinutes * 60 * 1000) {
         const ageMin = Math.floor(ageMs / 60000);
-        logInfo(wallet.address, '⏳', `Market age ${ageMin}m < 10m - skip`);
+        logInfo(wallet.address, '⏳', `Market age ${ageMin}m < ${minAgeMinutes}m - skip`);
         return false;
       }
     }
@@ -917,24 +1000,60 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       return;
     }
 
-    // Get contracts
+    // Get contracts (skip in simulation mode for now, use defaults)
     let contracts;
-    try {
-      contracts = await getContracts(wallet, provider, marketAddress, collateralTokenAddress);
-    } catch (e) {
-      logErr(wallet.address, '❌', `Contract load failed: ${e.message}`);
-      return;
+    let decimals = 6; // USDC decimals
+    let market = null;
+    let usdc = null;
+    let erc1155 = null;
+
+    if (!SIMULATION_MODE) {
+      try {
+        contracts = await getContracts(wallet, provider, marketAddress, collateralTokenAddress);
+        market = contracts.market;
+        usdc = contracts.usdc;
+        erc1155 = contracts.erc1155;
+        decimals = contracts.decimals;
+      } catch (e) {
+        logErr(wallet.address, '❌', `Contract load failed: ${e.message}`);
+        return;
+      }
     }
 
-    const { market, usdc, erc1155, decimals } = contracts;
-
-    // Check position
+    // Check position (optimized to reduce RPC calls)
     const localHolding = getHolding(wallet.address, marketAddress);
     const pid0 = positionIds[0] ? BigInt(positionIds[0]) : null;
     const pid1 = positionIds[1] ? BigInt(positionIds[1]) : null;
 
-    let bal0 = pid0 !== null ? await safeBalanceOf(erc1155, wallet.address, pid0) : 0n;
-    let bal1 = pid1 !== null ? await safeBalanceOf(erc1155, wallet.address, pid1) : 0n;
+    // Only check balances if we don't have local holding info, or to verify
+    let bal0 = 0n;
+    let bal1 = 0n;
+
+    if (SIMULATION_MODE) {
+      // In simulation, trust local state
+      if (localHolding) {
+        const knownTokenId = localHolding.tokenId;
+        if (knownTokenId === pid0) {
+          bal0 = localHolding.amount || 0n;
+        } else if (knownTokenId === pid1) {
+          bal1 = localHolding.amount || 0n;
+        }
+      }
+    } else {
+      if (localHolding) {
+        // We have local state, only check the known position
+        const knownTokenId = localHolding.tokenId;
+        if (knownTokenId === pid0) {
+          bal0 = await safeBalanceOf(erc1155, wallet.address, pid0);
+        } else if (knownTokenId === pid1) {
+          bal1 = await safeBalanceOf(erc1155, wallet.address, pid1);
+        }
+      } else {
+        // No local state, check both positions
+        bal0 = pid0 !== null ? await safeBalanceOf(erc1155, wallet.address, pid0) : 0n;
+        bal1 = pid1 !== null ? await safeBalanceOf(erc1155, wallet.address, pid1) : 0n;
+      }
+    }
 
     const hasPosition = (bal0 > 0n) || (bal1 > 0n) || !!localHolding;
 
@@ -957,16 +1076,27 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
       const cost = holding.cost;
       let tokensNeededForCost;
-      try {
-        tokensNeededForCost = await market.calcSellAmount(cost, outcomeIndex);
-      } catch (e) {
-        logErr(wallet.address, '💥', 'calcSellAmount failed', e.message);
-        return;
-      }
 
-      if (tokensNeededForCost === 0n) {
-        logWarn(wallet.address, '⚠️', 'calcSellAmount returned 0');
-        return;
+      if (SIMULATION_MODE) {
+        // Simulate: Use current market price to estimate tokens needed
+        const currentPrice = prices[outcomeIndex];
+        // Approximate: tokens needed = cost / (price/100)
+        // If price is 60%, each token is worth ~0.60 USDC
+        const priceRatio = currentPrice / 100;
+        tokensNeededForCost = cost / BigInt(Math.max(1, Math.floor(priceRatio * 1000000))) * 1000000n;
+        if (tokensNeededForCost === 0n) tokensNeededForCost = cost; // Fallback
+      } else {
+        try {
+          tokensNeededForCost = await market.calcSellAmount(cost, outcomeIndex);
+        } catch (e) {
+          logErr(wallet.address, '💥', 'calcSellAmount failed', e.message);
+          return;
+        }
+
+        if (tokensNeededForCost === 0n) {
+          logWarn(wallet.address, '⚠️', 'calcSellAmount returned 0');
+          return;
+        }
       }
 
       const positionValue = (tokenBalance * cost) / tokensNeededForCost;
@@ -975,34 +1105,187 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
       const valueHuman = fmtUnitsPrec(positionValue, decimals);
       const pnlSign = pnlAbs >= 0n ? '📈' : '📉';
-      
-      logInfo(wallet.address, pnlSign, `Value: ${valueHuman} | PnL: ${pnlPct.toFixed(1)}%`);
 
-      if (pnlAbs > 0n && pnlPct >= TARGET_PROFIT_PCT) {
-        const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
-        if (!approvedOk) {
-          logWarn(wallet.address, '🛑', 'ERC1155 approval failed');
-          return;
+      // Update peak PnL for trailing stop
+      updatePeakPnL(wallet.address, marketAddress, pnlPct);
+
+      // Get peak PnL from holding
+      const peakPnLPct = holding.peakPnLPct !== undefined ? holding.peakPnLPct : pnlPct;
+
+      // Calculate time-based adjustments
+      const timeAdjustments = calculateTimeBasedAdjustments(marketInfo);
+
+      // Dynamic profit target and stop loss based on time remaining
+      const adjustedProfitTarget = TARGET_PROFIT_PCT * timeAdjustments.profitTargetMultiplier;
+      const adjustedStopLoss = STOP_LOSS_PCT * timeAdjustments.stopLossMultiplier;
+
+      // Calculate trailing stop loss (now with dynamic distance)
+      const trailingDistance = TRAILING_DISTANCE_PCT * timeAdjustments.stopLossMultiplier;
+      let trailingStopLoss = adjustedStopLoss;
+      let shouldSellReason = null;
+
+      if (ENABLE_TRAILING_PROFIT && peakPnLPct > 0) {
+        // Trailing stop: sell if we drop from peak
+        trailingStopLoss = peakPnLPct - trailingDistance;
+
+        if (pnlPct <= trailingStopLoss) {
+          shouldSellReason = `Trailing stop hit (Peak: ${peakPnLPct.toFixed(1)}%, Now: ${pnlPct.toFixed(1)}%, Drop: ${trailingDistance.toFixed(1)}%)`;
+        }
+      }
+
+      // Force exit if in danger zone
+      if (timeAdjustments.shouldForceExit && ENABLE_TIME_BASED_EXITS) {
+        shouldSellReason = `FORCE EXIT: <${MIN_TIME_TO_EXIT_MINUTES}m to deadline`;
+      }
+
+      const timeInfo = timeAdjustments.remainingMinutes !== null ? ` | Time: ${timeAdjustments.remainingMinutes.toFixed(1)}m (${timeAdjustments.timePhase})` : '';
+      const partialExitStatus = holding.partialExitDone ? ' | Partial✓' : '';
+      logInfo(wallet.address, pnlSign, `Value: ${valueHuman} | PnL: ${pnlPct.toFixed(1)}% | Peak: ${peakPnLPct.toFixed(1)}% | Target: ${adjustedProfitTarget.toFixed(1)}% | Stop: ${trailingStopLoss.toFixed(1)}%${timeInfo}${partialExitStatus}`);
+
+      // Check for partial exit trigger
+      if (ENABLE_PARTIAL_EXITS && !holding.partialExitDone && pnlPct >= PARTIAL_EXIT_TRIGGER && pnlPct < adjustedProfitTarget) {
+        logInfo(wallet.address, '📊', `Partial exit triggered at ${pnlPct.toFixed(1)}% - selling ${PARTIAL_EXIT_PCT}%`);
+
+        const tokensToSell = (tokenBalance * BigInt(PARTIAL_EXIT_PCT)) / 100n;
+        const partialValue = (tokensToSell * cost) / tokensNeededForCost;
+        let gasUsedEth = 0;
+
+        if (SIMULATION_MODE) {
+          // Simulation mode
+          const proceeds = Number(ethers.formatUnits(partialValue, decimals));
+          const newBalance = updateSimulationBalance(wallet.address, proceeds);
+
+          logInfo(wallet.address, '🎮', `[SIM] PARTIAL EXIT: Sold ${PARTIAL_EXIT_PCT}% | Proceeds: $${proceeds.toFixed(4)} | Balance: ${newBalance.toFixed(2)} USDC`);
+          gasUsedEth = 0.0002;
+        } else {
+          // Real mode
+          const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
+          if (!approvedOk) {
+            logWarn(wallet.address, '🛑', 'ERC1155 approval failed for partial exit');
+            return;
+          }
+
+          const returnAmountForSell = partialValue - (partialValue / 100n);
+
+          const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, tokensToSell]);
+          if (!gasEst) {
+            return;
+          }
+
+          const padded = (gasEst * 120n) / 100n + 10000n;
+          const tx = await market.sell(returnAmountForSell, outcomeIndex, tokensToSell, await txOverrides(wallet.provider, padded));
+
+          logInfo(wallet.address, '🧾', `Partial exit tx: ${tx.hash.slice(0, 10)}...`);
+          const receipt = await tx.wait(CONFIRMATIONS);
+
+          const gasUsedBigInt = receipt.gasUsed * receipt.gasPrice;
+          gasUsedEth = Number(ethers.formatEther(gasUsedBigInt));
+
+          logInfo(wallet.address, '✅', `PARTIAL EXIT: Sold ${PARTIAL_EXIT_PCT}% at ${pnlPct.toFixed(1)}% profit`);
         }
 
-        const maxOutcomeTokensToSell = tokenBalance;
-        const returnAmountForSell = positionValue - (positionValue / 100n);
-        
-        const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
-        if (!gasEst) {
-          logWarn(wallet.address, '🛑', 'Sell gas estimate failed');
-          return;
+        // Update holding to mark partial exit done and adjust amount
+        holding.partialExitDone = true;
+        holding.amount = tokenBalance - tokensToSell;
+        setHolding(wallet.address, marketAddress, holding);
+
+        // Log partial exit as a trade
+        const partialPnl = Number(ethers.formatUnits(partialValue - (cost * BigInt(PARTIAL_EXIT_PCT) / 100n), decimals));
+        const entryTime = holding.entryTime || Date.now();
+        const holdTimeMs = Date.now() - entryTime;
+        const holdTimeMinutes = holdTimeMs / 60000;
+        const currentPrice = prices[outcomeIndex];
+
+        logTrade(
+          wallet.address,
+          marketAddress,
+          marketInfo.title || 'Unknown Market',
+          outcomeIndex,
+          'SELL',
+          Number(ethers.formatUnits(cost * BigInt(PARTIAL_EXIT_PCT) / 100n, decimals)),
+          partialPnl,
+          pnlPct,
+          holding.entryPrice || null,
+          currentPrice || null,
+          holdTimeMinutes,
+          gasUsedEth,
+          'PARTIAL_EXIT',
+          peakPnLPct
+        );
+
+        return; // Return to check position again next cycle
+      }
+
+      if (pnlPct >= adjustedProfitTarget || pnlPct <= adjustedStopLoss || shouldSellReason) {
+        // Determine exit reason
+        let exitReason = 'UNKNOWN';
+        if (shouldSellReason) {
+          if (shouldSellReason.includes('FORCE EXIT')) {
+            exitReason = 'TIME_BASED_EXIT';
+          } else {
+            exitReason = 'TRAILING_STOP';
+          }
+          logInfo(wallet.address, '🛑', shouldSellReason);
+        } else if (pnlPct >= adjustedProfitTarget) {
+          exitReason = 'PROFIT_TARGET';
+          logInfo(wallet.address, '🎯', `Target profit reached: ${pnlPct.toFixed(1)}% (adjusted: ${adjustedProfitTarget.toFixed(1)}%)`);
+        } else if (pnlPct <= adjustedStopLoss) {
+          exitReason = 'STOP_LOSS';
+          logInfo(wallet.address, '🛑', `Stop loss triggered: ${pnlPct.toFixed(1)}% (adjusted: ${adjustedStopLoss.toFixed(1)}%)`);
         }
 
-        const padded = (gasEst * 120n) / 100n + 10000n;
-        const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, await txOverrides(wallet.provider, padded));
-        
-        logInfo(wallet.address, '🧾', `Sell tx: ${tx.hash.slice(0, 10)}...`);
-        await tx.wait(CONFIRMATIONS);
-        logInfo(wallet.address, '✅', `SOLD at ${pnlPct.toFixed(1)}% profit`);
-        
-        // Log the trade
+        let gasUsedEth = 0;
+
+        if (SIMULATION_MODE) {
+          // Simulation mode - just calculate the proceeds
+          const proceeds = Number(ethers.formatUnits(positionValue, decimals));
+          const newBalance = updateSimulationBalance(wallet.address, proceeds);
+
+          logInfo(wallet.address, '🎮', `[SIM] SELL at ${pnlPct.toFixed(1)}% | Proceeds: $${proceeds.toFixed(4)} | New balance: ${newBalance.toFixed(2)} USDC`);
+          logInfo(wallet.address, '✅', `[SIM] SOLD | Reason: ${exitReason}`);
+
+          // Simulate gas cost (typical: 0.0001-0.0005 ETH)
+          gasUsedEth = 0.0002;
+        } else {
+          // Real mode
+          const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
+          if (!approvedOk) {
+            logWarn(wallet.address, '🛑', 'ERC1155 approval failed');
+            return;
+          }
+
+          const maxOutcomeTokensToSell = tokenBalance;
+          const returnAmountForSell = positionValue - (positionValue / 100n);
+
+          const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
+          if (!gasEst) {
+            logWarn(wallet.address, '🛑', 'Sell gas estimate failed');
+            return;
+          }
+
+          const padded = (gasEst * 120n) / 100n + 10000n;
+          const txStartTime = Date.now();
+          const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, await txOverrides(wallet.provider, padded));
+
+          logInfo(wallet.address, '🧾', `Sell tx: ${tx.hash.slice(0, 10)}...`);
+          const receipt = await tx.wait(CONFIRMATIONS);
+
+          // Calculate gas cost
+          const gasUsedBigInt = receipt.gasUsed * receipt.gasPrice;
+          gasUsedEth = Number(ethers.formatEther(gasUsedBigInt));
+
+          logInfo(wallet.address, '✅', `SOLD at ${pnlPct.toFixed(1)}% | Reason: ${exitReason}`);
+        }
+
+        // Calculate hold time
+        const entryTime = holding.entryTime || Date.now();
+        const holdTimeMs = Date.now() - entryTime;
+        const holdTimeMinutes = holdTimeMs / 60000;
+
+        // Log the trade with full details
         const pnlAmount = Number(ethers.formatUnits(pnlAbs, decimals));
+        const currentPrice = prices[outcomeIndex];
+
         logTrade(
           wallet.address,
           marketAddress,
@@ -1011,12 +1294,18 @@ async function processMarket(wallet, provider, oracleId, marketData) {
           'SELL',
           Number(ethers.formatUnits(cost, decimals)),
           pnlAmount,
-          pnlPct
+          pnlPct,
+          holding.entryPrice || null,
+          currentPrice || null,
+          holdTimeMinutes,
+          gasUsedEth,
+          exitReason,
+          peakPnLPct
         );
-        
+
         setHolding(wallet.address, marketAddress, null);
         markMarketCompleted(wallet.address, marketAddress);
-        
+
         return;
       }
 
@@ -1047,47 +1336,80 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       return;
     }
 
-    const outcomeToBuy = pickOutcome(prices);
+    const outcomeToBuy = pickOutcome(prices, marketInfo);
     if (outcomeToBuy === null) {
-      logInfo(wallet.address, '🔎', `No signal (${prices[0]}/${prices[1]})`);
+      logInfo(wallet.address, '🔎', `No signal (${prices[0]}/${prices[1]}) | Strategy: ${STRATEGY_MODE} | Trigger: ${TRIGGER_PCT}% ±${TRIGGER_BAND}%`);
+      return;
+    }
+
+    // Determine effective mode for logging
+    let effectiveMode = STRATEGY_MODE;
+    if (STRATEGY_MODE === 'hybrid' && marketInfo.deadline) {
+      const remainingMs = new Date(marketInfo.deadline).getTime() - Date.now();
+      const remainingMinutes = remainingMs / 60000;
+      effectiveMode = remainingMinutes > 30 ? 'opposite (hybrid-early)' : 'dominant (hybrid-late)';
+    }
+
+    logInfo(wallet.address, '📍', `SIGNAL DETECTED: Buy outcome ${outcomeToBuy} at ${prices[outcomeToBuy]}% | Strategy: ${effectiveMode}`);
+
+    // Check global position limit
+    const activePositions = countActivePositions(wallet.address);
+    if (activePositions >= MAX_CONCURRENT_POSITIONS) {
+      logWarn(wallet.address, '🚫', `Max concurrent positions reached (${activePositions}/${MAX_CONCURRENT_POSITIONS}) - skipping`);
       return;
     }
 
     const investment = ethers.parseUnits(BUY_AMOUNT_USDC.toString(), decimals);
 
-    const usdcBal = await usdc.balanceOf(wallet.address);
-    if (usdcBal < investment) {
-      logWarn(wallet.address, '⚠️', 'Insufficient USDC');
-      return;
+    if (SIMULATION_MODE) {
+      // Simulation mode - check virtual balance
+      const simBalance = getSimulationBalance(wallet.address);
+      if (simBalance < BUY_AMOUNT_USDC) {
+        logWarn(wallet.address, '⚠️', `[SIM] Insufficient balance: ${simBalance.toFixed(2)} USDC`);
+        return;
+      }
+
+      logInfo(wallet.address, '🎮', `[SIM] BUY outcome ${outcomeToBuy} for $${BUY_AMOUNT_USDC} | Balance: ${simBalance.toFixed(2)} USDC`);
+
+      // Deduct from simulation balance
+      const newBalance = updateSimulationBalance(wallet.address, -BUY_AMOUNT_USDC);
+      logInfo(wallet.address, '✅', `[SIM] BUY completed | New balance: ${newBalance.toFixed(2)} USDC`);
+    } else {
+      // Real mode - actual transactions
+      const usdcBal = await usdc.balanceOf(wallet.address);
+      if (usdcBal < investment) {
+        logWarn(wallet.address, '⚠️', 'Insufficient USDC');
+        return;
+      }
+
+      const allowanceOk = await ensureUsdcApproval(wallet, usdc, marketAddress, investment);
+      if (!allowanceOk) {
+        logWarn(wallet.address, '🛑', 'USDC approval failed');
+        return;
+      }
+
+      const expectedTokens = await market.calcBuyAmount(investment, outcomeToBuy);
+      const minOutcomeTokensToBuy = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
+
+      logInfo(wallet.address, '🛒', `BUY outcome ${outcomeToBuy} for $${BUY_AMOUNT_USDC}`);
+
+      const gasEst = await estimateGasFor(market, wallet, 'buy', [investment, outcomeToBuy, minOutcomeTokensToBuy]);
+      if (!gasEst) {
+        logWarn(wallet.address, '🛑', 'Buy gas estimate failed');
+        return;
+      }
+
+      const padded = (gasEst * 120n) / 100n + 10000n;
+      const tx = await market.buy(investment, outcomeToBuy, minOutcomeTokensToBuy, await txOverrides(wallet.provider, padded));
+
+      logInfo(wallet.address, '🧾', `Buy tx: ${tx.hash.slice(0, 10)}...`);
+      await tx.wait(CONFIRMATIONS);
+      logInfo(wallet.address, '✅', 'BUY completed');
     }
-
-    const allowanceOk = await ensureUsdcApproval(wallet, usdc, marketAddress, investment);
-    if (!allowanceOk) {
-      logWarn(wallet.address, '🛑', 'USDC approval failed');
-      return;
-    }
-
-    const expectedTokens = await market.calcBuyAmount(investment, outcomeToBuy);
-    const minOutcomeTokensToBuy = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
-    
-    logInfo(wallet.address, '🛒', `BUY outcome ${outcomeToBuy} for $${BUY_AMOUNT_USDC}`);
-
-    const gasEst = await estimateGasFor(market, wallet, 'buy', [investment, outcomeToBuy, minOutcomeTokensToBuy]);
-    if (!gasEst) {
-      logWarn(wallet.address, '🛑', 'Buy gas estimate failed');
-      return;
-    }
-
-    const padded = (gasEst * 120n) / 100n + 10000n;
-    const tx = await market.buy(investment, outcomeToBuy, minOutcomeTokensToBuy, await txOverrides(wallet.provider, padded));
-    
-    logInfo(wallet.address, '🧾', `Buy tx: ${tx.hash.slice(0, 10)}...`);
-    await tx.wait(CONFIRMATIONS);
-    logInfo(wallet.address, '✅', 'BUY completed');
 
     const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
     
-    // Log the buy trade
+    // Log the buy trade with entry price
     logTrade(
       wallet.address,
       marketAddress,
@@ -1096,6 +1418,10 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       'BUY',
       BUY_AMOUNT_USDC,
       null,
+      null,
+      prices[outcomeToBuy],
+      null,
+      null,
       null
     );
     
@@ -1103,7 +1429,9 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       outcomeIndex: outcomeToBuy,
       tokenId,
       amount: investment,
-      cost: investment
+      cost: investment,
+      entryTime: Date.now(),
+      entryPrice: prices[outcomeToBuy]
     });
 
     // Confirm balance
@@ -1148,33 +1476,45 @@ async function runForWallet(wallet, provider) {
 // ========= Main Entry Point =========
 async function main() {
   console.log('🚀 Starting Multi-Market Limitless Bot');
-  console.log('🎯 VOLUME + CAPITAL PRESERVATION MODE');
+  console.log(SIMULATION_MODE ? '🎮 SIMULATION MODE - NO REAL TRADES' : '🎯 LIVE TRADING MODE');
   console.log(`📊 Strategy: ${STRATEGY_MODE.toUpperCase()}`);
-  console.log(`💰 Position size: ${BUY_AMOUNT_USDC}`);
+  console.log(`💰 Position size: ${BUY_AMOUNT_USDC} USDC | Max positions: ${MAX_CONCURRENT_POSITIONS}`);
+  if (SIMULATION_MODE) {
+    console.log(`💵 Starting balance: ${SIMULATION_BALANCE_USDC} USDC (virtual)`);
+  }
   console.log(`📈 Target profit: ${TARGET_PROFIT_PCT}% | Stop loss: ${STOP_LOSS_PCT}%`);
-  console.log(`🎚️ Entry trigger: ${TRIGGER_PCT}% | Slippage: ${(SLIPPAGE_BPS / 100).toFixed(2)}%`);
+  console.log(`🎚️ Entry trigger: ${TRIGGER_PCT}% ±${TRIGGER_BAND}% | Slippage: ${(SLIPPAGE_BPS / 100).toFixed(2)}%`);
+  console.log(`📉 Trailing stop: ${ENABLE_TRAILING_PROFIT ? `${TRAILING_DISTANCE_PCT}%` : 'DISABLED'}`);
+  console.log(`🎯 Partial exits: ${ENABLE_PARTIAL_EXITS ? `${PARTIAL_EXIT_PCT}% @ ${PARTIAL_EXIT_TRIGGER}%` : 'DISABLED'}`);
+  console.log(`⏱️ Time-based exits: ${ENABLE_TIME_BASED_EXITS ? 'ENABLED' : 'DISABLED'} | Market age min: 3m`);
   console.log(`⏱️ Poll interval: ${POLL_INTERVAL_MS / 1000}s | Confirmations: ${CONFIRMATIONS}`);
   console.log(`🎯 Tracking ${PRICE_ORACLE_IDS.length} oracle(s): ${PRICE_ORACLE_IDS.join(', ')}`);
   console.log('');
   
   const provider = new ethers.JsonRpcProvider(RPC_URL);
 
-  try {
-    const net = await provider.getNetwork();
-    console.log(`🌐 Connected to chainId=${net.chainId}`);
-    if (Number(net.chainId) !== CHAIN_ID) {
-      console.error(`❌ Wrong network: expected ${CHAIN_ID}, got ${net.chainId}`);
+  if (!SIMULATION_MODE) {
+    try {
+      const net = await provider.getNetwork();
+      console.log(`🌐 Connected to chainId=${net.chainId}`);
+      if (Number(net.chainId) !== CHAIN_ID) {
+        console.error(`❌ Wrong network: expected ${CHAIN_ID}, got ${net.chainId}`);
+        process.exit(1);
+      }
+    } catch (e) {
+      console.error('💥 Network check failed:', e.message);
       process.exit(1);
     }
-  } catch (e) {
-    console.error('💥 Network check failed:', e.message);
-    process.exit(1);
+  } else {
+    console.log(`🎮 Simulation mode - skipping network validation`);
   }
 
-  const wallets = PRIVATE_KEYS.map(pk => {
-    const key = pk.startsWith('0x') ? pk : '0x' + pk;
-    return new ethers.Wallet(key, provider);
-  });
+  const wallets = SIMULATION_MODE
+    ? [{ address: '0xSimulation' + Math.random().toString(36).substring(2, 10), provider }]
+    : PRIVATE_KEYS.map(pk => {
+        const key = pk.startsWith('0x') ? pk : '0x' + pk;
+        return new ethers.Wallet(key, provider);
+      });
 
   // Load state
   const persisted = loadStateSync();
@@ -1207,6 +1547,51 @@ async function main() {
 
   process.on('SIGINT', () => {
     console.log('👋 Shutting down...');
+
+    // Print simulation summary if in simulation mode
+    if (SIMULATION_MODE) {
+      console.log('\n' + '='.repeat(60));
+      console.log('🎮 SIMULATION SUMMARY');
+      console.log('='.repeat(60));
+
+      for (const [addr, balance] of simulationBalances.entries()) {
+        const startBalance = SIMULATION_BALANCE_USDC;
+        const pnl = balance - startBalance;
+        const pnlPct = ((pnl / startBalance) * 100).toFixed(2);
+        const sign = pnl >= 0 ? '+' : '';
+
+        console.log(`\n💼 Wallet: ${addr}`);
+        console.log(`   Start: ${startBalance.toFixed(2)} USDC`);
+        console.log(`   End:   ${balance.toFixed(2)} USDC`);
+        console.log(`   PnL:   ${sign}${pnl.toFixed(2)} USDC (${sign}${pnlPct}%)`);
+      }
+
+      const completedTrades = tradeHistory.filter(t => t.action === 'SELL');
+      if (completedTrades.length > 0) {
+        const wins = completedTrades.filter(t => t.pnl > 0).length;
+        const losses = completedTrades.filter(t => t.pnl <= 0).length;
+        const winRate = ((wins / completedTrades.length) * 100).toFixed(1);
+
+        console.log(`\n📊 Trade Stats:`);
+        console.log(`   Total trades: ${completedTrades.length}`);
+        console.log(`   Wins: ${wins} | Losses: ${losses}`);
+        console.log(`   Win rate: ${winRate}%`);
+
+        const exitReasons = {};
+        completedTrades.forEach(t => {
+          const reason = t.exitReason || 'UNKNOWN';
+          exitReasons[reason] = (exitReasons[reason] || 0) + 1;
+        });
+
+        console.log(`\n🚪 Exit Reasons:`);
+        for (const [reason, count] of Object.entries(exitReasons)) {
+          console.log(`   ${reason}: ${count}`);
+        }
+      }
+
+      console.log('\n' + '='.repeat(60) + '\n');
+    }
+
     timers.forEach(t => clearInterval(t));
     process.exit(0);
   });
