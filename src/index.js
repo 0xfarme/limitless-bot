@@ -12,7 +12,6 @@ const ERC1155_ABI = require('./abis/ERC1155.json');
 const RPC_URL = process.env.RPC_URL;
 const CHAIN_ID = parseInt(process.env.CHAIN_ID || '8453', 10);
 
-// NEW: Support multiple oracle IDs (comma-separated)
 const PRICE_ORACLE_IDS = (process.env.PRICE_ORACLE_IDS || process.env.PRICE_ORACLE_ID || '')
   .split(',')
   .map(s => s.trim())
@@ -30,6 +29,11 @@ const STRATEGY_MODE = (process.env.STRATEGY_MODE || 'dominant').toLowerCase();
 const TRIGGER_PCT = process.env.TRIGGER_PCT ? Number(process.env.TRIGGER_PCT) : 55;
 const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND) : 5;
 
+// NEW: Pre-approval settings
+const PRE_APPROVE_USDC = process.env.PRE_APPROVE_USDC !== 'false'; // Default enabled
+const PRE_APPROVAL_INTERVAL_MS = parseInt(process.env.PRE_APPROVAL_INTERVAL_MS || '3600000', 10); // 1 hour
+const PRE_APPROVAL_AMOUNT_USDC = process.env.PRE_APPROVAL_AMOUNT_USDC ? Number(process.env.PRE_APPROVAL_AMOUNT_USDC) : 100;
+
 // Trailing profit settings
 const ENABLE_TRAILING_PROFIT = process.env.ENABLE_TRAILING_PROFIT === 'true';
 const TRAILING_DISTANCE_PCT = process.env.TRAILING_DISTANCE_PCT ? Number(process.env.TRAILING_DISTANCE_PCT) : 3;
@@ -39,7 +43,7 @@ const TRAILING_MAX_TIME_MINUTES = process.env.TRAILING_MAX_TIME_MINUTES ? Number
 const MIN_TIME_TO_ENTER_MINUTES = process.env.MIN_TIME_TO_ENTER_MINUTES ? Number(process.env.MIN_TIME_TO_ENTER_MINUTES) : 20;
 const MIN_TIME_TO_EXIT_MINUTES = process.env.MIN_TIME_TO_EXIT_MINUTES ? Number(process.env.MIN_TIME_TO_EXIT_MINUTES) : 5;
 const TIME_DECAY_THRESHOLD_MINUTES = process.env.TIME_DECAY_THRESHOLD_MINUTES ? Number(process.env.TIME_DECAY_THRESHOLD_MINUTES) : 15;
-const ENABLE_TIME_BASED_EXITS = process.env.ENABLE_TIME_BASED_EXITS !== 'false'; // Default true
+const ENABLE_TIME_BASED_EXITS = process.env.ENABLE_TIME_BASED_EXITS !== 'false';
 
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
 const STATE_FILE = process.env.STATE_FILE || path.join('data', 'state.json');
@@ -67,20 +71,14 @@ const MAX_GAS_ETH = process.env.MAX_GAS_ETH ? Number(process.env.MAX_GAS_ETH) : 
 const MAX_GAS_WEI = ethers.parseEther(String(MAX_GAS_ETH));
 
 // ========= State Management =========
-// Structure: Map<walletAddress, Map<marketAddress, { holding, completed }>>
 const userState = new Map();
+const tradeHistory = [];
+const failedExits = new Map();
+const tradingLocks = new Map();
 
-// Trade tracking for summary
-const tradeHistory = []; // Array of trade records
-
-// Failed exits tracking - prevents re-entry until manually resolved
-const failedExits = new Map(); // key: marketAddress, value: { timestamp, reason, pnl, attempts }
-
-// Trading locks to prevent concurrent buys on same market
-const tradingLocks = new Map(); // key: `${walletAddress}-${marketAddress}`, value: timestamp
-
-// Inactive market tracking - avoid repeatedly checking markets that alternate
-const inactiveMarkets = new Map(); // key: oracleId, value: { lastChecked, consecutiveInactive }
+// NEW: Track pre-approvals per wallet
+const preApprovedMarkets = new Map(); // key: walletAddress, value: Set of market addresses
+let lastPreApprovalTime = new Map(); // key: walletAddress, value: timestamp
 
 function getWalletState(addr) {
   if (!userState.has(addr)) {
@@ -132,7 +130,7 @@ function markExitFailed(marketAddress, wallet, reason, pnl, marketTitle) {
     reason,
     pnl,
     attempts: (existing?.attempts || 0) + 1,
-    status: 'BLOCKED' // Manual intervention required
+    status: 'BLOCKED'
   };
   
   failedExits.set(key, record);
@@ -179,7 +177,7 @@ function markMarketCompleted(addr, marketAddress) {
 }
 
 // ========= Trade Logging =========
-function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, amount, pnl = null, pnlPct = null, entryPrice = null, exitPrice = null, holdTimeMinutes = null, gasUsed = null) {
+function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, amount, pnl = null, pnlPct = null, entryPrice = null, exitPrice = null, holdTimeMinutes = null, gasUsed = null, triggerPrice = null) {
   const timestamp = new Date().toISOString();
   const record = {
     timestamp,
@@ -187,10 +185,11 @@ function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, am
     market: marketAddress,
     marketTitle,
     outcome,
-    action, // 'BUY' or 'SELL'
+    action,
     amount,
     entryPrice,
     exitPrice,
+    triggerPrice, // NEW: Log the price that triggered the buy
     pnl: pnl !== null ? Number(pnl) : null,
     pnlPct: pnlPct !== null ? Number(pnlPct) : null,
     holdTimeMinutes,
@@ -199,11 +198,10 @@ function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, am
   
   tradeHistory.push(record);
   
-  // Append to human-readable log file
   try {
     ensureDirSync(path.dirname(TRADES_LOG_FILE));
     if (action === 'BUY') {
-      const logLine = `${timestamp} | ${walletAddress.slice(0, 8)} | BUY | ${marketTitle} | Outcome ${outcome} | Amount: ${amount} | Price: ${entryPrice}%\n`;
+      const logLine = `${timestamp} | ${walletAddress.slice(0, 8)} | BUY | ${marketTitle} | Outcome ${outcome} | Amount: ${amount} | Entry Price: ${entryPrice}% | Trigger Price: ${triggerPrice}%\n`;
       fs.appendFileSync(TRADES_LOG_FILE, logLine);
     } else {
       const logLine = `${timestamp} | ${walletAddress.slice(0, 8)} | SELL | ${marketTitle} | Outcome ${outcome} | Amount: ${amount} | PnL: ${pnlPct.toFixed(2)}% | Hold: ${holdTimeMinutes}m | Gas: ${gasUsed.toFixed(4)}\n`;
@@ -213,27 +211,22 @@ function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, am
     console.warn('Failed to write trade log:', e.message);
   }
   
-  // Append to CSV for analysis
   try {
     ensureDirSync(path.dirname(TRADES_CSV_FILE));
     const csvExists = fs.existsSync(TRADES_CSV_FILE);
     
     if (!csvExists) {
-      // Write header
-      const header = 'timestamp,wallet,market,marketTitle,outcome,action,amount,entryPrice,exitPrice,pnl,pnlPct,holdTimeMinutes,gasUsed\n';
+      const header = 'timestamp,wallet,market,marketTitle,outcome,action,amount,entryPrice,triggerPrice,exitPrice,pnl,pnlPct,holdTimeMinutes,gasUsed\n';
       fs.writeFileSync(TRADES_CSV_FILE, header);
     }
     
-    const csvLine = `${timestamp},${walletAddress},${marketAddress},"${marketTitle}",${outcome},${action},${amount},${entryPrice || ''},${exitPrice || ''},${pnl || ''},${pnlPct || ''},${holdTimeMinutes || ''},${gasUsed || ''}\n`;
+    const csvLine = `${timestamp},${walletAddress},${marketAddress},"${marketTitle}",${outcome},${action},${amount},${entryPrice || ''},${triggerPrice || ''},${exitPrice || ''},${pnl || ''},${pnlPct || ''},${holdTimeMinutes || ''},${gasUsed || ''}\n`;
     fs.appendFileSync(TRADES_CSV_FILE, csvLine);
   } catch (e) {
     console.warn('Failed to write CSV:', e.message);
   }
   
-  // Update summary
   updateSummary();
-  
-  // Update analytics
   updateAnalytics();
 }
 
@@ -245,21 +238,18 @@ function updateAnalytics() {
     
     if (completedTrades.length === 0) return;
     
-    // Overall stats
     const wins = completedTrades.filter(t => t.pnl > 0);
     const losses = completedTrades.filter(t => t.pnl < 0);
     const totalPnL = completedTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
     const totalGas = completedTrades.reduce((sum, t) => sum + (t.gasUsed || 0), 0);
     const netPnL = totalPnL - totalGas;
     
-    // By outcome
     const outcome0Trades = completedTrades.filter(t => t.outcome === 0);
     const outcome1Trades = completedTrades.filter(t => t.outcome === 1);
     
     const outcome0Wins = outcome0Trades.filter(t => t.pnl > 0).length;
     const outcome1Wins = outcome1Trades.filter(t => t.pnl > 0).length;
     
-    // By price range at entry
     const priceRanges = {
       '50-60': completedTrades.filter(t => t.entryPrice >= 50 && t.entryPrice < 60),
       '60-70': completedTrades.filter(t => t.entryPrice >= 60 && t.entryPrice < 70),
@@ -282,13 +272,11 @@ function updateAnalytics() {
       }
     }
     
-    // Hold time analysis
     const avgHoldTime = completedTrades.reduce((sum, t) => sum + (t.holdTimeMinutes || 0), 0) / completedTrades.length;
     const shortTrades = completedTrades.filter(t => t.holdTimeMinutes < 15);
     const mediumTrades = completedTrades.filter(t => t.holdTimeMinutes >= 15 && t.holdTimeMinutes < 30);
     const longTrades = completedTrades.filter(t => t.holdTimeMinutes >= 30);
     
-    // Best and worst trades
     const sortedByPnL = [...completedTrades].sort((a, b) => b.pnlPct - a.pnlPct);
     const bestTrades = sortedByPnL.slice(0, 5).map(t => ({
       market: t.marketTitle,
@@ -381,7 +369,7 @@ function updateSummary() {
       totalPnL: totalPnL.toFixed(4),
       avgPnLPerTrade: (totalPnL / Math.max(completedTrades.length, 1)).toFixed(4),
       avgPnLPct: avgPnLPct.toFixed(2) + '%',
-      recentTrades: completedTrades.slice(-10).reverse() // Last 10 trades
+      recentTrades: completedTrades.slice(-10).reverse()
     };
     
     fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summary, null, 2));
@@ -391,8 +379,6 @@ function updateSummary() {
 }
 
 function loadTradeHistory() {
-  // Trade history is ephemeral per session, but we could load from log file if needed
-  // For now, just initialize empty
   return [];
 }
 
@@ -548,7 +534,6 @@ async function fetchMarket(oracleId) {
   try {
     const res = await axios.get(url, { timeout: 15000 });
     
-    // Log the response for debugging
     if (res.data && res.data.market) {
       console.log(`📡 Oracle ${oracleId}: ${res.data.market.title || 'Untitled'} | Active: ${res.data.isActive} | Address: ${res.data.market.address}`);
     }
@@ -561,87 +546,19 @@ async function fetchMarket(oracleId) {
 }
 
 async function fetchAllMarkets() {
-  const now = Date.now();
-
-  // Get current hour marker and minutes within hour
-  const currentHour = Math.floor(now / (60 * 60 * 1000));
-  const minutesIntoHour = Math.floor((now % (60 * 60 * 1000)) / (60 * 1000));
-
-  // During first 5 minutes of each hour, check all markets to determine which are active
-  const isDiscoveryPhase = minutesIntoHour < 5;
-
-  let oraclesToCheck;
-
-  if (isDiscoveryPhase) {
-    // Check all markets during discovery phase
-    oraclesToCheck = PRICE_ORACLE_IDS;
-    if (minutesIntoHour === 0 || !inactiveMarkets.size) {
-      console.log(`🔍 Hour ${currentHour} started - checking all markets to find active ones...`);
-    }
-  } else {
-    // After 5 minutes, only check markets that were active during discovery
-    oraclesToCheck = PRICE_ORACLE_IDS.filter(id => {
-      const inactive = inactiveMarkets.get(id);
-
-      // If no record, include it (shouldn't happen after discovery phase)
-      if (!inactive) return true;
-
-      // If marked inactive for this hour, skip it
-      if (inactive.hour === currentHour) {
-        return false;
-      }
-
-      // Different hour, include it
-      return true;
-    });
-
-    if (oraclesToCheck.length < PRICE_ORACLE_IDS.length) {
-      const skipped = PRICE_ORACLE_IDS.length - oraclesToCheck.length;
-      console.log(`⏭️  Skipping ${skipped} inactive market(s) for rest of hour`);
-    }
-  }
-
-  const promises = oraclesToCheck.map(id => fetchMarket(id));
+  const promises = PRICE_ORACLE_IDS.map(id => fetchMarket(id));
   const results = await Promise.allSettled(promises);
-
+  
   const markets = [];
   results.forEach((result, idx) => {
-    const oracleId = oraclesToCheck[idx];
-
     if (result.status === 'fulfilled' && result.value) {
-      const isActive = result.value.isActive;
-
-      // Update inactive tracking
-      if (!isActive) {
-        const existing = inactiveMarkets.get(oracleId);
-
-        // Only log if this is new information for this hour
-        if (!existing || existing.hour !== currentHour) {
-          inactiveMarkets.set(oracleId, {
-            hour: currentHour,
-            markedAt: now
-          });
-          console.log(`⏸️  Oracle ${oracleId}: Inactive for hour ${currentHour}`);
-        }
-      } else {
-        // Market is active
-        const wasInactive = inactiveMarkets.has(oracleId);
-        if (wasInactive) {
-          const existing = inactiveMarkets.get(oracleId);
-          if (existing.hour !== currentHour) {
-            console.log(`✅ Oracle ${oracleId}: Active in hour ${currentHour}`);
-          }
-          inactiveMarkets.delete(oracleId);
-        }
-      }
-
       markets.push({
-        oracleId,
+        oracleId: PRICE_ORACLE_IDS[idx],
         data: result.value
       });
     }
   });
-
+  
   return markets;
 }
 
@@ -650,7 +567,6 @@ function pickOutcome(prices) {
   const [p0, p1] = prices;
   
   if (STRATEGY_MODE === 'dominant') {
-    // DOMINANT: Buy the side that is >= TRIGGER_PCT (choose the higher if both)
     const p0ok = p0 >= TRIGGER_PCT;
     const p1ok = p1 >= TRIGGER_PCT;
     if (p0ok || p1ok) {
@@ -658,7 +574,6 @@ function pickOutcome(prices) {
     }
     return null;
   } else {
-    // OPPOSITE/CONTRARIAN: if a side is within TRIGGER_BAND of TRIGGER_PCT, buy the opposite side
     const low = TRIGGER_PCT - TRIGGER_BAND;
     const high = TRIGGER_PCT + TRIGGER_BAND;
     if (p0 >= low && p0 <= high) return 1;
@@ -688,7 +603,6 @@ function validateMarketTiming(marketInfo, wallet) {
       const remainingMs = deadlineMs - nowMs;
       const remainingMinutes = remainingMs / 60000;
       
-      // Don't enter if too close to deadline
       if (remainingMinutes < MIN_TIME_TO_ENTER_MINUTES) {
         logInfo(wallet.address, '⏰', `Only ${remainingMinutes.toFixed(1)}m left < ${MIN_TIME_TO_ENTER_MINUTES}m - too risky to enter`);
         return false;
@@ -719,37 +633,31 @@ function calculateTimeBasedAdjustments(marketInfo) {
   const remainingMinutes = remainingMs / 60000;
   result.remainingMinutes = remainingMinutes;
   
-  // Define time phases in hourly market (assumes 60-min duration)
   if (remainingMinutes > 30) {
-    // Early phase: 30+ minutes left
     result.timePhase = 'early';
-    result.positionSizeMultiplier = 1.0; // Full size
-    result.profitTargetMultiplier = 1.0; // Normal target
-    result.stopLossMultiplier = 1.0; // Normal stop
+    result.positionSizeMultiplier = 1.0;
+    result.profitTargetMultiplier = 1.0;
+    result.stopLossMultiplier = 1.0;
   } 
   else if (remainingMinutes > 20) {
-    // Mid phase: 20-30 minutes left
     result.timePhase = 'mid';
-    result.positionSizeMultiplier = 1.0; // Full size
-    result.profitTargetMultiplier = 1.0; // Normal target
-    result.stopLossMultiplier = 1.0; // Normal stop
+    result.positionSizeMultiplier = 1.0;
+    result.profitTargetMultiplier = 1.0;
+    result.stopLossMultiplier = 1.0;
   }
   else if (remainingMinutes > TIME_DECAY_THRESHOLD_MINUTES) {
-    // Late phase: 15-20 minutes left
     result.timePhase = 'late';
-    result.positionSizeMultiplier = 0.75; // Reduce position size
-    result.profitTargetMultiplier = 0.85; // Lower profit target (12% → 10.2%)
-    result.stopLossMultiplier = 0.75; // Tighter stop loss (-8% → -6%)
+    result.positionSizeMultiplier = 0.75;
+    result.profitTargetMultiplier = 0.85;
+    result.stopLossMultiplier = 0.75;
   }
   else if (remainingMinutes > MIN_TIME_TO_EXIT_MINUTES) {
-    // Critical phase: 5-15 minutes left
     result.timePhase = 'critical';
-    result.positionSizeMultiplier = 0.5; // Half size only
-    result.profitTargetMultiplier = 0.7; // Much lower target (12% → 8.4%)
-    result.stopLossMultiplier = 0.5; // Much tighter stop (-8% → -4%)
+    result.positionSizeMultiplier = 0.5;
+    result.profitTargetMultiplier = 0.7;
+    result.stopLossMultiplier = 0.5;
   }
   else {
-    // Danger zone: < 5 minutes - force exit any position
     result.timePhase = 'danger';
     result.shouldForceExit = true;
   }
@@ -757,19 +665,104 @@ function calculateTimeBasedAdjustments(marketInfo) {
   return result;
 }
 
+// ========= NEW: Pre-Approval Functions =========
+async function preApproveMarketsForWallet(wallet, provider, markets) {
+  if (!PRE_APPROVE_USDC) return;
+  
+  const walletAddr = wallet.address;
+  const now = Date.now();
+  const lastRun = lastPreApprovalTime.get(walletAddr) || 0;
+  
+  // Check if it's time to run
+  if (now - lastRun < PRE_APPROVAL_INTERVAL_MS) {
+    return;
+  }
+  
+  logInfo(walletAddr, '🔐', 'Running periodic USDC pre-approval...');
+  lastPreApprovalTime.set(walletAddr, now);
+  
+  if (!preApprovedMarkets.has(walletAddr)) {
+    preApprovedMarkets.set(walletAddr, new Set());
+  }
+  const approvedSet = preApprovedMarkets.get(walletAddr);
+  
+  let approvedCount = 0;
+  let skippedCount = 0;
+  
+  for (const { data: marketData } of markets) {
+    if (!marketData || !marketData.market || !marketData.isActive) continue;
+    
+    const marketInfo = marketData.market;
+    const marketAddress = ethers.getAddress(marketInfo.address);
+    const collateralTokenAddress = ethers.getAddress(marketInfo.collateralToken.address);
+    
+    // Skip if already approved
+    if (approvedSet.has(marketAddress)) {
+      skippedCount++;
+      continue;
+    }
+    
+    try {
+      const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
+      const decimals = Number(await usdc.decimals());
+      const approvalAmount = ethers.parseUnits(PRE_APPROVAL_AMOUNT_USDC.toString(), decimals);
+      
+      // Check current allowance
+      const current = await readAllowance(usdc, walletAddr, marketAddress);
+      
+      if (current >= approvalAmount) {
+        approvedSet.add(marketAddress);
+        skippedCount++;
+        continue;
+      }
+      
+      // Reset if needed
+      if (current > 0n) {
+        try {
+          const tx0 = await usdc.approve(marketAddress, 0n, await txOverrides(wallet.provider, 100000n));
+          await tx0.wait(CONFIRMATIONS);
+          await delay(1000);
+        } catch (e) {
+          logWarn(walletAddr, '⚠️', `Reset failed for ${marketInfo.title?.slice(0, 30)}`);
+        }
+      }
+      
+      // Approve
+      const gasEst = await estimateGasFor(usdc, wallet, 'approve', [marketAddress, approvalAmount]);
+      if (!gasEst) {
+        logWarn(walletAddr, '⚠️', `Gas estimate failed for ${marketInfo.title?.slice(0, 30)}`);
+        continue;
+      }
+      
+      const pad = (gasEst * 120n) / 100n + 10000n;
+      const tx = await usdc.approve(marketAddress, approvalAmount, await txOverrides(wallet.provider, pad));
+      await tx.wait(CONFIRMATIONS);
+      
+      approvedSet.add(marketAddress);
+      approvedCount++;
+      
+      logInfo(walletAddr, '✅', `Pre-approved: ${marketInfo.title?.slice(0, 40)} ($${PRE_APPROVAL_AMOUNT_USDC})`);
+      
+      await delay(2000);
+      
+    } catch (e) {
+      logErr(walletAddr, '❌', `Pre-approval failed for ${marketInfo.title?.slice(0, 30)}`, e.message);
+    }
+  }
+  
+  logInfo(walletAddr, '🎉', `Pre-approval complete: ${approvedCount} new, ${skippedCount} already approved`);
+}
+
 // ========= Approval Functions =========
 async function readAllowance(usdc, owner, spender) {
   try {
-    // Try direct call first
     const allowance = await usdc.allowance(owner, spender);
     return allowance;
   } catch (e) {
-    // Fallback 1: Try staticCall
     try {
       const allowance = await usdc.allowance.staticCall(owner, spender);
       return allowance;
     } catch (e2) {
-      // Fallback 2: Manual call encoding
       try {
         const iface = usdc.interface;
         const data = iface.encodeFunctionData('allowance', [owner, spender]);
@@ -780,7 +773,6 @@ async function readAllowance(usdc, owner, spender) {
         const decoded = iface.decodeFunctionResult('allowance', result);
         return decoded[0];
       } catch (e3) {
-        // If all methods fail, assume zero allowance and log warning
         console.warn(`Warning: Could not read allowance, assuming 0. Error: ${e3.message}`);
         return 0n;
       }
@@ -789,6 +781,22 @@ async function readAllowance(usdc, owner, spender) {
 }
 
 async function ensureUsdcApproval(wallet, usdc, marketAddress, needed) {
+  // Check if already pre-approved
+  const walletAddr = wallet.address;
+  const approvedSet = preApprovedMarkets.get(walletAddr);
+  if (approvedSet && approvedSet.has(marketAddress)) {
+    // Verify it's still valid
+    try {
+      const current = await readAllowance(usdc, walletAddr, marketAddress);
+      if (current >= needed) {
+        logInfo(walletAddr, '⚡', 'Using pre-approved allowance (instant)');
+        return true;
+      }
+    } catch (e) {
+      // Fall through to normal approval
+    }
+  }
+  
   let current;
   try {
     current = await readAllowance(usdc, wallet.address, marketAddress);
@@ -805,7 +813,6 @@ async function ensureUsdcApproval(wallet, usdc, marketAddress, needed) {
   
   logInfo(wallet.address, '🔓', `Approving ${ethers.formatUnits(needed, 6)} USDC...`);
   
-  // Some tokens require resetting to 0 first (like USDT)
   if (current > 0n) {
     try {
       logInfo(wallet.address, '🔄', `Resetting allowance to 0 first...`);
@@ -817,11 +824,10 @@ async function ensureUsdcApproval(wallet, usdc, marketAddress, needed) {
         const tx0 = await usdc.approve(marketAddress, 0n, await txOverrides(wallet.provider, pad0));
         logInfo(wallet.address, '🧾', `Reset tx: ${tx0.hash.slice(0, 10)}...`);
         await tx0.wait(CONFIRMATIONS);
-        await delay(1000); // Give it time to settle
+        await delay(1000);
       }
     } catch (e) {
       logWarn(wallet.address, '⚠️', `Reset to 0 failed: ${e.message}`);
-      // Continue anyway, might still work
     }
   }
   
@@ -837,7 +843,6 @@ async function ensureUsdcApproval(wallet, usdc, marketAddress, needed) {
     logInfo(wallet.address, '🧾', `Approve tx: ${tx.hash.slice(0, 10)}...`);
     await tx.wait(CONFIRMATIONS);
     
-    // Wait and verify
     await delay(1000);
     try {
       const after = await readAllowance(usdc, wallet.address, marketAddress);
@@ -845,7 +850,6 @@ async function ensureUsdcApproval(wallet, usdc, marketAddress, needed) {
       logInfo(wallet.address, success ? '✅' : '⚠️', `Allowance after: ${ethers.formatUnits(after, 6)} USDC`);
       return success;
     } catch (e) {
-      // Assume success if we can't read
       logWarn(wallet.address, '⚠️', 'Could not verify allowance, assuming success');
       return true;
     }
@@ -881,7 +885,7 @@ async function ensureErc1155Approval(wallet, erc1155, operator) {
 }
 
 // ========= Contract Cache =========
-const contractCache = new Map(); // key: marketAddress, value: { market, usdc, erc1155, decimals }
+const contractCache = new Map();
 
 async function getContracts(wallet, provider, marketAddress, collateralTokenAddress) {
   const cacheKey = marketAddress;
@@ -890,7 +894,6 @@ async function getContracts(wallet, provider, marketAddress, collateralTokenAddr
   }
   
   try {
-    // Verify contracts have code before trying to interact
     const [marketHasCode, usdcHasCode] = await Promise.all([
       isContract(provider, marketAddress),
       isContract(provider, collateralTokenAddress)
@@ -906,25 +909,20 @@ async function getContracts(wallet, provider, marketAddress, collateralTokenAddr
     const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
     const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
     
-    // Try to get conditionalTokens address with multiple strategies
     let conditionalTokensAddress;
     try {
-      // Strategy 1: Direct call
       conditionalTokensAddress = await market.conditionalTokens();
       
-      // Verify it returned a valid address
       if (!conditionalTokensAddress || conditionalTokensAddress === ethers.ZeroAddress) {
         throw new Error('returned zero address');
       }
     } catch (e) {
-      // Strategy 2: Try with staticCall
       try {
         conditionalTokensAddress = await market.conditionalTokens.staticCall();
         if (!conditionalTokensAddress || conditionalTokensAddress === ethers.ZeroAddress) {
           throw new Error('returned zero address');
         }
       } catch (e2) {
-        // Strategy 3: Manual encoding
         try {
           const iface = market.interface;
           const data = iface.encodeFunctionData('conditionalTokens', []);
@@ -967,7 +965,6 @@ async function processMarket(wallet, provider, oracleId, marketData) {
     const marketInfo = marketData.market;
     const marketAddress = ethers.getAddress(marketInfo.address);
     
-    // Check if market is blocked due to previous failed exit
     if (isMarketBlocked(marketAddress)) {
       return;
     }
@@ -978,17 +975,15 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
     logInfo(wallet.address, '📊', `Oracle ${oracleId}: ${marketInfo.title || 'Untitled'}`);
     
-    // Log key market info for debugging
+    // NEW: Log current prices for transparency
     if (prices.length >= 2) {
-      logInfo(wallet.address, '💹', `Prices: ${prices[0]}/${prices[1]}`);
+      logInfo(wallet.address, '💹', `Current Prices: ${prices[0].toFixed(1)}% / ${prices[1].toFixed(1)}%`);
     }
 
-    // Validate timing
     if (!validateMarketTiming(marketInfo, wallet)) {
       return;
     }
 
-    // Get contracts
     let contracts;
     try {
       contracts = await getContracts(wallet, provider, marketAddress, collateralTokenAddress);
@@ -999,7 +994,6 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
     const { market, usdc, erc1155, decimals } = contracts;
 
-    // Check position
     const localHolding = getHolding(wallet.address, marketAddress);
     const pid0 = positionIds[0] ? BigInt(positionIds[0]) : null;
     const pid1 = positionIds[1] ? BigInt(positionIds[1]) : null;
@@ -1010,10 +1004,8 @@ async function processMarket(wallet, provider, oracleId, marketData) {
     const hasPosition = (bal0 > 0n) || (bal1 > 0n) || !!localHolding;
 
     if (hasPosition) {
-      // CRITICAL: Already have a position in this market, do not open another
       logInfo(wallet.address, '🔒', `Already holding position in this market - managing exit`);
       
-      // Manage existing position
       let outcomeIndex = bal0 > 0n ? 0 : 1;
       let tokenId = bal0 > 0n ? pid0 : pid1;
       let tokenBalance = bal0 > 0n ? bal0 : bal1;
@@ -1046,48 +1038,10 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
       const valueHuman = fmtUnitsPrec(positionValue, decimals);
       const pnlSign = pnlAbs >= 0n ? '📈' : '📉';
+      
+      logInfo(wallet.address, pnlSign, `Value: ${valueHuman} | PnL: ${pnlPct.toFixed(1)}%`);
 
-      // Calculate time remaining until market deadline
-      let minutesRemaining = Infinity;
-      if (marketInfo.deadline) {
-        const deadlineMs = new Date(marketInfo.deadline).getTime();
-        if (!Number.isNaN(deadlineMs)) {
-          const remainingMs = deadlineMs - Date.now();
-          minutesRemaining = remainingMs / 60000;
-        }
-      }
-
-      // Track peak PnL for trailing stop
-      if (!holding.peakPnLPct || pnlPct > holding.peakPnLPct) {
-        holding.peakPnLPct = pnlPct;
-        setHolding(wallet.address, marketAddress, holding);
-      }
-      const peakPnLPct = holding.peakPnLPct || pnlPct;
-
-      logInfo(wallet.address, pnlSign, `Value: ${valueHuman} | PnL: ${pnlPct.toFixed(1)}% | Peak: ${peakPnLPct.toFixed(1)}% | Time left: ${minutesRemaining.toFixed(0)}m`);
-
-      // Check for exit conditions:
-      let shouldSell = false;
-      let exitReason = '';
-
-      // 1. Trailing stop: Once we hit profit target, use 3% trailing stop
-      if (peakPnLPct >= TARGET_PROFIT_PCT) {
-        const trailingStop = peakPnLPct - 3;
-        if (pnlPct <= trailingStop) {
-          shouldSell = true;
-          exitReason = `TRAILING_STOP (Peak: ${peakPnLPct.toFixed(1)}%, Now: ${pnlPct.toFixed(1)}%)`;
-          logInfo(wallet.address, '📉', `Trailing stop hit: ${exitReason}`);
-        }
-      }
-
-      // 2. Stop loss: Only in last 10 minutes
-      if (!shouldSell && minutesRemaining <= 10 && pnlPct <= STOP_LOSS_PCT) {
-        shouldSell = true;
-        exitReason = 'STOP_LOSS';
-        logInfo(wallet.address, '⚠️', `Stop loss active in final 10 minutes`);
-      }
-
-      if (shouldSell) {
+      if (pnlAbs > 0n && pnlPct >= TARGET_PROFIT_PCT) {
         const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
         if (!approvedOk) {
           logWarn(wallet.address, '🛑', 'ERC1155 approval failed');
@@ -1108,11 +1062,8 @@ async function processMarket(wallet, provider, oracleId, marketData) {
         
         logInfo(wallet.address, '🧾', `Sell tx: ${tx.hash.slice(0, 10)}...`);
         await tx.wait(CONFIRMATIONS);
-
-        const exitEmoji = pnlPct >= 0 ? '✅' : '🛑';
-        logInfo(wallet.address, exitEmoji, `SOLD at ${pnlPct.toFixed(1)}% (${exitReason || 'EXIT'})`);
+        logInfo(wallet.address, '✅', `SOLD at ${pnlPct.toFixed(1)}% profit`);
         
-        // Log the trade
         const pnlAmount = Number(ethers.formatUnits(pnlAbs, decimals));
         logTrade(
           wallet.address,
@@ -1135,7 +1086,6 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       return;
     }
 
-    // No position - look for entry
     if (!Array.isArray(prices) || prices.length < 2) {
       return;
     }
@@ -1145,8 +1095,6 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       return;
     }
     
-    // CRITICAL CHECK: Ensure we don't have any position in this market
-    // This prevents opening multiple positions in the same market
     if (bal0 > 0n || bal1 > 0n || localHolding) {
       logInfo(wallet.address, '🔒', 'Position exists - cannot open another in same market');
       return;
@@ -1160,9 +1108,13 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
     const outcomeToBuy = pickOutcome(prices);
     if (outcomeToBuy === null) {
-      logInfo(wallet.address, '🔎', `No signal (${prices[0]}/${prices[1]})`);
+      logInfo(wallet.address, '🔎', `No signal (${prices[0].toFixed(1)}%/${prices[1].toFixed(1)}%)`);
       return;
     }
+
+    // NEW: Log the trigger price - the price that caused the buy signal
+    const triggerPrice = prices[outcomeToBuy];
+    logInfo(wallet.address, '🎯', `BUY SIGNAL: Outcome ${outcomeToBuy} at trigger price ${triggerPrice.toFixed(1)}%`);
 
     const investment = ethers.parseUnits(BUY_AMOUNT_USDC.toString(), decimals);
 
@@ -1194,11 +1146,14 @@ async function processMarket(wallet, provider, oracleId, marketData) {
     
     logInfo(wallet.address, '🧾', `Buy tx: ${tx.hash.slice(0, 10)}...`);
     await tx.wait(CONFIRMATIONS);
-    logInfo(wallet.address, '✅', 'BUY completed');
+    
+    // Get actual entry price after buy
+    const entryPrice = prices[outcomeToBuy];
+    logInfo(wallet.address, '✅', `BUY completed at ${entryPrice.toFixed(1)}%`);
 
     const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
     
-    // Log the buy trade
+    // NEW: Log buy with both trigger price and actual entry price
     logTrade(
       wallet.address,
       marketAddress,
@@ -1207,7 +1162,12 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       'BUY',
       BUY_AMOUNT_USDC,
       null,
-      null
+      null,
+      entryPrice,
+      null,
+      null,
+      null,
+      triggerPrice
     );
     
     setHolding(wallet.address, marketAddress, {
@@ -1217,7 +1177,6 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       cost: investment
     });
 
-    // Confirm balance
     for (let i = 0; i < 3; i++) {
       const balNow = await safeBalanceOf(erc1155, wallet.address, tokenId);
       if (balNow > 0n) {
@@ -1246,7 +1205,9 @@ async function runForWallet(wallet, provider) {
 
     logInfo(wallet.address, '🔄', `Processing ${markets.length} markets...`);
 
-    // Process markets sequentially to avoid race conditions
+    // NEW: Run pre-approval before processing markets
+    await preApproveMarketsForWallet(wallet, provider, markets);
+
     for (const { oracleId, data } of markets) {
       await processMarket(wallet, provider, oracleId, data);
     }
@@ -1264,6 +1225,7 @@ async function main() {
   console.log(`💰 Position size: ${BUY_AMOUNT_USDC}`);
   console.log(`📈 Target profit: ${TARGET_PROFIT_PCT}% | Stop loss: ${STOP_LOSS_PCT}%`);
   console.log(`🎚️ Entry trigger: ${TRIGGER_PCT}% | Slippage: ${(SLIPPAGE_BPS / 100).toFixed(2)}%`);
+  console.log(`🔐 Pre-approval: ${PRE_APPROVE_USDC ? `Enabled (every ${PRE_APPROVAL_INTERVAL_MS/60000}min, $${PRE_APPROVAL_AMOUNT_USDC})` : 'Disabled'}`);
   console.log(`⏱️ Poll interval: ${POLL_INTERVAL_MS / 1000}s | Confirmations: ${CONFIRMATIONS}`);
   console.log(`🎯 Tracking ${PRICE_ORACLE_IDS.length} oracle(s): ${PRICE_ORACLE_IDS.join(', ')}`);
   console.log('');
@@ -1287,20 +1249,17 @@ async function main() {
     return new ethers.Wallet(key, provider);
   });
 
-  // Load state
   const persisted = loadStateSync();
   for (const [addr, marketMap] of persisted.entries()) {
     userState.set(addr, marketMap);
   }
   
-  // Initialize trade history (starts fresh each session)
   loadTradeHistory();
 
   for (const w of wallets) {
     console.log(`🔑 Loaded wallet: ${w.address.slice(0, 6)}...${w.address.slice(-4)}`);
   }
   
-  // Print initial summary if exists
   if (fs.existsSync(SUMMARY_FILE)) {
     try {
       const summary = JSON.parse(fs.readFileSync(SUMMARY_FILE, 'utf8'));
