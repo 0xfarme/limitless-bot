@@ -542,15 +542,75 @@ function validateMarketTiming(marketInfo, wallet) {
     const deadlineMs = new Date(marketInfo.deadline).getTime();
     if (!Number.isNaN(deadlineMs)) {
       const remainingMs = deadlineMs - nowMs;
-      if (remainingMs < 5 * 60 * 1000) {
-        const remMin = Math.floor(remainingMs / 60000);
-        logInfo(wallet.address, '⏰', `Deadline in ${remMin}m < 5m - skip`);
+      const remainingMinutes = remainingMs / 60000;
+      
+      // Don't enter if too close to deadline
+      if (remainingMinutes < MIN_TIME_TO_ENTER_MINUTES) {
+        logInfo(wallet.address, '⏰', `Only ${remainingMinutes.toFixed(1)}m left < ${MIN_TIME_TO_ENTER_MINUTES}m - too risky to enter`);
         return false;
       }
     }
   }
   
   return true;
+}
+
+function calculateTimeBasedAdjustments(marketInfo) {
+  const nowMs = Date.now();
+  const result = {
+    remainingMinutes: null,
+    positionSizeMultiplier: 1.0,
+    profitTargetMultiplier: 1.0,
+    stopLossMultiplier: 1.0,
+    shouldForceExit: false,
+    timePhase: 'unknown'
+  };
+  
+  if (!marketInfo.deadline) return result;
+  
+  const deadlineMs = new Date(marketInfo.deadline).getTime();
+  if (Number.isNaN(deadlineMs)) return result;
+  
+  const remainingMs = deadlineMs - nowMs;
+  const remainingMinutes = remainingMs / 60000;
+  result.remainingMinutes = remainingMinutes;
+  
+  // Define time phases in hourly market (assumes 60-min duration)
+  if (remainingMinutes > 30) {
+    // Early phase: 30+ minutes left
+    result.timePhase = 'early';
+    result.positionSizeMultiplier = 1.0; // Full size
+    result.profitTargetMultiplier = 1.0; // Normal target
+    result.stopLossMultiplier = 1.0; // Normal stop
+  } 
+  else if (remainingMinutes > 20) {
+    // Mid phase: 20-30 minutes left
+    result.timePhase = 'mid';
+    result.positionSizeMultiplier = 1.0; // Full size
+    result.profitTargetMultiplier = 1.0; // Normal target
+    result.stopLossMultiplier = 1.0; // Normal stop
+  }
+  else if (remainingMinutes > TIME_DECAY_THRESHOLD_MINUTES) {
+    // Late phase: 15-20 minutes left
+    result.timePhase = 'late';
+    result.positionSizeMultiplier = 0.75; // Reduce position size
+    result.profitTargetMultiplier = 0.85; // Lower profit target (12% → 10.2%)
+    result.stopLossMultiplier = 0.75; // Tighter stop loss (-8% → -6%)
+  }
+  else if (remainingMinutes > MIN_TIME_TO_EXIT_MINUTES) {
+    // Critical phase: 5-15 minutes left
+    result.timePhase = 'critical';
+    result.positionSizeMultiplier = 0.5; // Half size only
+    result.profitTargetMultiplier = 0.7; // Much lower target (12% → 8.4%)
+    result.stopLossMultiplier = 0.5; // Much tighter stop (-8% → -4%)
+  }
+  else {
+    // Danger zone: < 5 minutes - force exit any position
+    result.timePhase = 'danger';
+    result.shouldForceExit = true;
+  }
+  
+  return result;
 }
 
 // ========= Approval Functions =========
