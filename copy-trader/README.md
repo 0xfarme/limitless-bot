@@ -5,6 +5,7 @@ Automatically copy trades from any wallet on Limitless Exchange. Mirror position
 ## 🌟 Features
 
 - **Real-time Position Tracking** - Monitor target wallet via Limitless API
+- **Position Addition Detection** - Copy when target adds to positions ⭐ NEW
 - **Flexible Position Sizing** - Copy by ratio or fixed amount
 - **Auto-Close on Exit** - Automatically close when target closes
 - **Risk Management** - Stop loss and take profit levels
@@ -73,9 +74,10 @@ npm start
 
 1. **Polls target wallet** every 10 seconds (configurable)
 2. **Detects new positions** by comparing with previous snapshot
-3. **Fetches market details** to check filters
-4. **Calculates copy amount** based on settings
-5. **Executes trade** if all conditions met
+3. **Detects position additions** when target increases existing position ⭐ NEW
+4. **Fetches market details** to check filters
+5. **Calculates copy amount** based on settings
+6. **Executes trade** if all conditions met
 
 ### Auto-Close Logic
 
@@ -117,6 +119,19 @@ FIXED_POSITION_SIZE_USDC=10       # Always bet $10 regardless of target
 # Limits (apply to both modes)
 MIN_POSITION_SIZE_USDC=1          # Minimum to copy
 MAX_POSITION_SIZE_USDC=100        # Maximum per position
+```
+
+### Position Additions ⭐ NEW
+
+```bash
+# Copy when target adds to existing positions
+COPY_POSITION_ADDITIONS=true
+
+# Only copy if they add 20%+ to position
+MIN_ADDITION_THRESHOLD_PCT=20
+
+# Max amount to copy for additions
+MAX_ADDITION_SIZE_USDC=50
 ```
 
 ### Filtering

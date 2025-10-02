@@ -21,6 +21,11 @@ const FIXED_POSITION_SIZE_USDC = process.env.FIXED_POSITION_SIZE_USDC ? Number(p
 const MIN_POSITION_SIZE_USDC = process.env.MIN_POSITION_SIZE_USDC ? Number(process.env.MIN_POSITION_SIZE_USDC) : 1;
 const MAX_POSITION_SIZE_USDC = process.env.MAX_POSITION_SIZE_USDC ? Number(process.env.MAX_POSITION_SIZE_USDC) : 100;
 
+// Position addition tracking
+const COPY_POSITION_ADDITIONS = process.env.COPY_POSITION_ADDITIONS === 'true';
+const MIN_ADDITION_THRESHOLD_PCT = process.env.MIN_ADDITION_THRESHOLD_PCT ? Number(process.env.MIN_ADDITION_THRESHOLD_PCT) : 20;
+const MAX_ADDITION_SIZE_USDC = process.env.MAX_ADDITION_SIZE_USDC ? Number(process.env.MAX_ADDITION_SIZE_USDC) : 50;
+
 // Execution settings
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
 const SLIPPAGE_BPS = parseInt(process.env.SLIPPAGE_BPS || '150', 10);
@@ -387,6 +392,113 @@ async function copyPosition(position, wallet, provider) {
   saveState();
 }
 
+async function copyPositionAddition(addedAmount, position, wallet, provider) {
+  const marketAddress = position.market.address.toLowerCase();
+  const outcomeIndex = position.outcomeIndex;
+  const positionKey = `${marketAddress}-${outcomeIndex}`;
+
+  log('➕', `Target added to position: ${position.market.title} - ${addedAmount.toFixed(2)} USDC`);
+
+  // Calculate how much to copy of the addition
+  let copyAddAmount;
+  if (FIXED_POSITION_SIZE_USDC) {
+    copyAddAmount = FIXED_POSITION_SIZE_USDC;
+  } else {
+    copyAddAmount = addedAmount * COPY_RATIO;
+  }
+
+  // Apply limits
+  if (copyAddAmount < MIN_POSITION_SIZE_USDC) {
+    log('⏭️', `Addition too small: $${copyAddAmount.toFixed(2)}`);
+    return;
+  }
+  if (copyAddAmount > MAX_ADDITION_SIZE_USDC) {
+    copyAddAmount = MAX_ADDITION_SIZE_USDC;
+  }
+
+  log('🔄', `Copying addition: $${copyAddAmount.toFixed(2)}`);
+
+  if (SIMULATION_MODE) {
+    // Simulation mode
+    if (simulationBalance < copyAddAmount) {
+      log('⚠️', `[SIM] Insufficient balance: ${simulationBalance.toFixed(2)}`);
+      return;
+    }
+
+    simulationBalance -= copyAddAmount;
+    log('✅', `[SIM] Copied addition | Balance: ${simulationBalance.toFixed(2)}`);
+
+    // Update our position size
+    const ourPosition = copiedPositions.get(positionKey);
+    if (ourPosition) {
+      ourPosition.amount += copyAddAmount;
+      copiedPositions.set(positionKey, ourPosition);
+    }
+
+    logTrade('ADD_POSITION', position.market.title, outcomeIndex, copyAddAmount, {
+      addedAmount,
+      simulation: true
+    });
+
+  } else {
+    // Real mode - execute additional buy
+    try {
+      const marketDetails = await fetchMarketDetails(marketAddress);
+      if (!marketDetails) {
+        log('❌', 'Failed to fetch market details');
+        return;
+      }
+
+      const collateralTokenAddress = marketDetails.collateralToken.address;
+      const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
+      const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
+
+      const decimals = Number(await usdc.decimals());
+      const investment = ethers.parseUnits(copyAddAmount.toString(), decimals);
+
+      // Check balance
+      const usdcBal = await usdc.balanceOf(wallet.address);
+      if (usdcBal < investment) {
+        log('❌', 'Insufficient USDC balance for addition');
+        return;
+      }
+
+      // Approve USDC
+      const approved = await ensureUsdcApproval(wallet, usdc, marketAddress, investment);
+      if (!approved) return;
+
+      // Calculate tokens
+      const expectedTokens = await market.calcBuyAmount(investment, outcomeIndex);
+      const minTokens = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
+
+      // Execute buy
+      log('📝', `Executing addition buy...`);
+      const tx = await market.buy(investment, outcomeIndex, minTokens, await txOverrides(wallet.provider, 300000n));
+      log('🧾', `Tx: ${tx.hash}`);
+      await tx.wait(CONFIRMATIONS);
+      log('✅', 'Addition copied successfully');
+
+      // Update our position size
+      const ourPosition = copiedPositions.get(positionKey);
+      if (ourPosition) {
+        ourPosition.amount += copyAddAmount;
+        ourPosition.txHash = tx.hash; // Update with latest tx
+        copiedPositions.set(positionKey, ourPosition);
+      }
+
+      logTrade('ADD_POSITION', position.market.title, outcomeIndex, copyAddAmount, {
+        addedAmount,
+        txHash: tx.hash
+      });
+
+    } catch (e) {
+      console.error('❌ Failed to copy addition:', e.message);
+    }
+  }
+
+  saveState();
+}
+
 async function closePosition(positionKey, reason, wallet, provider) {
   const position = copiedPositions.get(positionKey);
   if (!position) return;
@@ -487,6 +599,26 @@ async function monitorAndCopy(wallet, provider) {
       if (!targetPositionsSnapshot.has(key)) {
         // New position detected
         await copyPosition(position, wallet, provider);
+      } else if (COPY_POSITION_ADDITIONS) {
+        // Position exists - check for additions
+        const previousPosition = targetPositionsSnapshot.get(key);
+        const previousAmount = Number(previousPosition.collateralAmount || previousPosition.amount || 0);
+        const currentAmount = Number(position.collateralAmount || position.amount || 0);
+
+        if (currentAmount > previousAmount) {
+          const addedAmount = currentAmount - previousAmount;
+          const increasePercent = ((addedAmount / previousAmount) * 100).toFixed(1);
+
+          // Only copy if increase is significant
+          if (addedAmount / previousAmount * 100 >= MIN_ADDITION_THRESHOLD_PCT) {
+            log('📈', `Target increased position by ${increasePercent}% (+$${addedAmount.toFixed(2)})`);
+            await copyPositionAddition(addedAmount, position, wallet, provider);
+          } else {
+            if (VERBOSE_LOGGING) {
+              log('⏭️', `Addition too small: ${increasePercent}% (threshold: ${MIN_ADDITION_THRESHOLD_PCT}%)`);
+            }
+          }
+        }
       }
     }
 
@@ -537,6 +669,7 @@ async function main() {
   console.log(`👤 Target Wallet: ${TARGET_WALLET}`);
   console.log(`💰 Copy Settings: ${FIXED_POSITION_SIZE_USDC ? `Fixed $${FIXED_POSITION_SIZE_USDC}` : `Ratio ${COPY_RATIO}x`}`);
   console.log(`📊 Limits: Min $${MIN_POSITION_SIZE_USDC} | Max $${MAX_POSITION_SIZE_USDC}`);
+  console.log(`➕ Position Additions: ${COPY_POSITION_ADDITIONS ? `Enabled (>${MIN_ADDITION_THRESHOLD_PCT}%, max $${MAX_ADDITION_SIZE_USDC})` : 'Disabled'}`);
   console.log(`🛡️ Risk: Stop Loss ${STOP_LOSS_PCT}% | Take Profit ${TAKE_PROFIT_PCT}%`);
   console.log(`🔄 Auto-close on target exit: ${AUTO_CLOSE_ON_TARGET_EXIT}`);
   console.log(`⏱️ Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
