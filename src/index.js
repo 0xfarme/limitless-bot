@@ -28,7 +28,6 @@ const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '1', 10);
 const STRATEGY_MODE = (process.env.STRATEGY_MODE || 'dominant').toLowerCase();
 const TRIGGER_PCT = process.env.TRIGGER_PCT ? Number(process.env.TRIGGER_PCT) : 55;
 const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND) : 5;
-const MAX_ENTRY_PRICE = process.env.MAX_ENTRY_PRICE ? Number(process.env.MAX_ENTRY_PRICE) : 65; // Don't buy above this %
 
 // NEW: Pre-approval settings
 const PRE_APPROVE_USDC = process.env.PRE_APPROVE_USDC !== 'false'; // Default enabled
@@ -625,8 +624,8 @@ function pickOutcome(prices) {
   const [p0, p1] = prices;
 
   if (STRATEGY_MODE === 'dominant') {
-    const p0ok = p0 >= TRIGGER_PCT && p0 <= MAX_ENTRY_PRICE;
-    const p1ok = p1 >= TRIGGER_PCT && p1 <= MAX_ENTRY_PRICE;
+    const p0ok = p0 >= TRIGGER_PCT;
+    const p1ok = p1 >= TRIGGER_PCT;
     if (p0ok || p1ok) {
       return p0 >= p1 ? 0 : 1;
     }
@@ -1233,13 +1232,7 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
     const outcomeToBuy = pickOutcome(prices);
     if (outcomeToBuy === null) {
-      // Check if it was rejected due to MAX_ENTRY_PRICE
-      if (STRATEGY_MODE === 'dominant' && (prices[0] > MAX_ENTRY_PRICE || prices[1] > MAX_ENTRY_PRICE)) {
-        const highPrice = Math.max(prices[0], prices[1]);
-        logInfo(wallet.address, '🚫', `Price too high: ${highPrice.toFixed(1)}% > ${MAX_ENTRY_PRICE}% max`);
-      } else {
-        logInfo(wallet.address, '🔎', `No signal (${prices[0].toFixed(1)}%/${prices[1].toFixed(1)}%)`);
-      }
+      logInfo(wallet.address, '🔎', `No signal (${prices[0].toFixed(1)}%/${prices[1].toFixed(1)}%)`);
       return;
     }
 
