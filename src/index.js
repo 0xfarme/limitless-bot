@@ -1061,12 +1061,35 @@ async function processMarket(wallet, provider, oracleId, marketData) {
         logInfo(wallet.address, '💾', `Initialized cost: $${BUY_AMOUNT_USDC}`);
       }
 
+      // Check if market has expired before trying to sell
+      let minutesRemaining = Infinity;
+      if (marketInfo.deadline) {
+        const deadlineMs = new Date(marketInfo.deadline).getTime();
+        if (!Number.isNaN(deadlineMs)) {
+          const remainingMs = deadlineMs - Date.now();
+          minutesRemaining = remainingMs / 60000;
+
+          if (minutesRemaining <= 0) {
+            logWarn(wallet.address, '⏰', 'Market expired - cannot sell, marking as completed');
+            markMarketCompleted(wallet.address, marketAddress);
+            return;
+          }
+        }
+      }
+
       const cost = holding.cost;
       let tokensNeededForCost;
       try {
         tokensNeededForCost = await market.calcSellAmount(cost, outcomeIndex);
       } catch (e) {
         logErr(wallet.address, '💥', `calcSellAmount failed: ${e.message}`);
+
+        // If market is within 2 minutes of deadline, probably expired
+        if (minutesRemaining <= 2) {
+          logWarn(wallet.address, '⏰', 'Market near/past deadline - marking as completed');
+          markMarketCompleted(wallet.address, marketAddress);
+          return;
+        }
 
         // Track failures - only mark as completed after multiple failures
         if (!holding.calcSellFailures) {
@@ -1103,16 +1126,6 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
       const valueHuman = fmtUnitsPrec(positionValue, decimals);
       const pnlSign = pnlAbs >= 0n ? '📈' : '📉';
-
-      // Calculate time remaining until market deadline
-      let minutesRemaining = Infinity;
-      if (marketInfo.deadline) {
-        const deadlineMs = new Date(marketInfo.deadline).getTime();
-        if (!Number.isNaN(deadlineMs)) {
-          const remainingMs = deadlineMs - Date.now();
-          minutesRemaining = remainingMs / 60000;
-        }
-      }
 
       logInfo(wallet.address, pnlSign, `Value: ${valueHuman} | PnL: ${pnlPct.toFixed(1)}% | Time left: ${minutesRemaining.toFixed(0)}m`);
 
