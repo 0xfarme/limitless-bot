@@ -1230,7 +1230,29 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       return;
     }
 
-    const outcomeToBuy = pickOutcome(prices);
+    // Check time remaining for last-minute entry strategy
+    let minutesRemaining = Infinity;
+    if (marketInfo.deadline) {
+      const deadlineMs = new Date(marketInfo.deadline).getTime();
+      if (!Number.isNaN(deadlineMs)) {
+        const remainingMs = deadlineMs - Date.now();
+        minutesRemaining = remainingMs / 60000;
+      }
+    }
+
+    let outcomeToBuy = pickOutcome(prices);
+
+    // Last 10 minutes strategy: Buy side with >80% probability
+    if (outcomeToBuy === null && minutesRemaining <= 10) {
+      if (prices[0] > 80) {
+        outcomeToBuy = 0;
+        logInfo(wallet.address, '🎰', `LAST MINUTE BUY: YES at ${prices[0].toFixed(1)}% (${minutesRemaining.toFixed(0)}m left)`);
+      } else if (prices[1] > 80) {
+        outcomeToBuy = 1;
+        logInfo(wallet.address, '🎰', `LAST MINUTE BUY: NO at ${prices[1].toFixed(1)}% (${minutesRemaining.toFixed(0)}m left)`);
+      }
+    }
+
     if (outcomeToBuy === null) {
       logInfo(wallet.address, '🔎', `No signal (${prices[0].toFixed(1)}%/${prices[1].toFixed(1)}%)`);
       return;
