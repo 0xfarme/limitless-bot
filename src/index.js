@@ -1127,7 +1127,14 @@ async function processMarket(wallet, provider, oracleId, marketData) {
         logInfo(wallet.address, '🎯', `Target profit reached: ${exitReason}`);
       }
 
-      // 2. Last 10 minutes: Exit any profitable position
+      // 2. Last 12 minutes: Emergency stop loss if down 70%+
+      if (!shouldSell && minutesRemaining <= 12 && pnlPct <= -70) {
+        shouldSell = true;
+        exitReason = `EMERGENCY_STOP_LOSS (${minutesRemaining.toFixed(0)}m left, ${pnlPct.toFixed(1)}% loss)`;
+        logErr(wallet.address, '🚨', `Emergency stop loss triggered: ${exitReason}`);
+      }
+
+      // 3. Last 10 minutes: Exit any profitable position
       if (!shouldSell && minutesRemaining <= 10 && pnlPct > 0) {
         shouldSell = true;
         exitReason = `DEADLINE_EXIT (${minutesRemaining.toFixed(0)}m left, ${pnlPct.toFixed(1)}% profit)`;
