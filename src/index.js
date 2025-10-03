@@ -1244,17 +1244,6 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
     let outcomeToBuy = pickOutcome(prices);
 
-    // Last 10 minutes strategy: Buy side with >80% probability
-    if (outcomeToBuy === null && minutesRemaining <= 10) {
-      if (prices[0] > 80) {
-        outcomeToBuy = 0;
-        logInfo(wallet.address, '🎰', `LAST MINUTE BUY: YES at ${prices[0].toFixed(1)}% (${minutesRemaining.toFixed(0)}m left)`);
-      } else if (prices[1] > 80) {
-        outcomeToBuy = 1;
-        logInfo(wallet.address, '🎰', `LAST MINUTE BUY: NO at ${prices[1].toFixed(1)}% (${minutesRemaining.toFixed(0)}m left)`);
-      }
-    }
-
     if (outcomeToBuy === null) {
       logInfo(wallet.address, '🔎', `No signal (${prices[0].toFixed(1)}%/${prices[1].toFixed(1)}%)`);
       return;
@@ -1262,6 +1251,13 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
     // NEW: Log the trigger price - the price that caused the buy signal
     const triggerPrice = prices[outcomeToBuy];
+
+    // MAX ENTRY PRICE CHECK: Don't buy if price is above 65%
+    if (triggerPrice > 65) {
+      logInfo(wallet.address, '🚫', `Entry price too high: ${triggerPrice.toFixed(1)}% > 65% - skipping`);
+      return;
+    }
+
     logInfo(wallet.address, '🎯', `BUY SIGNAL: Outcome ${outcomeToBuy} at trigger price ${triggerPrice.toFixed(1)}%`);
 
     const investment = ethers.parseUnits(BUY_AMOUNT_USDC.toString(), decimals);
