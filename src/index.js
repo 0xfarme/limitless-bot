@@ -80,6 +80,10 @@ const tradingLocks = new Map();
 const preApprovedMarkets = new Map(); // key: walletAddress, value: Set of market addresses
 let lastPreApprovalTime = new Map(); // key: walletAddress, value: timestamp
 
+// Hourly active markets tracking
+let currentHour = -1;
+let activeOraclesThisHour = new Set(); // Oracle IDs that were active at :00
+
 function getWalletState(addr) {
   if (!userState.has(addr)) {
     userState.set(addr, new Map());
@@ -546,20 +550,72 @@ async function fetchMarket(oracleId) {
 }
 
 async function fetchAllMarkets() {
-  const promises = PRICE_ORACLE_IDS.map(id => fetchMarket(id));
-  const results = await Promise.allSettled(promises);
-  
-  const markets = [];
-  results.forEach((result, idx) => {
-    if (result.status === 'fulfilled' && result.value) {
-      markets.push({
-        oracleId: PRICE_ORACLE_IDS[idx],
-        data: result.value
-      });
+  const now = new Date();
+  const hourOfDay = now.getUTCHours();
+  const minuteOfHour = now.getUTCMinutes();
+
+  // Check if we're at the start of a new hour (minute 00)
+  const isNewHour = hourOfDay !== currentHour;
+  const isHourStart = minuteOfHour === 0;
+
+  if (isNewHour || isHourStart || activeOraclesThisHour.size === 0) {
+    // New hour detected or first run - check ALL markets to find active ones
+    console.log(`🕐 Hour ${hourOfDay}:${minuteOfHour.toString().padStart(2, '0')} - Checking all markets for active oracles...`);
+
+    const promises = PRICE_ORACLE_IDS.map(id => fetchMarket(id));
+    const results = await Promise.allSettled(promises);
+
+    const markets = [];
+    const newActiveOracles = new Set();
+
+    results.forEach((result, idx) => {
+      const oracleId = PRICE_ORACLE_IDS[idx];
+
+      if (result.status === 'fulfilled' && result.value) {
+        const isActive = result.value.isActive;
+
+        if (isActive) {
+          newActiveOracles.add(oracleId);
+          markets.push({
+            oracleId,
+            data: result.value
+          });
+        } else {
+          console.log(`⏸️  Oracle ${oracleId}: Inactive this hour`);
+        }
+      }
+    });
+
+    // Update tracking
+    currentHour = hourOfDay;
+    activeOraclesThisHour = newActiveOracles;
+
+    console.log(`✅ Active oracles for hour ${hourOfDay}: [${Array.from(activeOraclesThisHour).join(', ')}]`);
+    return markets;
+
+  } else {
+    // During the hour - only fetch markets for oracles that were active at :00
+    if (activeOraclesThisHour.size === 0) {
+      console.log(`⚠️  No active oracles found for this hour`);
+      return [];
     }
-  });
-  
-  return markets;
+
+    const activeOracleIds = Array.from(activeOraclesThisHour);
+    const promises = activeOracleIds.map(id => fetchMarket(id));
+    const results = await Promise.allSettled(promises);
+
+    const markets = [];
+    results.forEach((result, idx) => {
+      if (result.status === 'fulfilled' && result.value) {
+        markets.push({
+          oracleId: activeOracleIds[idx],
+          data: result.value
+        });
+      }
+    });
+
+    return markets;
+  }
 }
 
 // ========= Strategy =========
@@ -1072,11 +1128,19 @@ async function processMarket(wallet, provider, oracleId, marketData) {
         }
       }
 
-      // 2. Stop loss: Only in last 10 minutes
-      if (!shouldSell && minutesRemaining <= 10 && pnlPct <= STOP_LOSS_PCT) {
-        shouldSell = true;
-        exitReason = 'STOP_LOSS';
-        logInfo(wallet.address, '⚠️', `Stop loss active in final 10 minutes`);
+      // 2. Last 10 minutes: Exit any profitable position OR hit stop loss
+      if (!shouldSell && minutesRemaining <= 10) {
+        if (pnlPct > 0) {
+          // Close profitable positions before deadline
+          shouldSell = true;
+          exitReason = `DEADLINE_EXIT (${minutesRemaining.toFixed(0)}m left, ${pnlPct.toFixed(1)}% profit)`;
+          logInfo(wallet.address, '⏰', `Closing profitable position before deadline`);
+        } else if (pnlPct <= STOP_LOSS_PCT) {
+          // Stop loss for losing positions
+          shouldSell = true;
+          exitReason = 'STOP_LOSS';
+          logInfo(wallet.address, '⚠️', `Stop loss active in final 10 minutes`);
+        }
       }
 
       if (shouldSell) {
