@@ -21,7 +21,6 @@ const FREQUENCY = process.env.FREQUENCY || 'hourly';
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
 const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 2;
 const TARGET_PROFIT_PCT = process.env.TARGET_PROFIT_PCT ? Number(process.env.TARGET_PROFIT_PCT) : 12;
-const STOP_LOSS_PCT = process.env.STOP_LOSS_PCT ? Number(process.env.STOP_LOSS_PCT) : -8;
 const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 150;
 const GAS_PRICE_GWEI = process.env.GAS_PRICE_GWEI ? String(process.env.GAS_PRICE_GWEI) : '0.005';
 const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '1', 10);
@@ -34,10 +33,6 @@ const PRE_APPROVE_USDC = process.env.PRE_APPROVE_USDC !== 'false'; // Default en
 const PRE_APPROVAL_INTERVAL_MS = parseInt(process.env.PRE_APPROVAL_INTERVAL_MS || '3600000', 10); // 1 hour
 const PRE_APPROVAL_AMOUNT_USDC = process.env.PRE_APPROVAL_AMOUNT_USDC ? Number(process.env.PRE_APPROVAL_AMOUNT_USDC) : 100;
 
-// Trailing profit settings
-const ENABLE_TRAILING_PROFIT = process.env.ENABLE_TRAILING_PROFIT === 'true';
-const TRAILING_DISTANCE_PCT = process.env.TRAILING_DISTANCE_PCT ? Number(process.env.TRAILING_DISTANCE_PCT) : 3;
-const TRAILING_MAX_TIME_MINUTES = process.env.TRAILING_MAX_TIME_MINUTES ? Number(process.env.TRAILING_MAX_TIME_MINUTES) : 10;
 
 // Time-based risk management
 const MIN_TIME_TO_ENTER_MINUTES = process.env.MIN_TIME_TO_ENTER_MINUTES ? Number(process.env.MIN_TIME_TO_ENTER_MINUTES) : 20;
@@ -676,49 +671,44 @@ function calculateTimeBasedAdjustments(marketInfo) {
     remainingMinutes: null,
     positionSizeMultiplier: 1.0,
     profitTargetMultiplier: 1.0,
-    stopLossMultiplier: 1.0,
     shouldForceExit: false,
     timePhase: 'unknown'
   };
-  
+
   if (!marketInfo.deadline) return result;
-  
+
   const deadlineMs = new Date(marketInfo.deadline).getTime();
   if (Number.isNaN(deadlineMs)) return result;
-  
+
   const remainingMs = deadlineMs - nowMs;
   const remainingMinutes = remainingMs / 60000;
   result.remainingMinutes = remainingMinutes;
-  
+
   if (remainingMinutes > 30) {
     result.timePhase = 'early';
     result.positionSizeMultiplier = 1.0;
     result.profitTargetMultiplier = 1.0;
-    result.stopLossMultiplier = 1.0;
-  } 
+  }
   else if (remainingMinutes > 20) {
     result.timePhase = 'mid';
     result.positionSizeMultiplier = 1.0;
     result.profitTargetMultiplier = 1.0;
-    result.stopLossMultiplier = 1.0;
   }
   else if (remainingMinutes > TIME_DECAY_THRESHOLD_MINUTES) {
     result.timePhase = 'late';
     result.positionSizeMultiplier = 0.75;
     result.profitTargetMultiplier = 0.85;
-    result.stopLossMultiplier = 0.75;
   }
   else if (remainingMinutes > MIN_TIME_TO_EXIT_MINUTES) {
     result.timePhase = 'critical';
     result.positionSizeMultiplier = 0.5;
     result.profitTargetMultiplier = 0.7;
-    result.stopLossMultiplier = 0.5;
   }
   else {
     result.timePhase = 'danger';
     result.shouldForceExit = true;
   }
-  
+
   return result;
 }
 
@@ -1031,14 +1021,10 @@ async function processMarket(wallet, provider, oracleId, marketData) {
     const collateralTokenAddress = ethers.getAddress(marketInfo.collateralToken.address);
 
     logInfo(wallet.address, '📊', `Oracle ${oracleId}: ${marketInfo.title || 'Untitled'}`);
-    
+
     // NEW: Log current prices for transparency
     if (prices.length >= 2) {
       logInfo(wallet.address, '💹', `Current Prices: ${prices[0].toFixed(1)}% / ${prices[1].toFixed(1)}%`);
-    }
-
-    if (!validateMarketTiming(marketInfo, wallet)) {
-      return;
     }
 
     let contracts;
@@ -1080,12 +1066,34 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       try {
         tokensNeededForCost = await market.calcSellAmount(cost, outcomeIndex);
       } catch (e) {
-        logErr(wallet.address, '💥', 'calcSellAmount failed', e.message);
-        return;
+        logErr(wallet.address, '💥', `calcSellAmount failed: ${e.message}`);
+
+        // Track failures - only mark as completed after multiple failures
+        if (!holding.calcSellFailures) {
+          holding.calcSellFailures = 1;
+          setHolding(wallet.address, marketAddress, holding);
+          logWarn(wallet.address, '⚠️', 'Will retry next iteration...');
+          return;
+        } else if (holding.calcSellFailures < 5) {
+          holding.calcSellFailures++;
+          setHolding(wallet.address, marketAddress, holding);
+          logWarn(wallet.address, '⚠️', `Retry ${holding.calcSellFailures}/5...`);
+          return;
+        } else {
+          logErr(wallet.address, '🏁', 'Multiple failures - market likely expired, marking as completed');
+          markMarketCompleted(wallet.address, marketAddress);
+          return;
+        }
+      }
+
+      // Reset failure count on success
+      if (holding.calcSellFailures) {
+        holding.calcSellFailures = 0;
+        setHolding(wallet.address, marketAddress, holding);
       }
 
       if (tokensNeededForCost === 0n) {
-        logWarn(wallet.address, '⚠️', 'calcSellAmount returned 0');
+        logWarn(wallet.address, '⚠️', 'calcSellAmount returned 0 - skipping this iteration');
         return;
       }
 
@@ -1106,42 +1114,24 @@ async function processMarket(wallet, provider, oracleId, marketData) {
         }
       }
 
-      // Track peak PnL for trailing stop
-      if (!holding.peakPnLPct || pnlPct > holding.peakPnLPct) {
-        holding.peakPnLPct = pnlPct;
-        setHolding(wallet.address, marketAddress, holding);
-      }
-      const peakPnLPct = holding.peakPnLPct || pnlPct;
-
-      logInfo(wallet.address, pnlSign, `Value: ${valueHuman} | PnL: ${pnlPct.toFixed(1)}% | Peak: ${peakPnLPct.toFixed(1)}% | Time left: ${minutesRemaining.toFixed(0)}m`);
+      logInfo(wallet.address, pnlSign, `Value: ${valueHuman} | PnL: ${pnlPct.toFixed(1)}% | Time left: ${minutesRemaining.toFixed(0)}m`);
 
       // Check for exit conditions:
       let shouldSell = false;
       let exitReason = '';
 
-      // 1. Trailing stop: Once we hit profit target, use 3% trailing stop
-      if (peakPnLPct >= TARGET_PROFIT_PCT) {
-        const trailingStop = peakPnLPct - TRAILING_DISTANCE_PCT;
-        if (pnlPct <= trailingStop) {
-          shouldSell = true;
-          exitReason = `TRAILING_STOP (Peak: ${peakPnLPct.toFixed(1)}%, Now: ${pnlPct.toFixed(1)}%)`;
-          logInfo(wallet.address, '📉', `Trailing stop hit: ${exitReason}`);
-        }
+      // 1. Fixed profit target
+      if (pnlPct >= TARGET_PROFIT_PCT) {
+        shouldSell = true;
+        exitReason = `TARGET_PROFIT (${pnlPct.toFixed(1)}%)`;
+        logInfo(wallet.address, '🎯', `Target profit reached: ${exitReason}`);
       }
 
-      // 2. Last 10 minutes: Exit any profitable position OR hit stop loss
-      if (!shouldSell && minutesRemaining <= 10) {
-        if (pnlPct > 0) {
-          // Close profitable positions before deadline
-          shouldSell = true;
-          exitReason = `DEADLINE_EXIT (${minutesRemaining.toFixed(0)}m left, ${pnlPct.toFixed(1)}% profit)`;
-          logInfo(wallet.address, '⏰', `Closing profitable position before deadline`);
-        } else if (pnlPct <= STOP_LOSS_PCT) {
-          // Stop loss for losing positions
-          shouldSell = true;
-          exitReason = 'STOP_LOSS';
-          logInfo(wallet.address, '⚠️', `Stop loss active in final 10 minutes`);
-        }
+      // 2. Last 10 minutes: Exit any profitable position
+      if (!shouldSell && minutesRemaining <= 10 && pnlPct > 0) {
+        shouldSell = true;
+        exitReason = `DEADLINE_EXIT (${minutesRemaining.toFixed(0)}m left, ${pnlPct.toFixed(1)}% profit)`;
+        logInfo(wallet.address, '⏰', `Closing profitable position before deadline`);
       }
 
       if (shouldSell) {
@@ -1227,6 +1217,11 @@ async function processMarket(wallet, provider, oracleId, marketData) {
     const positionIdsValid = Array.isArray(positionIds) && positionIds.length >= 2 && positionIds[0] && positionIds[1];
     if (!positionIdsValid) {
       logWarn(wallet.address, '🛑', 'Invalid position IDs');
+      return;
+    }
+
+    // Validate market timing for new entries only
+    if (!validateMarketTiming(marketInfo, wallet)) {
       return;
     }
 
@@ -1371,7 +1366,7 @@ async function main() {
   console.log('🎯 VOLUME + CAPITAL PRESERVATION MODE');
   console.log(`📊 Strategy: ${STRATEGY_MODE.toUpperCase()}`);
   console.log(`💰 Position size: ${BUY_AMOUNT_USDC}`);
-  console.log(`📈 Target profit: ${TARGET_PROFIT_PCT}% | Stop loss: ${STOP_LOSS_PCT}%`);
+  console.log(`📈 Target profit: ${TARGET_PROFIT_PCT}%`);
   console.log(`🎚️ Entry trigger: ${TRIGGER_PCT}% | Slippage: ${(SLIPPAGE_BPS / 100).toFixed(2)}%`);
   console.log(`🔐 Pre-approval: ${PRE_APPROVE_USDC ? `Enabled (every ${PRE_APPROVAL_INTERVAL_MS/60000}min, $${PRE_APPROVAL_AMOUNT_USDC})` : 'Disabled'}`);
   console.log(`⏱️ Poll interval: ${POLL_INTERVAL_MS / 1000}s | Confirmations: ${CONFIRMATIONS}`);

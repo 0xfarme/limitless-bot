@@ -22,30 +22,19 @@ const CRYPTO_CATEGORY_ID = 2;
 const POLL_INTERVAL_MS = parseInt(process.env.LONG_TERM_POLL_INTERVAL_MS || '60000', 10); // 1 min for long-term
 const BUY_AMOUNT_USDC = process.env.LONG_TERM_BUY_AMOUNT_USDC ? Number(process.env.LONG_TERM_BUY_AMOUNT_USDC) : 10;
 const TARGET_PROFIT_PCT = process.env.LONG_TERM_TARGET_PROFIT_PCT ? Number(process.env.LONG_TERM_TARGET_PROFIT_PCT) : 15;
-const STOP_LOSS_PCT = process.env.LONG_TERM_STOP_LOSS_PCT ? Number(process.env.LONG_TERM_STOP_LOSS_PCT) : -10;
 const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 150;
 const GAS_PRICE_GWEI = process.env.GAS_PRICE_GWEI ? String(process.env.GAS_PRICE_GWEI) : '0.005';
 const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '1', 10);
 
-// Hybrid Strategy: Time-based phases with different exit rules
+// Phase-based exit windows
 const PHASE_CONFIG = {
   daily: {
     periodMs: 24 * 60 * 60 * 1000,
-    earlyPhaseHours: 18,        // First 18 hours: let it run
-    midPhaseHours: 4,           // Next 4 hours: tighten stops
-    finalPhaseHours: 2,         // Last 2 hours: enable hard stop loss
-    earlyTrailingPct: 8,        // 8% trailing in early phase
-    midTrailingPct: 5,          // 5% trailing in mid phase
-    finalTrailingPct: 3         // 3% trailing in final phase
+    finalPhaseHours: 2         // Last 2 hours: exit profitable positions
   },
   weekly: {
     periodMs: 7 * 24 * 60 * 60 * 1000,
-    earlyPhaseHours: 132,       // First 5.5 days: let it run
-    midPhaseHours: 24,          // Next 1 day: tighten stops
-    finalPhaseHours: 12,        // Last 12 hours: enable hard stop loss
-    earlyTrailingPct: 10,       // 10% trailing in early phase
-    midTrailingPct: 7,          // 7% trailing in mid phase
-    finalTrailingPct: 5         // 5% trailing in final phase
+    finalPhaseHours: 12        // Last 12 hours: exit profitable positions
   }
 };
 
@@ -180,8 +169,7 @@ function getMarketPhase(expirationTimestamp) {
 
   if (hoursRemaining < 0) return 'expired';
   if (hoursRemaining <= config.finalPhaseHours) return 'final';
-  if (hoursRemaining <= (config.finalPhaseHours + config.midPhaseHours)) return 'mid';
-  return 'early';
+  return 'active';
 }
 
 // ========= Contract Utilities =========
@@ -271,41 +259,25 @@ async function processMarket(wallet, provider, marketData) {
       const pnlAbs = positionValue - cost;
       const pnlPct = cost > 0n ? Number((pnlAbs * 10000n) / cost) / 100 : 0;
 
-      // Track peak PnL
-      if (!currentHolding.peakPnLPct || pnlPct > currentHolding.peakPnLPct) {
-        currentHolding.peakPnLPct = pnlPct;
-        setHolding(wallet.address, marketAddress, currentHolding);
-      }
-      const peakPnLPct = currentHolding.peakPnLPct || pnlPct;
-
       const hoursRemaining = (expirationTimestamp - Date.now()) / (60 * 60 * 1000);
 
       log(wallet.address, pnlAbs >= 0n ? '📈' : '📉',
-        `${title} | Phase: ${phase} | PnL: ${pnlPct.toFixed(1)}% | Peak: ${peakPnLPct.toFixed(1)}% | Hours left: ${hoursRemaining.toFixed(1)}`);
+        `${title} | Phase: ${phase} | PnL: ${pnlPct.toFixed(1)}% | Hours left: ${hoursRemaining.toFixed(1)}`);
 
-      // Determine exit conditions based on phase
+      // Determine exit conditions
       let shouldSell = false;
       let exitReason = '';
 
-      // Get phase-specific trailing stop distance
-      let trailingStopDistance;
-      if (phase === 'early') trailingStopDistance = config.earlyTrailingPct;
-      else if (phase === 'mid') trailingStopDistance = config.midTrailingPct;
-      else trailingStopDistance = config.finalTrailingPct;
-
-      // Trailing stop: Once we hit profit target
-      if (peakPnLPct >= TARGET_PROFIT_PCT) {
-        const trailingStop = peakPnLPct - trailingStopDistance;
-        if (pnlPct <= trailingStop) {
-          shouldSell = true;
-          exitReason = `TRAILING_STOP (Peak: ${peakPnLPct.toFixed(1)}%, Drop: ${trailingStopDistance}%)`;
-        }
+      // 1. Fixed profit target
+      if (pnlPct >= TARGET_PROFIT_PCT) {
+        shouldSell = true;
+        exitReason = `TARGET_PROFIT (${pnlPct.toFixed(1)}%)`;
       }
 
-      // Hard stop loss: Only in final phase
-      if (!shouldSell && phase === 'final' && pnlPct <= STOP_LOSS_PCT) {
+      // 2. Final phase: Exit any profitable position
+      if (!shouldSell && phase === 'final' && pnlPct > 0) {
         shouldSell = true;
-        exitReason = `STOP_LOSS (Final ${config.finalPhaseHours}h)`;
+        exitReason = `FINAL_PHASE_EXIT (${hoursRemaining.toFixed(1)}h left, ${pnlPct.toFixed(1)}% profit)`;
       }
 
       if (shouldSell) {
@@ -326,7 +298,7 @@ async function processMarket(wallet, provider, marketData) {
         setHolding(wallet.address, marketAddress, null);
         markMarketCompleted(wallet.address, marketAddress);
       } else {
-        log(wallet.address, '⏳', `Holding - ${phase} phase`);
+        log(wallet.address, '⏳', 'Holding position');
       }
 
     } else {
@@ -345,8 +317,8 @@ async function main() {
   console.log('🚀 Starting Long-Term Crypto Bot');
   console.log(`📅 Frequency: ${FREQUENCY.toUpperCase()}`);
   console.log(`💰 Position size: $${BUY_AMOUNT_USDC}`);
-  console.log(`📈 Target: ${TARGET_PROFIT_PCT}% | Stop loss: ${STOP_LOSS_PCT}% (final phase only)`);
-  console.log(`🎯 Trailing stops: Early ${config.earlyTrailingPct}% → Mid ${config.midTrailingPct}% → Final ${config.finalTrailingPct}%`);
+  console.log(`📈 Target profit: ${TARGET_PROFIT_PCT}%`);
+  console.log(`⏰ Final phase window: Last ${config.finalPhaseHours}h (exit profitable positions)`);
   console.log('');
 
   loadState();
