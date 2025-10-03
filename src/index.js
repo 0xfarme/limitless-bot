@@ -1133,6 +1133,9 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       let shouldSell = false;
       let exitReason = '';
 
+      // DEBUG: Always log profit check
+      logInfo(wallet.address, '🔍', `Profit check: ${pnlPct.toFixed(1)}% vs target ${TARGET_PROFIT_PCT}%`);
+
       // 1. Fixed profit target
       if (pnlPct >= TARGET_PROFIT_PCT) {
         shouldSell = true;
