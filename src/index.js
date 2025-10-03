@@ -28,6 +28,7 @@ const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '1', 10);
 const STRATEGY_MODE = (process.env.STRATEGY_MODE || 'dominant').toLowerCase();
 const TRIGGER_PCT = process.env.TRIGGER_PCT ? Number(process.env.TRIGGER_PCT) : 55;
 const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND) : 5;
+const MAX_ENTRY_PRICE = process.env.MAX_ENTRY_PRICE ? Number(process.env.MAX_ENTRY_PRICE) : 65; // Don't buy above this %
 
 // NEW: Pre-approval settings
 const PRE_APPROVE_USDC = process.env.PRE_APPROVE_USDC !== 'false'; // Default enabled
@@ -181,7 +182,7 @@ function markMarketCompleted(addr, marketAddress) {
 }
 
 // ========= Trade Logging =========
-function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, amount, pnl = null, pnlPct = null, entryPrice = null, exitPrice = null, holdTimeMinutes = null, gasUsed = null, triggerPrice = null) {
+function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, amount, pnl = null, pnlPct = null, entryPrice = null, exitPrice = null, holdTimeMinutes = null, gasUsed = null, triggerPrice = null, exitReason = null) {
   const timestamp = new Date().toISOString();
   const record = {
     timestamp,
@@ -197,18 +198,19 @@ function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, am
     pnl: pnl !== null ? Number(pnl) : null,
     pnlPct: pnlPct !== null ? Number(pnlPct) : null,
     holdTimeMinutes,
-    gasUsed: gasUsed !== null ? Number(gasUsed) : null
+    gasUsed: gasUsed !== null ? Number(gasUsed) : null,
+    exitReason: exitReason || null  // NEW: Exit reason
   };
-  
+
   tradeHistory.push(record);
-  
+
   try {
     ensureDirSync(path.dirname(TRADES_LOG_FILE));
     if (action === 'BUY') {
       const logLine = `${timestamp} | ${walletAddress.slice(0, 8)} | BUY | ${marketTitle} | Outcome ${outcome} | Amount: ${amount} | Entry Price: ${entryPrice}% | Trigger Price: ${triggerPrice}%\n`;
       fs.appendFileSync(TRADES_LOG_FILE, logLine);
     } else {
-      const logLine = `${timestamp} | ${walletAddress.slice(0, 8)} | SELL | ${marketTitle} | Outcome ${outcome} | Amount: ${amount} | PnL: ${pnlPct.toFixed(2)}% | Hold: ${holdTimeMinutes}m | Gas: ${gasUsed.toFixed(4)}\n`;
+      const logLine = `${timestamp} | ${walletAddress.slice(0, 8)} | SELL | ${marketTitle} | Outcome ${outcome} | Amount: ${amount} | PnL: ${pnlPct.toFixed(2)}% | Hold: ${holdTimeMinutes}m | Gas: ${gasUsed.toFixed(4)} | Reason: ${exitReason || 'N/A'}\n`;
       fs.appendFileSync(TRADES_LOG_FILE, logLine);
     }
   } catch (e) {
@@ -220,11 +222,11 @@ function logTrade(walletAddress, marketAddress, marketTitle, outcome, action, am
     const csvExists = fs.existsSync(TRADES_CSV_FILE);
     
     if (!csvExists) {
-      const header = 'timestamp,wallet,market,marketTitle,outcome,action,amount,entryPrice,triggerPrice,exitPrice,pnl,pnlPct,holdTimeMinutes,gasUsed\n';
+      const header = 'timestamp,wallet,market,marketTitle,outcome,action,amount,entryPrice,triggerPrice,exitPrice,pnl,pnlPct,holdTimeMinutes,gasUsed,exitReason\n';
       fs.writeFileSync(TRADES_CSV_FILE, header);
     }
-    
-    const csvLine = `${timestamp},${walletAddress},${marketAddress},"${marketTitle}",${outcome},${action},${amount},${entryPrice || ''},${triggerPrice || ''},${exitPrice || ''},${pnl || ''},${pnlPct || ''},${holdTimeMinutes || ''},${gasUsed || ''}\n`;
+
+    const csvLine = `${timestamp},${walletAddress},${marketAddress},"${marketTitle}",${outcome},${action},${amount},${entryPrice || ''},${triggerPrice || ''},${exitPrice || ''},${pnl || ''},${pnlPct || ''},${holdTimeMinutes || ''},${gasUsed || ''},${exitReason || ''}\n`;
     fs.appendFileSync(TRADES_CSV_FILE, csvLine);
   } catch (e) {
     console.warn('Failed to write CSV:', e.message);
@@ -621,10 +623,10 @@ async function fetchAllMarkets() {
 // ========= Strategy =========
 function pickOutcome(prices) {
   const [p0, p1] = prices;
-  
+
   if (STRATEGY_MODE === 'dominant') {
-    const p0ok = p0 >= TRIGGER_PCT;
-    const p1ok = p1 >= TRIGGER_PCT;
+    const p0ok = p0 >= TRIGGER_PCT && p0 <= MAX_ENTRY_PRICE;
+    const p1ok = p1 >= TRIGGER_PCT && p1 <= MAX_ENTRY_PRICE;
     if (p0ok || p1ok) {
       return p0 >= p1 ? 0 : 1;
     }
@@ -1167,8 +1169,21 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
         const exitEmoji = pnlPct >= 0 ? '✅' : '🛑';
         logInfo(wallet.address, exitEmoji, `SOLD at ${pnlPct.toFixed(1)}% (${exitReason || 'EXIT'})`);
-        
+
         const pnlAmount = Number(ethers.formatUnits(pnlAbs, decimals));
+
+        // Calculate hold time
+        const entryTime = holding.entryTime || Date.now();
+        const holdTimeMs = Date.now() - entryTime;
+        const holdTimeMinutes = holdTimeMs / 60000;
+
+        // Get entry and exit prices
+        const entryPriceVal = holding.entryPrice || null;
+        const currentPrice = prices && prices[outcomeIndex] ? prices[outcomeIndex] : null;
+
+        // Get gas used (estimate for now)
+        const gasUsedEth = 0.0002;
+
         logTrade(
           wallet.address,
           marketAddress,
@@ -1177,7 +1192,13 @@ async function processMarket(wallet, provider, oracleId, marketData) {
           'SELL',
           Number(ethers.formatUnits(cost, decimals)),
           pnlAmount,
-          pnlPct
+          pnlPct,
+          entryPriceVal,
+          currentPrice,
+          holdTimeMinutes,
+          gasUsedEth,
+          null, // triggerPrice (only for buys)
+          exitReason // EXIT REASON
         );
         
         setHolding(wallet.address, marketAddress, null);
@@ -1212,7 +1233,13 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
     const outcomeToBuy = pickOutcome(prices);
     if (outcomeToBuy === null) {
-      logInfo(wallet.address, '🔎', `No signal (${prices[0].toFixed(1)}%/${prices[1].toFixed(1)}%)`);
+      // Check if it was rejected due to MAX_ENTRY_PRICE
+      if (STRATEGY_MODE === 'dominant' && (prices[0] > MAX_ENTRY_PRICE || prices[1] > MAX_ENTRY_PRICE)) {
+        const highPrice = Math.max(prices[0], prices[1]);
+        logInfo(wallet.address, '🚫', `Price too high: ${highPrice.toFixed(1)}% > ${MAX_ENTRY_PRICE}% max`);
+      } else {
+        logInfo(wallet.address, '🔎', `No signal (${prices[0].toFixed(1)}%/${prices[1].toFixed(1)}%)`);
+      }
       return;
     }
 
@@ -1278,7 +1305,9 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       outcomeIndex: outcomeToBuy,
       tokenId,
       amount: investment,
-      cost: investment
+      cost: investment,
+      entryTime: Date.now(),
+      entryPrice: entryPrice
     });
 
     for (let i = 0; i < 3; i++) {
