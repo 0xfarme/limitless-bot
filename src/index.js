@@ -22,6 +22,10 @@ const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
 const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 2;
 const TARGET_PROFIT_PCT = process.env.TARGET_PROFIT_PCT ? Number(process.env.TARGET_PROFIT_PCT) : 12;
 const MIN_SELL_VALUE_USDC = process.env.MIN_SELL_VALUE_USDC ? Number(process.env.MIN_SELL_VALUE_USDC) : 0.5;
+const TRAILING_STOP_ENABLED = process.env.TRAILING_STOP_ENABLED !== 'false'; // Default enabled
+const TRAILING_STOP_ACTIVATION_PCT = process.env.TRAILING_STOP_ACTIVATION_PCT ? Number(process.env.TRAILING_STOP_ACTIVATION_PCT) : 15;
+const TRAILING_STOP_DISTANCE_PCT = process.env.TRAILING_STOP_DISTANCE_PCT ? Number(process.env.TRAILING_STOP_DISTANCE_PCT) : 8;
+const INSTANT_SELL_AT_PCT = process.env.INSTANT_SELL_AT_PCT ? Number(process.env.INSTANT_SELL_AT_PCT) : 50;
 const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 150;
 const GAS_PRICE_GWEI = process.env.GAS_PRICE_GWEI ? String(process.env.GAS_PRICE_GWEI) : '0.005';
 const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '1', 10);
@@ -154,6 +158,20 @@ function setHolding(addr, marketAddress, holding) {
   marketState.holding = holding;
   walletState.set(marketAddress, marketState);
   scheduleSave();
+}
+
+function updateHighestProfit(addr, marketAddress, currentPnlPct) {
+  const walletState = getWalletState(addr);
+  const marketState = walletState.get(marketAddress);
+  if (!marketState || !marketState.holding) return;
+
+  const holding = marketState.holding;
+  if (!holding.highestProfitPct || currentPnlPct > holding.highestProfitPct) {
+    holding.highestProfitPct = currentPnlPct;
+    holding.trailingStopActivated = currentPnlPct >= TRAILING_STOP_ACTIVATION_PCT;
+    walletState.set(marketAddress, marketState);
+    scheduleSave();
+  }
 }
 
 function getHolding(addr, marketAddress) {
@@ -1129,7 +1147,12 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       const positionValueFloat = Number(ethers.formatUnits(positionValue, decimals));
       const pnlSign = pnlAbs >= 0n ? '📈' : '📉';
 
-      logInfo(wallet.address, pnlSign, `Value: ${valueHuman} | PnL: ${pnlPct.toFixed(1)}% | Time left: ${minutesRemaining.toFixed(0)}m`);
+      // Update trailing stop tracking
+      updateHighestProfit(wallet.address, marketAddress, pnlPct);
+      const highestProfitPct = holding.highestProfitPct || 0;
+      const trailingStopActivated = holding.trailingStopActivated || false;
+
+      logInfo(wallet.address, pnlSign, `Value: ${valueHuman} | PnL: ${pnlPct.toFixed(1)}% | High: ${highestProfitPct.toFixed(1)}% | Time: ${minutesRemaining.toFixed(0)}m`);
 
       // Check for exit conditions:
       let shouldSell = false;
@@ -1141,24 +1164,40 @@ async function processMarket(wallet, provider, oracleId, marketData) {
         return;
       }
 
-      // DEBUG: Always log profit check
-      logInfo(wallet.address, '🔍', `Profit check: ${pnlPct.toFixed(1)}% vs target ${TARGET_PROFIT_PCT}%`);
+      // 1. INSTANT SELL at 50%+ profit
+      if (pnlPct >= INSTANT_SELL_AT_PCT) {
+        shouldSell = true;
+        exitReason = `INSTANT_SELL (${pnlPct.toFixed(1)}% >= ${INSTANT_SELL_AT_PCT}%)`;
+        logInfo(wallet.address, '🚀', `Instant sell triggered: ${exitReason}`);
+      }
 
-      // 1. Fixed profit target
-      if (pnlPct >= TARGET_PROFIT_PCT) {
+      // 2. Trailing Stop Loss
+      if (!shouldSell && TRAILING_STOP_ENABLED && trailingStopActivated) {
+        const dropFromPeak = highestProfitPct - pnlPct;
+        if (dropFromPeak >= TRAILING_STOP_DISTANCE_PCT) {
+          shouldSell = true;
+          exitReason = `TRAILING_STOP (peak: ${highestProfitPct.toFixed(1)}%, now: ${pnlPct.toFixed(1)}%, drop: ${dropFromPeak.toFixed(1)}%)`;
+          logInfo(wallet.address, '📉', `Trailing stop triggered: ${exitReason}`);
+        } else {
+          logInfo(wallet.address, '🔒', `Trailing stop active: ${dropFromPeak.toFixed(1)}% from peak (trigger at ${TRAILING_STOP_DISTANCE_PCT}%)`);
+        }
+      }
+
+      // 3. Fixed profit target (if trailing stop not triggered)
+      if (!shouldSell && pnlPct >= TARGET_PROFIT_PCT) {
         shouldSell = true;
         exitReason = `TARGET_PROFIT (${pnlPct.toFixed(1)}%)`;
         logInfo(wallet.address, '🎯', `Target profit reached: ${exitReason}`);
       }
 
-      // 2. Last 12 minutes: Emergency stop loss if down 70%+
+      // 4. Last 12 minutes: Emergency stop loss if down 70%+
       if (!shouldSell && minutesRemaining <= 12 && pnlPct <= -70) {
         shouldSell = true;
         exitReason = `EMERGENCY_STOP_LOSS (${minutesRemaining.toFixed(0)}m left, ${pnlPct.toFixed(1)}% loss)`;
         logErr(wallet.address, '🚨', `Emergency stop loss triggered: ${exitReason}`);
       }
 
-      // 3. Last 10 minutes: Exit any profitable position (but only if above min value)
+      // 5. Last 10 minutes: Exit any profitable position (but only if above min value)
       if (!shouldSell && minutesRemaining <= 10 && pnlPct > 0) {
         shouldSell = true;
         exitReason = `DEADLINE_EXIT (${minutesRemaining.toFixed(0)}m left, ${pnlPct.toFixed(1)}% profit)`;
@@ -1344,7 +1383,9 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       amount: investment,
       cost: investment,
       entryTime: Date.now(),
-      entryPrice: entryPrice
+      entryPrice: entryPrice,
+      highestProfitPct: 0,
+      trailingStopActivated: false
     });
 
     for (let i = 0; i < 3; i++) {
@@ -1395,6 +1436,8 @@ async function main() {
   console.log(`💰 Position size: ${BUY_AMOUNT_USDC}`);
   console.log(`📈 Target profit: ${TARGET_PROFIT_PCT}%`);
   console.log(`💧 Min sell value: $${MIN_SELL_VALUE_USDC} (prevents dust sells)`);
+  console.log(`🚀 Instant sell: ${INSTANT_SELL_AT_PCT}%`);
+  console.log(`📉 Trailing stop: ${TRAILING_STOP_ENABLED ? `Enabled (activates at ${TRAILING_STOP_ACTIVATION_PCT}%, distance ${TRAILING_STOP_DISTANCE_PCT}%)` : 'Disabled'}`);
   console.log(`🎚️ Entry trigger: ${TRIGGER_PCT}% | Slippage: ${(SLIPPAGE_BPS / 100).toFixed(2)}%`);
   console.log(`🔐 Pre-approval: ${PRE_APPROVE_USDC ? `Enabled (every ${PRE_APPROVAL_INTERVAL_MS/60000}min, $${PRE_APPROVAL_AMOUNT_USDC})` : 'Disabled'}`);
   console.log(`⏱️ Poll interval: ${POLL_INTERVAL_MS / 1000}s | Confirmations: ${CONFIRMATIONS}`);
