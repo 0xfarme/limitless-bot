@@ -1211,9 +1211,11 @@ async function processMarket(wallet, provider, oracleId, marketData) {
           return;
         }
 
+        // ALWAYS sell entire token balance to close position completely
         const maxOutcomeTokensToSell = tokenBalance;
-        const returnAmountForSell = positionValue - (positionValue / 100n);
-        
+        // Set minimum return to 0 to ensure we sell everything (even at a loss)
+        const returnAmountForSell = 0n;
+
         const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
         if (!gasEst) {
           logWarn(wallet.address, '🛑', 'Sell gas estimate failed');
