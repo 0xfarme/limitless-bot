@@ -11,7 +11,13 @@ const ERC1155_ABI = require('./abis/ERC1155.json');
 // ========= Config =========
 const RPC_URL = process.env.RPC_URL;
 const CHAIN_ID = parseInt(process.env.CHAIN_ID || '8453', 10);
-const PRICE_ORACLE_ID = process.env.PRICE_ORACLE_ID;
+
+// Support multiple oracle IDs (comma-separated)
+const PRICE_ORACLE_IDS = (process.env.PRICE_ORACLE_IDS || process.env.PRICE_ORACLE_ID || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
 const FREQUENCY = process.env.FREQUENCY || 'hourly';
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
 const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 5; // human units
@@ -42,8 +48,8 @@ if (!RPC_URL) {
   console.error('RPC_URL is required');
   process.exit(1);
 }
-if (!PRICE_ORACLE_ID) {
-  console.error('PRICE_ORACLE_ID is required');
+if (PRICE_ORACLE_IDS.length === 0) {
+  console.error('PRICE_ORACLE_IDS or PRICE_ORACLE_ID is required (comma separated for multiple)');
   process.exit(1);
 }
 if (PRIVATE_KEYS.length === 0) {
@@ -256,12 +262,12 @@ function fmtUnitsPrec(amount, decimals, precision = 4) {
   }
 }
 
-async function fetchMarket() {
-  const url = `https://api.limitless.exchange/markets/prophet?priceOracleId=${PRICE_ORACLE_ID}&frequency=${FREQUENCY}`;
+async function fetchMarket(oracleId) {
+  const url = `https://api.limitless.exchange/markets/prophet?priceOracleId=${oracleId}&frequency=${FREQUENCY}`;
   const res = await axios.get(url, { timeout: 15000 });
 
   // Debug logging
-  console.log('📡 API Response:', {
+  console.log(`📡 Oracle ${oracleId} Response:`, {
     isActive: res.data.isActive,
     hasMarket: !!res.data.market,
     marketAddress: res.data.market?.address,
@@ -269,6 +275,27 @@ async function fetchMarket() {
   });
 
   return res.data;
+}
+
+async function fetchAllMarkets() {
+  const results = await Promise.allSettled(
+    PRICE_ORACLE_IDS.map(id => fetchMarket(id))
+  );
+
+  const markets = [];
+  results.forEach((result, idx) => {
+    if (result.status === 'fulfilled' && result.value) {
+      const data = result.value;
+      if (data.isActive && data.market && data.market.address) {
+        markets.push({
+          oracleId: PRICE_ORACLE_IDS[idx],
+          data: data
+        });
+      }
+    }
+  });
+
+  return markets;
 }
 
 async function readAllowance(usdc, owner, spender) {
@@ -468,40 +495,42 @@ async function estimateGasFor(contract, wallet, fnName, args) {
 }
 
 async function runForWallet(wallet, provider) {
-  logInfo(wallet.address, '🚀', 'Worker started');
-  logAction(wallet.address, 'WORKER_START', {});
-  let lastMarketAddr = null;
-  let cachedContracts = null;
+  logInfo(wallet.address, '🚀', `Worker started for ${PRICE_ORACLE_IDS.length} oracle(s)`);
+  logAction(wallet.address, 'WORKER_START', { oracleIds: PRICE_ORACLE_IDS });
+
+  const contractsCache = new Map(); // Cache contracts per market
 
   async function tick() {
     try {
       logAction(wallet.address, 'TICK_START', {});
 
-      const data = await fetchMarket();
+      const markets = await fetchAllMarkets();
 
-      // Debug: Log full response
-      console.log('🔍 Full API response:', JSON.stringify(data, null, 2));
-
-      // Check for various failure conditions
-      if (!data || !data.market) {
-        logWarn(wallet.address, '⏸️', 'No market data returned from API');
-        logAction(wallet.address, 'MARKET_MISSING', { data });
+      if (markets.length === 0) {
+        logWarn(wallet.address, '⏸️', 'No active markets available');
         return;
       }
 
-      if (!data.isActive) {
-        logWarn(wallet.address, '⏸️', `Market inactive: ${data.market.title || 'Unknown'}`);
-        logAction(wallet.address, 'MARKET_INACTIVE', { marketTitle: data.market.title });
-        return;
-      }
+      logInfo(wallet.address, '🔄', `Processing ${markets.length} active market(s)`);
 
-      if (!data.market.address) {
-        logWarn(wallet.address, '⏳', `Market not yet deployed on-chain: ${data.market.title || 'Unknown'} - address is: ${data.market.address}`);
-        logAction(wallet.address, 'MARKET_NOT_DEPLOYED', { marketTitle: data.market.title, address: data.market.address });
-        return;
+      // Process each market
+      for (const { oracleId, data } of markets) {
+        await processMarket(wallet, provider, oracleId, data, contractsCache);
       }
+    } catch (err) {
+      logErr(wallet.address, '💥', 'Error in tick:', err && err.message ? err.message : err);
+      logError(wallet.address, err, { action: 'TICK_ERROR' });
+    }
+  }
 
-      const marketInfo = data.market;
+  // initial tick immediately, then interval
+  await tick();
+  return setInterval(tick, POLL_INTERVAL_MS);
+}
+
+async function processMarket(wallet, provider, oracleId, data, contractsCache) {
+  try {
+    const marketInfo = data.market;
       // Log market title to console for visibility
       if (marketInfo && marketInfo.title) {
         logInfo(wallet.address, '📰', `Market: ${marketInfo.title}`);
@@ -548,7 +577,9 @@ async function runForWallet(wallet, provider) {
         }
       }
 
-      if (lastMarketAddr !== marketAddress || !cachedContracts) {
+      let cachedContracts = contractsCache.get(marketAddress);
+
+      if (!cachedContracts) {
         // Attach contracts directly to the wallet (signer) for ethers v6 compatibility
         const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
         const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
@@ -570,7 +601,7 @@ async function runForWallet(wallet, provider) {
           return;
         }
         cachedContracts = { market, usdc, erc1155, decimals };
-        lastMarketAddr = marketAddress;
+        contractsCache.set(marketAddress, cachedContracts);
         logInfo(wallet.address, '🧩', `Loaded contracts: market=${marketAddress}, usdc=${collateralTokenAddress}, erc1155=${conditionalTokensAddress}, usdcDecimals=${decimals}`);
       }
 
@@ -838,21 +869,17 @@ async function runForWallet(wallet, provider) {
       } catch (e) {
         logWarn(wallet.address, '⚠️', `Failed to read position balance after buy: ${(e && e.message) ? e.message : e}`);
       }
-    } catch (err) {
-      logErr(wallet.address, '💥', 'Error in tick:', err && err.message ? err.message : err);
-      logError(wallet.address, err, { action: 'TICK_ERROR' });
-    }
+  } catch (err) {
+    logErr(wallet.address, '💥', `Error processing market oracle ${oracleId}:`, err && err.message ? err.message : err);
+    logError(wallet.address, err, { action: 'PROCESS_MARKET_ERROR', oracleId });
   }
-
-  // initial tick immediately, then interval
-  await tick();
-  return setInterval(tick, POLL_INTERVAL_MS);
 }
 
 async function main() {
   console.log('🚀 Starting Limitless bot on Base...');
   console.log('');
   console.log('⚙️  Configuration:');
+  console.log(`   🎯 Tracking ${PRICE_ORACLE_IDS.length} oracle(s): ${PRICE_ORACLE_IDS.join(', ')}`);
   console.log(`   💰 Buy amount: ${BUY_AMOUNT_USDC} USDC`);
   console.log(`   📈 Target profit: ${TARGET_PROFIT_PCT}%`);
   console.log(`   🛑 Stop loss: ${STOP_LOSS_ENABLED ? `Enabled (${STOP_LOSS_PCT}% loss in last ${STOP_LOSS_TRIGGER_MINUTES} min)` : 'Disabled'}`);
