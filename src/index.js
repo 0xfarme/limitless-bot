@@ -21,6 +21,7 @@ const FREQUENCY = process.env.FREQUENCY || 'hourly';
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
 const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 2;
 const TARGET_PROFIT_PCT = process.env.TARGET_PROFIT_PCT ? Number(process.env.TARGET_PROFIT_PCT) : 12;
+const MIN_SELL_VALUE_USDC = process.env.MIN_SELL_VALUE_USDC ? Number(process.env.MIN_SELL_VALUE_USDC) : 0.5;
 const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 150;
 const GAS_PRICE_GWEI = process.env.GAS_PRICE_GWEI ? String(process.env.GAS_PRICE_GWEI) : '0.005';
 const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '1', 10);
@@ -1125,6 +1126,7 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       const pnlPct = cost > 0n ? Number((pnlAbs * 10000n) / cost) / 100 : 0;
 
       const valueHuman = fmtUnitsPrec(positionValue, decimals);
+      const positionValueFloat = Number(ethers.formatUnits(positionValue, decimals));
       const pnlSign = pnlAbs >= 0n ? '📈' : '📉';
 
       logInfo(wallet.address, pnlSign, `Value: ${valueHuman} | PnL: ${pnlPct.toFixed(1)}% | Time left: ${minutesRemaining.toFixed(0)}m`);
@@ -1132,6 +1134,12 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       // Check for exit conditions:
       let shouldSell = false;
       let exitReason = '';
+
+      // 0. Check minimum sell value to avoid dust sells
+      if (positionValueFloat < MIN_SELL_VALUE_USDC) {
+        logInfo(wallet.address, '💧', `Position value $${positionValueFloat.toFixed(2)} < min $${MIN_SELL_VALUE_USDC} - dust position, skipping sell`);
+        return;
+      }
 
       // DEBUG: Always log profit check
       logInfo(wallet.address, '🔍', `Profit check: ${pnlPct.toFixed(1)}% vs target ${TARGET_PROFIT_PCT}%`);
@@ -1150,7 +1158,7 @@ async function processMarket(wallet, provider, oracleId, marketData) {
         logErr(wallet.address, '🚨', `Emergency stop loss triggered: ${exitReason}`);
       }
 
-      // 3. Last 10 minutes: Exit any profitable position
+      // 3. Last 10 minutes: Exit any profitable position (but only if above min value)
       if (!shouldSell && minutesRemaining <= 10 && pnlPct > 0) {
         shouldSell = true;
         exitReason = `DEADLINE_EXIT (${minutesRemaining.toFixed(0)}m left, ${pnlPct.toFixed(1)}% profit)`;
@@ -1386,6 +1394,7 @@ async function main() {
   console.log(`📊 Strategy: ${STRATEGY_MODE.toUpperCase()}`);
   console.log(`💰 Position size: ${BUY_AMOUNT_USDC}`);
   console.log(`📈 Target profit: ${TARGET_PROFIT_PCT}%`);
+  console.log(`💧 Min sell value: $${MIN_SELL_VALUE_USDC} (prevents dust sells)`);
   console.log(`🎚️ Entry trigger: ${TRIGGER_PCT}% | Slippage: ${(SLIPPAGE_BPS / 100).toFixed(2)}%`);
   console.log(`🔐 Pre-approval: ${PRE_APPROVE_USDC ? `Enabled (every ${PRE_APPROVAL_INTERVAL_MS/60000}min, $${PRE_APPROVAL_AMOUNT_USDC})` : 'Disabled'}`);
   console.log(`⏱️ Poll interval: ${POLL_INTERVAL_MS / 1000}s | Confirmations: ${CONFIRMATIONS}`);
