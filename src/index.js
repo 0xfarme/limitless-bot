@@ -22,6 +22,7 @@ const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
 const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 2;
 const TARGET_PROFIT_PCT = process.env.TARGET_PROFIT_PCT ? Number(process.env.TARGET_PROFIT_PCT) : 12;
 const MIN_SELL_VALUE_USDC = process.env.MIN_SELL_VALUE_USDC ? Number(process.env.MIN_SELL_VALUE_USDC) : 0.5;
+const MIN_PROFIT_USDC = process.env.MIN_PROFIT_USDC ? Number(process.env.MIN_PROFIT_USDC) : 0.3; // Minimum profit to cover gas
 const TRAILING_STOP_ENABLED = process.env.TRAILING_STOP_ENABLED !== 'false'; // Default enabled
 const TRAILING_STOP_ACTIVATION_PCT = process.env.TRAILING_STOP_ACTIVATION_PCT ? Number(process.env.TRAILING_STOP_ACTIVATION_PCT) : 15;
 const TRAILING_STOP_DISTANCE_PCT = process.env.TRAILING_STOP_DISTANCE_PCT ? Number(process.env.TRAILING_STOP_DISTANCE_PCT) : 8;
@@ -1164,29 +1165,34 @@ async function processMarket(wallet, provider, oracleId, marketData) {
         return;
       }
 
-      // 1. INSTANT SELL at 50%+ profit
-      if (pnlPct >= INSTANT_SELL_AT_PCT) {
+      // Calculate profit in dollars
+      const pnlAmountUSDC = Number(ethers.formatUnits(pnlAbs, decimals));
+
+      // 1. INSTANT SELL at 50%+ profit (only if profit > min)
+      if (pnlPct >= INSTANT_SELL_AT_PCT && pnlAmountUSDC >= MIN_PROFIT_USDC) {
         shouldSell = true;
-        exitReason = `INSTANT_SELL (${pnlPct.toFixed(1)}% >= ${INSTANT_SELL_AT_PCT}%)`;
+        exitReason = `INSTANT_SELL (${pnlPct.toFixed(1)}%, $${pnlAmountUSDC.toFixed(2)} profit)`;
         logInfo(wallet.address, '🚀', `Instant sell triggered: ${exitReason}`);
       }
 
-      // 2. Trailing Stop Loss
+      // 2. Trailing Stop Loss (only if profit > min)
       if (!shouldSell && TRAILING_STOP_ENABLED && trailingStopActivated) {
         const dropFromPeak = highestProfitPct - pnlPct;
-        if (dropFromPeak >= TRAILING_STOP_DISTANCE_PCT) {
+        if (dropFromPeak >= TRAILING_STOP_DISTANCE_PCT && pnlAmountUSDC >= MIN_PROFIT_USDC) {
           shouldSell = true;
-          exitReason = `TRAILING_STOP (peak: ${highestProfitPct.toFixed(1)}%, now: ${pnlPct.toFixed(1)}%, drop: ${dropFromPeak.toFixed(1)}%)`;
+          exitReason = `TRAILING_STOP (peak: ${highestProfitPct.toFixed(1)}%, now: ${pnlPct.toFixed(1)}%, $${pnlAmountUSDC.toFixed(2)} profit)`;
           logInfo(wallet.address, '📉', `Trailing stop triggered: ${exitReason}`);
+        } else if (dropFromPeak >= TRAILING_STOP_DISTANCE_PCT) {
+          logInfo(wallet.address, '⏸️', `Trailing stop triggered but profit $${pnlAmountUSDC.toFixed(2)} < min $${MIN_PROFIT_USDC} - holding`);
         } else {
           logInfo(wallet.address, '🔒', `Trailing stop active: ${dropFromPeak.toFixed(1)}% from peak (trigger at ${TRAILING_STOP_DISTANCE_PCT}%)`);
         }
       }
 
-      // 3. Fixed profit target (if trailing stop not triggered)
-      if (!shouldSell && pnlPct >= TARGET_PROFIT_PCT) {
+      // 3. Fixed profit target (only if profit in $ > min)
+      if (!shouldSell && pnlPct >= TARGET_PROFIT_PCT && pnlAmountUSDC >= MIN_PROFIT_USDC) {
         shouldSell = true;
-        exitReason = `TARGET_PROFIT (${pnlPct.toFixed(1)}%)`;
+        exitReason = `TARGET_PROFIT (${pnlPct.toFixed(1)}%, $${pnlAmountUSDC.toFixed(2)} profit)`;
         logInfo(wallet.address, '🎯', `Target profit reached: ${exitReason}`);
       }
 
@@ -1197,11 +1203,18 @@ async function processMarket(wallet, provider, oracleId, marketData) {
         logErr(wallet.address, '🚨', `Emergency stop loss triggered: ${exitReason}`);
       }
 
-      // 5. Last 10 minutes: Exit any profitable position (but only if above min value)
-      if (!shouldSell && minutesRemaining <= 10 && pnlPct > 0) {
+      // 5. Last 5 minutes: Exit only if profit > gas fees
+      if (!shouldSell && minutesRemaining <= 5 && pnlAmountUSDC >= MIN_PROFIT_USDC) {
         shouldSell = true;
-        exitReason = `DEADLINE_EXIT (${minutesRemaining.toFixed(0)}m left, ${pnlPct.toFixed(1)}% profit)`;
+        exitReason = `DEADLINE_EXIT (${minutesRemaining.toFixed(0)}m left, $${pnlAmountUSDC.toFixed(2)} profit)`;
         logInfo(wallet.address, '⏰', `Closing profitable position before deadline`);
+      }
+
+      // 6. Last 2 minutes: Force exit regardless (avoid expiry)
+      if (!shouldSell && minutesRemaining <= 2) {
+        shouldSell = true;
+        exitReason = `FORCE_EXIT (${minutesRemaining.toFixed(0)}m left, ${pnlPct > 0 ? 'take any profit' : 'cut losses'})`;
+        logWarn(wallet.address, '⏱️', `Force exit near deadline: ${exitReason}`);
       }
 
       if (shouldSell) {
@@ -1453,6 +1466,7 @@ async function main() {
   console.log(`📊 Strategy: ${STRATEGY_MODE.toUpperCase()}`);
   console.log(`💰 Position size: ${BUY_AMOUNT_USDC}`);
   console.log(`📈 Target profit: ${TARGET_PROFIT_PCT}%`);
+  console.log(`💵 Min profit to sell: $${MIN_PROFIT_USDC} (covers gas fees)`);
   console.log(`💧 Min sell value: $${MIN_SELL_VALUE_USDC} (prevents dust sells)`);
   console.log(`🚀 Instant sell: ${INSTANT_SELL_AT_PCT}%`);
   console.log(`📉 Trailing stop: ${TRAILING_STOP_ENABLED ? `Enabled (activates at ${TRAILING_STOP_ACTIVATION_PCT}%, distance ${TRAILING_STOP_DISTANCE_PCT}%)` : 'Disabled'}`);
