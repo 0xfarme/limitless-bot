@@ -16,6 +16,9 @@ const FREQUENCY = process.env.FREQUENCY || 'hourly';
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
 const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 5; // human units
 const TARGET_PROFIT_PCT = process.env.TARGET_PROFIT_PCT ? Number(process.env.TARGET_PROFIT_PCT) : 20; // 20%
+const STOP_LOSS_ENABLED = process.env.STOP_LOSS_ENABLED !== 'false'; // Default enabled
+const STOP_LOSS_TRIGGER_MINUTES = process.env.STOP_LOSS_TRIGGER_MINUTES ? Number(process.env.STOP_LOSS_TRIGGER_MINUTES) : 13;
+const STOP_LOSS_PCT = process.env.STOP_LOSS_PCT ? Number(process.env.STOP_LOSS_PCT) : -30; // -30% loss
 const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 100; // 1%
 const GAS_PRICE_GWEI = process.env.GAS_PRICE_GWEI ? String(process.env.GAS_PRICE_GWEI) : '0.005';
 const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '1', 10);
@@ -614,13 +617,39 @@ async function runForWallet(wallet, provider) {
           pnlUSDC: Number(ethers.formatUnits(pnlAbs >= 0n ? pnlAbs : -pnlAbs, decimals))
         });
 
-        if (pnlAbs > 0n && pnlPct >= TARGET_PROFIT_PCT) {
-          logAction(wallet.address, 'SELL_TRIGGER', {
-            market: marketAddress,
-            reason: 'TARGET_PROFIT',
-            pnlPct,
-            targetPct: TARGET_PROFIT_PCT
-          });
+        // Calculate time remaining for stop loss check
+        let shouldSellStopLoss = false;
+        if (STOP_LOSS_ENABLED && marketInfo.deadline) {
+          const deadlineMs = new Date(marketInfo.deadline).getTime();
+          if (!Number.isNaN(deadlineMs)) {
+            const remainingMs = deadlineMs - nowMs;
+            const remainingMin = Math.max(0, Math.floor(remainingMs / 60000));
+
+            // Stop loss: activate in last X minutes if losing money
+            if (remainingMin <= STOP_LOSS_TRIGGER_MINUTES && pnlPct <= STOP_LOSS_PCT) {
+              shouldSellStopLoss = true;
+              logAction(wallet.address, 'STOP_LOSS_TRIGGER', {
+                market: marketAddress,
+                reason: 'STOP_LOSS',
+                pnlPct,
+                stopLossPct: STOP_LOSS_PCT,
+                remainingMinutes: remainingMin,
+                triggerMinutes: STOP_LOSS_TRIGGER_MINUTES
+              });
+              logWarn(wallet.address, '🛑', `STOP LOSS: ${remainingMin}m left, ${pnlPct.toFixed(2)}% loss - selling to preserve capital`);
+            }
+          }
+        }
+
+        if (shouldSellStopLoss || (pnlAbs > 0n && pnlPct >= TARGET_PROFIT_PCT)) {
+          if (!shouldSellStopLoss) {
+            logAction(wallet.address, 'SELL_TRIGGER', {
+              market: marketAddress,
+              reason: 'TARGET_PROFIT',
+              pnlPct,
+              targetPct: TARGET_PROFIT_PCT
+            });
+          }
           const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
           if (!approvedOk) {
             logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping sell this tick.');
@@ -651,6 +680,7 @@ async function runForWallet(wallet, provider) {
             positionValue: positionValue.toString(),
             pnlPct,
             pnlUSDC: Number(ethers.formatUnits(pnlAbs, decimals)),
+            reason: shouldSellStopLoss ? 'STOP_LOSS' : 'TARGET_PROFIT',
             txHash: tx.hash
           });
 
@@ -795,6 +825,13 @@ async function runForWallet(wallet, provider) {
 
 async function main() {
   console.log('🚀 Starting Limitless bot on Base...');
+  console.log('');
+  console.log('⚙️  Configuration:');
+  console.log(`   💰 Buy amount: ${BUY_AMOUNT_USDC} USDC`);
+  console.log(`   📈 Target profit: ${TARGET_PROFIT_PCT}%`);
+  console.log(`   🛑 Stop loss: ${STOP_LOSS_ENABLED ? `Enabled (${STOP_LOSS_PCT}% loss in last ${STOP_LOSS_TRIGGER_MINUTES} min)` : 'Disabled'}`);
+  console.log(`   🎯 Strategy: ${STRATEGY_MODE} (trigger: ${TRIGGER_PCT}%)`);
+  console.log('');
   console.log('📁 Logging to:');
   console.log(`   📊 Trades: ${TRADES_LOG}`);
   console.log(`   🔄 Actions: ${ACTIONS_LOG}`);
