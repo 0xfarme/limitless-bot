@@ -1211,10 +1211,20 @@ async function processMarket(wallet, provider, oracleId, marketData) {
           return;
         }
 
-        // ALWAYS sell entire token balance to close position completely
-        const maxOutcomeTokensToSell = tokenBalance;
-        // Set minimum return to 0 to ensure we sell everything (even at a loss)
+        // Sell 90% of tokens - leave 10% dust to avoid rounding/calculation issues
+        const tokensToSell = (tokenBalance * 90n) / 100n;
+
+        // If we have tracked the original purchased amount, use that
+        const originalPurchasedAmount = holding.purchasedTokenAmount || tokenBalance;
+        const ninetyPercentOfPurchased = (originalPurchasedAmount * 90n) / 100n;
+
+        // Use whichever is appropriate based on what we have
+        const maxOutcomeTokensToSell = holding.purchasedTokenAmount ? ninetyPercentOfPurchased : tokensToSell;
+
+        // Set minimum return to 0 to ensure we sell (even at a loss)
         const returnAmountForSell = 0n;
+
+        logInfo(wallet.address, '📤', `Selling 90% of position: ${maxOutcomeTokensToSell} tokens (leaving 10% dust)`);
 
         const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
         if (!gasEst) {
@@ -1352,15 +1362,20 @@ async function processMarket(wallet, provider, oracleId, marketData) {
 
     const padded = (gasEst * 120n) / 100n + 10000n;
     const tx = await market.buy(investment, outcomeToBuy, minOutcomeTokensToBuy, await txOverrides(wallet.provider, padded));
-    
+
     logInfo(wallet.address, '🧾', `Buy tx: ${tx.hash.slice(0, 10)}...`);
     await tx.wait(CONFIRMATIONS);
-    
+
     // Get actual entry price after buy
     const entryPrice = prices[outcomeToBuy];
     logInfo(wallet.address, '✅', `BUY completed at ${entryPrice.toFixed(1)}%`);
 
     const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
+
+    // Get the actual token amount received after purchase
+    await delay(2000); // Wait for balance to update
+    const purchasedTokenAmount = await safeBalanceOf(erc1155, wallet.address, tokenId);
+    logInfo(wallet.address, '🎟️', `Purchased ${purchasedTokenAmount} tokens`);
     
     // NEW: Log buy with both trigger price and actual entry price
     logTrade(
@@ -1387,7 +1402,8 @@ async function processMarket(wallet, provider, oracleId, marketData) {
       entryTime: Date.now(),
       entryPrice: entryPrice,
       highestProfitPct: 0,
-      trailingStopActivated: false
+      trailingStopActivated: false,
+      purchasedTokenAmount: purchasedTokenAmount // Track original purchase amount
     });
 
     for (let i = 0; i < 3; i++) {
