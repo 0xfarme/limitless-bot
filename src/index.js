@@ -31,6 +31,7 @@ const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '1', 10);
 const STRATEGY_MODE = (process.env.STRATEGY_MODE || 'dominant').toLowerCase();
 const TRIGGER_PCT = process.env.TRIGGER_PCT ? Number(process.env.TRIGGER_PCT) : 60;
 const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND) : 5;
+const MAX_ENTRY_PRICE = process.env.MAX_ENTRY_PRICE ? Number(process.env.MAX_ENTRY_PRICE) : 70; // Don't buy above 70%
 const LOOKBACK_BLOCKS = parseInt(process.env.LOOKBACK_BLOCKS || '500000', 10);
 
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -789,10 +790,23 @@ async function processMarket(wallet, provider, oracleId, data, contractsCache) {
         return;
       }
 
+      // Check entry price - don't buy if price is too high (not profitable)
+      const entryPrice = prices[outcomeToBuy];
+      if (entryPrice > MAX_ENTRY_PRICE) {
+        logWarn(wallet.address, '🚫', `Entry price too high: ${entryPrice.toFixed(1)}% > ${MAX_ENTRY_PRICE}% (not profitable, skipping)`);
+        logAction(wallet.address, 'ENTRY_PRICE_TOO_HIGH', {
+          market: marketAddress,
+          outcomeIndex: outcomeToBuy,
+          entryPrice,
+          maxEntryPrice: MAX_ENTRY_PRICE
+        });
+        return;
+      }
+
       logAction(wallet.address, 'BUY_TRIGGER', {
         market: marketAddress,
         outcomeIndex: outcomeToBuy,
-        price: prices[outcomeToBuy],
+        price: entryPrice,
         mode: STRATEGY_MODE
       });
 
@@ -883,7 +897,7 @@ async function main() {
   console.log(`   💰 Buy amount: ${BUY_AMOUNT_USDC} USDC`);
   console.log(`   📈 Target profit: ${TARGET_PROFIT_PCT}%`);
   console.log(`   🛑 Stop loss: ${STOP_LOSS_ENABLED ? `Enabled (${STOP_LOSS_PCT}% loss in last ${STOP_LOSS_TRIGGER_MINUTES} min)` : 'Disabled'}`);
-  console.log(`   🎯 Strategy: ${STRATEGY_MODE} (trigger: ${TRIGGER_PCT}%)`);
+  console.log(`   🎯 Strategy: ${STRATEGY_MODE} (trigger: ${TRIGGER_PCT}%, max entry: ${MAX_ENTRY_PRICE}%)`);
   console.log('');
   console.log('📁 Logging to:');
   console.log(`   📊 Trades: ${TRADES_LOG}`);
