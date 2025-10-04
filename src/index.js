@@ -479,6 +479,9 @@ async function runForWallet(wallet, provider) {
 
       const data = await fetchMarket();
 
+      // Debug: Log full response
+      console.log('🔍 Full API response:', JSON.stringify(data, null, 2));
+
       // Check for various failure conditions
       if (!data || !data.market) {
         logWarn(wallet.address, '⏸️', 'No market data returned from API');
@@ -493,8 +496,8 @@ async function runForWallet(wallet, provider) {
       }
 
       if (!data.market.address) {
-        logWarn(wallet.address, '⏳', `Market not yet deployed on-chain: ${data.market.title || 'Unknown'}`);
-        logAction(wallet.address, 'MARKET_NOT_DEPLOYED', { marketTitle: data.market.title });
+        logWarn(wallet.address, '⏳', `Market not yet deployed on-chain: ${data.market.title || 'Unknown'} - address is: ${data.market.address}`);
+        logAction(wallet.address, 'MARKET_NOT_DEPLOYED', { marketTitle: data.market.title, address: data.market.address });
         return;
       }
 
