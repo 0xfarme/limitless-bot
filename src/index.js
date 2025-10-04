@@ -478,9 +478,23 @@ async function runForWallet(wallet, provider) {
       logAction(wallet.address, 'TICK_START', {});
 
       const data = await fetchMarket();
-      if (!data || !data.market || !data.market.address || !data.isActive) {
-        logWarn(wallet.address, '⏸️', 'Market inactive or missing data');
-        logAction(wallet.address, 'MARKET_INACTIVE', { data });
+
+      // Check for various failure conditions
+      if (!data || !data.market) {
+        logWarn(wallet.address, '⏸️', 'No market data returned from API');
+        logAction(wallet.address, 'MARKET_MISSING', { data });
+        return;
+      }
+
+      if (!data.isActive) {
+        logWarn(wallet.address, '⏸️', `Market inactive: ${data.market.title || 'Unknown'}`);
+        logAction(wallet.address, 'MARKET_INACTIVE', { marketTitle: data.market.title });
+        return;
+      }
+
+      if (!data.market.address) {
+        logWarn(wallet.address, '⏳', `Market not yet deployed on-chain: ${data.market.title || 'Unknown'}`);
+        logAction(wallet.address, 'MARKET_NOT_DEPLOYED', { marketTitle: data.market.title });
         return;
       }
 
