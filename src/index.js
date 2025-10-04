@@ -259,6 +259,15 @@ function fmtUnitsPrec(amount, decimals, precision = 4) {
 async function fetchMarket() {
   const url = `https://api.limitless.exchange/markets/prophet?priceOracleId=${PRICE_ORACLE_ID}&frequency=${FREQUENCY}`;
   const res = await axios.get(url, { timeout: 15000 });
+
+  // Debug logging
+  console.log('📡 API Response:', {
+    isActive: res.data.isActive,
+    hasMarket: !!res.data.market,
+    marketAddress: res.data.market?.address,
+    marketTitle: res.data.market?.title
+  });
+
   return res.data;
 }
 
