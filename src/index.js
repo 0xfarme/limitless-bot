@@ -86,6 +86,9 @@ async function txOverrides(provider, gasLimit) {
 // In-memory state: per-user cost basis to compute PnL
 const userState = new Map(); // key: wallet.address, value: { holding: { marketAddress, outcomeIndex, tokenId: bigint, amount: bigint, cost: bigint } | null, completedMarkets: Set<string> }
 
+// Track pending buy transactions per wallet to prevent duplicate buys
+const pendingBuys = new Map(); // key: wallet.address, value: marketAddress
+
 // ========= Enhanced Logging System =========
 function appendLog(file, data) {
   try {
@@ -774,6 +777,13 @@ async function processMarket(wallet, provider, oracleId, data, contractsCache) {
         return;
       }
 
+      // Check if there's already a pending buy transaction for this wallet
+      const pendingMarket = pendingBuys.get(wallet.address);
+      if (pendingMarket) {
+        logInfo(wallet.address, '⏳', `Buy transaction pending for market ${pendingMarket}; skipping new buy.`);
+        return;
+      }
+
       // Additional guardrails for betting:
       const positionIdsValid = Array.isArray(positionIds) && positionIds.length >= 2 && positionIds[0] && positionIds[1];
       if (!positionIdsValid) {
@@ -852,10 +862,19 @@ async function processMarket(wallet, provider, oracleId, data, contractsCache) {
       logInfo(wallet.address, '⛽', `Gas estimate buy: ${gasEst}`);
       const padded = (gasEst * 120n) / 100n + 10000n;
       const buyOv = await txOverrides(wallet.provider, padded);
-      const buyTx = await market.buy(investment, outcomeToBuy, minOutcomeTokensToBuy, buyOv);
-      logInfo(wallet.address, '🧾', `Buy tx: ${buyTx.hash}`);
-      const receipt = await buyTx.wait(CONFIRMATIONS);
-      logInfo(wallet.address, '✅', `Buy completed in block ${receipt.blockNumber}`);
+
+      // Mark this wallet as having a pending buy transaction
+      pendingBuys.set(wallet.address, marketAddress);
+
+      try {
+        const buyTx = await market.buy(investment, outcomeToBuy, minOutcomeTokensToBuy, buyOv);
+        logInfo(wallet.address, '🧾', `Buy tx: ${buyTx.hash}`);
+        const receipt = await buyTx.wait(CONFIRMATIONS);
+        logInfo(wallet.address, '✅', `Buy completed in block ${receipt.blockNumber}`);
+      } finally {
+        // Always clear the pending buy flag, even if transaction fails
+        pendingBuys.delete(wallet.address);
+      }
 
       const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
 
