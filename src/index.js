@@ -32,6 +32,7 @@ const STRATEGY_MODE = (process.env.STRATEGY_MODE || 'dominant').toLowerCase();
 const TRIGGER_PCT = process.env.TRIGGER_PCT ? Number(process.env.TRIGGER_PCT) : 60;
 const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND) : 5;
 const MAX_ENTRY_PRICE = process.env.MAX_ENTRY_PRICE ? Number(process.env.MAX_ENTRY_PRICE) : 70; // Don't buy above 70%
+const MIN_SELL_VALUE_USDC = process.env.MIN_SELL_VALUE_USDC ? Number(process.env.MIN_SELL_VALUE_USDC) : 0.10; // Don't sell if position < 10 cents
 const LOOKBACK_BLOCKS = parseInt(process.env.LOOKBACK_BLOCKS || '500000', 10);
 
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -700,6 +701,13 @@ async function processMarket(wallet, provider, oracleId, data, contractsCache) {
         }
 
         if (shouldSellStopLoss || (pnlAbs > 0n && pnlPct >= TARGET_PROFIT_PCT)) {
+          // Skip selling if position value is dust (less than minimum threshold)
+          const minSellValueWei = BigInt(Math.floor(MIN_SELL_VALUE_USDC * 1e6)); // USDC has 6 decimals
+          if (positionValue < minSellValueWei) {
+            logWarn(wallet.address, '💨', `Position value ${(Number(positionValue) / 1e6).toFixed(4)} USDC is dust (< ${MIN_SELL_VALUE_USDC} USDC) - skipping sell to save gas`);
+            return;
+          }
+
           if (!shouldSellStopLoss) {
             logAction(wallet.address, 'SELL_TRIGGER', {
               market: marketAddress,
