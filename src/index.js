@@ -25,7 +25,6 @@ const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND)
 const LOOKBACK_BLOCKS = parseInt(process.env.LOOKBACK_BLOCKS || '500000', 10);
 
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
-const CALC_SELL_DECIMALS = 8; // calcSellAmount returns values scaled by 1e8 per spec
 const STATE_FILE = process.env.STATE_FILE || path.join('data', 'state.json');
 
 if (!RPC_URL) {
@@ -276,7 +275,23 @@ async function fetchMarkets() {
     }
   });
   const results = await Promise.all(promises);
-  return results.filter(Boolean); // Filter out failed fetches
+  const markets = results.filter(Boolean); // Filter out failed fetches
+
+  // Deduplicate by market address (in case same market comes from multiple oracles)
+  const seen = new Map();
+  const unique = [];
+  for (const market of markets) {
+    if (market && market.market && market.market.address) {
+      const addr = market.market.address.toLowerCase();
+      if (!seen.has(addr)) {
+        seen.set(addr, true);
+        unique.push(market);
+      }
+    } else {
+      unique.push(market); // Keep markets without address
+    }
+  }
+  return unique;
 }
 
 async function readAllowance(usdc, owner, spender) {
@@ -487,8 +502,10 @@ async function runForWallet(wallet, provider) {
   logInfo(wallet.address, '🚀', 'Worker started');
   let cachedContracts = new Map(); // marketAddress -> { market, usdc, erc1155, decimals }
   let lastApprovalHour = -1; // Track which hour we last pre-approved
+  let buyingInProgress = new Set(); // Track markets currently being bought in this tick to prevent duplicates
 
   async function tick() {
+    buyingInProgress.clear(); // Clear at start of each tick
     try {
       logInfo(wallet.address, '🔄', `Polling market data (oracles=[${PRICE_ORACLE_IDS.join(', ')}], freq=${FREQUENCY})...`);
       const allMarketsData = await fetchMarkets();
@@ -522,6 +539,91 @@ async function runForWallet(wallet, provider) {
     }
   }
 
+  // Helper function to execute buy transaction
+  async function executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155) {
+    // Check if USDC allowance is sufficient
+    logInfo(wallet.address, '🔐', `Checking USDC allowance for market ${marketAddress}...`);
+    let currentAllowance;
+    try {
+      currentAllowance = await readAllowance(usdc, wallet.address, marketAddress);
+      logInfo(wallet.address, '🔍', `Current allowance: ${ethers.formatUnits(currentAllowance, decimals)} USDC`);
+    } catch (e) {
+      logWarn(wallet.address, '⚠️', `Failed to read allowance: ${e?.message || e}`);
+      currentAllowance = 0n;
+    }
+
+    // Only run approval if needed
+    if (currentAllowance < investment) {
+      logInfo(wallet.address, '🔐', `Insufficient allowance, requesting approval now...`);
+      const allowanceOk = await ensureUsdcApproval(wallet, usdc, marketAddress, investment);
+      if (!allowanceOk) {
+        logWarn(wallet.address, '🛑', 'Allowance not confirmed. Skip buy this tick.');
+        return;
+      }
+    } else {
+      logInfo(wallet.address, '✅', `Allowance already sufficient (pre-approved), proceeding to buy`);
+    }
+
+    // Compute minOutcomeTokensToBuy via calcBuyAmount and slippage
+    logInfo(wallet.address, '🧮', `[${marketAddress.substring(0, 8)}...] Calculating expected tokens for investment=${investment}...`);
+    const expectedTokens = await retryRpcCall(async () => await market.calcBuyAmount(investment, outcomeToBuy));
+    const minOutcomeTokensToBuy = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
+    logInfo(wallet.address, '🛒', `Buying outcome=${outcomeToBuy} invest=${investment} expectedTokens=${expectedTokens} minTokens=${minOutcomeTokensToBuy} slippage=${SLIPPAGE_BPS}bps`);
+
+    // Mark this market as being bought to prevent duplicates in this tick
+    buyingInProgress.add(marketAddress.toLowerCase());
+
+    // Estimate gas then buy
+    logInfo(wallet.address, '⚡', `Estimating gas for buy transaction...`);
+    const gasEst = await estimateGasFor(market, wallet, 'buy', [investment, outcomeToBuy, minOutcomeTokensToBuy]);
+    if (!gasEst) {
+      logWarn(wallet.address, '🛑', 'Gas estimate buy failed; skipping buy this tick.');
+      buyingInProgress.delete(marketAddress.toLowerCase());
+      return;
+    }
+    logInfo(wallet.address, '⛽', `Gas estimate buy: ${gasEst}`);
+    const padded = (gasEst * 120n) / 100n + 10000n;
+    logInfo(wallet.address, '🔧', `Gas with 20% padding: ${padded}`);
+    const buyOv = await txOverrides(wallet.provider, padded);
+    logInfo(wallet.address, '💸', `Sending buy transaction: investment=${investment}, outcome=${outcomeToBuy}, minTokens=${minOutcomeTokensToBuy}`);
+    const buyTx = await market.buy(investment, outcomeToBuy, minOutcomeTokensToBuy, buyOv);
+    logInfo(wallet.address, '🧾', `Buy tx: ${buyTx.hash}`);
+    logInfo(wallet.address, '⏳', `Waiting for ${CONFIRMATIONS} confirmation(s)...`);
+    const receipt = await buyTx.wait(CONFIRMATIONS);
+    logInfo(wallet.address, '✅', `Buy completed in block ${receipt.blockNumber}, gasUsed=${receipt.gasUsed}`);
+
+    const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
+    // After buy, record cost basis
+    logInfo(wallet.address, '💾', `[${marketAddress.substring(0, 8)}...] Recording position: outcome=${outcomeToBuy}, tokenId=${tokenId}, cost=${investment}`);
+    addHolding(wallet.address, {
+      marketAddress,
+      outcomeIndex: outcomeToBuy,
+      tokenId,
+      amount: investment,
+      cost: investment
+    });
+
+    // Try to confirm on-chain ERC1155 balance
+    try {
+      let balNow = 0n;
+      logInfo(wallet.address, '🔎', `Verifying position balance (tokenId=${tokenId})...`);
+      for (let i = 0; i < 3; i++) {
+        balNow = await safeBalanceOf(erc1155, wallet.address, tokenId);
+        if (balNow > 0n) {
+          logInfo(wallet.address, '🎟️', `Position balance confirmed: ${balNow} (attempt ${i + 1}/3)`);
+          break;
+        }
+        logInfo(wallet.address, '⏳', `Position balance not yet updated, retrying in 1s (attempt ${i + 1}/3)...`);
+        await delay(1000);
+      }
+      if (balNow === 0n) {
+        logWarn(wallet.address, '⚠️', `Position balance still 0 after 3 attempts (may update later)`);
+      }
+    } catch (e) {
+      logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Failed to read position balance after buy: ${(e && e.message) ? e.message : e}`);
+    }
+  }
+
   async function processMarket(wallet, provider, data) {
     try {
 
@@ -544,6 +646,7 @@ async function runForWallet(wallet, provider) {
       const nowMs = Date.now();
       let tooNewForBet = false;
       let nearDeadlineForBet = false;
+      let inLastNineMinutes = false;
 
       if (marketInfo.createdAt) {
         const createdMs = new Date(marketInfo.createdAt).getTime();
@@ -561,6 +664,13 @@ async function runForWallet(wallet, provider) {
         if (!Number.isNaN(deadlineMs)) {
           const remainingMs = deadlineMs - nowMs;
           const remMin = Math.max(0, Math.floor(remainingMs / 60000));
+
+          // NEW LOGIC: Check if in last 9 minutes
+          if (remainingMs <= 9 * 60 * 1000 && remainingMs > 0) {
+            inLastNineMinutes = true;
+            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last 9 minutes (${remMin}m remaining) - can buy if >75%`);
+          }
+
           if (remainingMs < 5 * 60 * 1000) {
             nearDeadlineForBet = true;
             logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Time to deadline ${remMin}m < 5m — skip betting`);
@@ -684,6 +794,13 @@ async function runForWallet(wallet, provider) {
         const costHuman = fmtUnitsPrec(cost, decimals, 4);
         const pnlAbsHuman = fmtUnitsPrec(pnlAbs >= 0n ? pnlAbs : -pnlAbs, decimals, 4);
         logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] Position: value=${valueHuman} cost=${costHuman} PnL=${pnlPct.toFixed(2)}% ${signEmoji}${pnlAbsHuman} USDC`);
+
+        // NEW LOGIC: Don't sell if in last 9 minutes strategy - hold until close
+        if (inLastNineMinutes) {
+          logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Holding position until market closes (last 9min strategy)`);
+          return;
+        }
+
         if (pnlAbs > 0n && pnlPct >= TARGET_PROFIT_PCT) {
           logInfo(wallet.address, '🎯', `Profit target reached! PnL=${pnlPct.toFixed(2)}% >= ${TARGET_PROFIT_PCT}%. Initiating sell...`);
           const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
@@ -737,6 +854,12 @@ async function runForWallet(wallet, provider) {
         return;
       }
 
+      // Prevent duplicate buys in the same tick cycle
+      if (buyingInProgress.has(marketAddress.toLowerCase())) {
+        logInfo(wallet.address, '🔒', `[${marketAddress.substring(0, 8)}...] Buy already in progress for this market in current tick; skipping.`);
+        return;
+      }
+
       // Additional guardrails for betting:
       const positionIdsValid = Array.isArray(positionIds) && positionIds.length >= 2 && positionIds[0] && positionIds[1];
       if (!positionIdsValid) {
@@ -748,103 +871,42 @@ async function runForWallet(wallet, provider) {
         return;
       }
 
-      const outcomeToBuy = pickOutcome(prices);
-      if (outcomeToBuy === null) {
-        logInfo(wallet.address, '🔎', `[${marketAddress.substring(0, 8)}...] No trigger (mode=${STRATEGY_MODE}, prices=${prices.join(', ')}).`);
-        return;
-      }
-
-      const investmentHuman = BUY_AMOUNT_USDC;
-      const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
-
-      // Check USDC balance sufficient for bet
-      logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Checking USDC balance...`);
-      const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
-      const usdcBalHuman = ethers.formatUnits(usdcBal, decimals);
-      const needHuman = ethers.formatUnits(investment, decimals);
-      logInfo(wallet.address, '💰', `USDC balance=${usdcBalHuman}, need=${needHuman} for buy`);
-      if (usdcBal < investment) {
-        logWarn(wallet.address, '⚠️', `Insufficient USDC balance. Need ${needHuman}, have ${usdcBalHuman}.`);
-        return;
-      }
-
-      // Check if USDC allowance is sufficient (should already be pre-approved during first 10 min of hour)
-      logInfo(wallet.address, '🔐', `Checking USDC allowance for market ${marketAddress}...`);
-      let currentAllowance;
-      try {
-        currentAllowance = await readAllowance(usdc, wallet.address, marketAddress);
-        logInfo(wallet.address, '🔍', `Current allowance: ${ethers.formatUnits(currentAllowance, decimals)} USDC`);
-      } catch (e) {
-        logWarn(wallet.address, '⚠️', `Failed to read allowance: ${e?.message || e}`);
-        currentAllowance = 0n;
-      }
-
-      // Only run approval if needed (not pre-approved or insufficient)
-      if (currentAllowance < investment) {
-        logInfo(wallet.address, '🔐', `Insufficient allowance, requesting approval now...`);
-        const allowanceOk = await ensureUsdcApproval(wallet, usdc, marketAddress, investment);
-        if (!allowanceOk) {
-          logWarn(wallet.address, '🛑', 'Allowance not confirmed. Skip buy this tick.');
+      // NEW LOGIC: Check if we should use last 9 minutes strategy
+      if (inLastNineMinutes) {
+        // Only buy if one side is > 75%
+        const maxPrice = Math.max(...prices);
+        if (maxPrice <= 75) {
+          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] In last 9min but no side >75% (prices: [${prices.join(', ')}]) - skipping`);
           return;
         }
-      } else {
-        logInfo(wallet.address, '✅', `Allowance already sufficient (pre-approved), proceeding to buy`);
-      }
 
-      // Compute minOutcomeTokensToBuy via calcBuyAmount and slippage
-      logInfo(wallet.address, '🧮', `[${marketAddress.substring(0, 8)}...] Calculating expected tokens for investment=${investment}...`);
-      const expectedTokens = await retryRpcCall(async () => await market.calcBuyAmount(investment, outcomeToBuy));
-      const minOutcomeTokensToBuy = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
-      logInfo(wallet.address, '🛒', `Trigger hit (mode=${STRATEGY_MODE}). Buying outcome=${outcomeToBuy} invest=${investment} expectedTokens=${expectedTokens} minTokens=${minOutcomeTokensToBuy} slippage=${SLIPPAGE_BPS}bps`);
+        // Buy the side that is > 75%
+        const outcomeToBuy = prices[0] > 75 ? 0 : 1;
+        logInfo(wallet.address, '🎯', `[${marketAddress.substring(0, 8)}...] Last 9min strategy: Buying outcome ${outcomeToBuy} at ${prices[outcomeToBuy]}%`);
 
-      // Estimate gas then buy
-      logInfo(wallet.address, '⚡', `Estimating gas for buy transaction...`);
-      const gasEst = await estimateGasFor(market, wallet, 'buy', [investment, outcomeToBuy, minOutcomeTokensToBuy]);
-      if (!gasEst) {
-        logWarn(wallet.address, '🛑', 'Gas estimate buy failed; skipping buy this tick.');
+        // Continue to buy logic below with this outcome
+        const investmentHuman = BUY_AMOUNT_USDC;
+        const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
+
+        // Check USDC balance sufficient for bet
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Checking USDC balance...`);
+        const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+        const usdcBalHuman = ethers.formatUnits(usdcBal, decimals);
+        const needHuman = ethers.formatUnits(investment, decimals);
+        logInfo(wallet.address, '💰', `USDC balance=${usdcBalHuman}, need=${needHuman} for buy`);
+        if (usdcBal < investment) {
+          logWarn(wallet.address, '⚠️', `Insufficient USDC balance. Need ${needHuman}, have ${usdcBalHuman}.`);
+          return;
+        }
+
+        // Check allowance and execute buy (same as normal flow)
+        await executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155);
         return;
       }
-      logInfo(wallet.address, '⛽', `Gas estimate buy: ${gasEst}`);
-      const padded = (gasEst * 120n) / 100n + 10000n;
-      logInfo(wallet.address, '🔧', `Gas with 20% padding: ${padded}`);
-      const buyOv = await txOverrides(wallet.provider, padded);
-      logInfo(wallet.address, '💸', `Sending buy transaction: investment=${investment}, outcome=${outcomeToBuy}, minTokens=${minOutcomeTokensToBuy}`);
-      const buyTx = await market.buy(investment, outcomeToBuy, minOutcomeTokensToBuy, buyOv);
-      logInfo(wallet.address, '🧾', `Buy tx: ${buyTx.hash}`);
-      logInfo(wallet.address, '⏳', `Waiting for ${CONFIRMATIONS} confirmation(s)...`);
-      const receipt = await buyTx.wait(CONFIRMATIONS);
-      logInfo(wallet.address, '✅', `Buy completed in block ${receipt.blockNumber}, gasUsed=${receipt.gasUsed}`);
 
-      const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
-      // After buy, record cost basis
-      logInfo(wallet.address, '💾', `[${marketAddress.substring(0, 8)}...] Recording position: outcome=${outcomeToBuy}, tokenId=${tokenId}, cost=${investment}`);
-      addHolding(wallet.address, {
-        marketAddress,
-        outcomeIndex: outcomeToBuy,
-        tokenId,
-        amount: investment,
-        cost: investment
-      });
-      // Try to confirm on-chain ERC1155 balance right away (best-effort)
-      // Try to confirm on-chain ERC1155 balance right away (best-effort with retries)
-      try {
-        let balNow = 0n;
-        logInfo(wallet.address, '🔎', `Verifying position balance (tokenId=${tokenId})...`);
-        for (let i = 0; i < 3; i++) {
-          balNow = await safeBalanceOf(erc1155, wallet.address, tokenId);
-          if (balNow > 0n) {
-            logInfo(wallet.address, '🎟️', `Position balance confirmed: ${balNow} (attempt ${i + 1}/3)`);
-            break;
-          }
-          logInfo(wallet.address, '⏳', `Position balance not yet updated, retrying in 1s (attempt ${i + 1}/3)...`);
-          await delay(1000);
-        }
-        if (balNow === 0n) {
-          logWarn(wallet.address, '⚠️', `Position balance still 0 after 3 attempts (may update later)`);
-        }
-      } catch (e) {
-        logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Failed to read position balance after buy: ${(e && e.message) ? e.message : e}`);
-      }
+      // Regular buy logic is DISABLED - only using last 9 minutes strategy
+      logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Not in last 9 minutes - regular buying disabled. Waiting for last 9min window.`);
+      return;
     } catch (err) {
       logErr(wallet.address, '💥', `Error processing market: ${err && err.message ? err.message : err}`);
       if (err.stack) {
@@ -932,10 +994,3 @@ main().catch((e) => {
   console.error('Fatal error:', e);
   process.exit(1);
 });
-function scaleToCalcSell(amount, tokenDecimals) {
-  const d = BigInt(tokenDecimals);
-  const target = BigInt(CALC_SELL_DECIMALS);
-  if (d === target) return amount;
-  if (d < target) return amount * (10n ** (target - d));
-  return amount / (10n ** (d - target));
-}
