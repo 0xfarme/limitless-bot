@@ -204,20 +204,52 @@ function loadStateSync() {
 }
 
 async function isContract(provider, address) {
-  const code = await provider.getCode(address);
-  return code && code !== '0x';
+  try {
+    const code = await provider.getCode(address);
+    return code && code !== '0x';
+  } catch (e) {
+    console.warn(`⚠️ Failed to check if ${address} is contract:`, e?.message || e);
+    return false;
+  }
 }
 
 function delay(ms) {
   return new Promise(res => setTimeout(res, ms));
 }
 
-async function safeBalanceOf(erc1155, owner, tokenId) {
-  try {
-    return await erc1155.balanceOf(owner, tokenId);
-  } catch (e) {
-    return 0n;
+// Retry helper for RPC calls with exponential backoff
+async function retryRpcCall(fn, maxRetries = 3, baseDelay = 1000) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const isLastAttempt = attempt === maxRetries - 1;
+      const isRpcError = e?.code === 'CALL_EXCEPTION' || e?.message?.includes('missing revert data') || e?.message?.includes('rate limit');
+
+      if (isLastAttempt || !isRpcError) {
+        throw e;
+      }
+
+      const delayMs = baseDelay * Math.pow(2, attempt);
+      console.warn(`⚠️ RPC call failed (attempt ${attempt + 1}/${maxRetries}), retrying in ${delayMs}ms:`, e?.message || e);
+      await delay(delayMs);
+    }
   }
+}
+
+async function safeBalanceOf(erc1155, owner, tokenId) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await erc1155.balanceOf(owner, tokenId);
+    } catch (e) {
+      if (attempt === 2) {
+        console.warn(`⚠️ Failed to read balance after 3 attempts:`, e?.message || e);
+        return 0n;
+      }
+      await delay(500 * (attempt + 1)); // Exponential backoff: 500ms, 1000ms, 1500ms
+    }
+  }
+  return 0n;
 }
 
 function fmtUnitsPrec(amount, decimals, precision = 4) {
@@ -248,18 +280,26 @@ async function fetchMarkets() {
 }
 
 async function readAllowance(usdc, owner, spender) {
-  // Try normal call, then staticCall as fallback
-  try {
-    return await usdc.allowance(owner, spender);
-  } catch (e) {
+  // Try with retry and fallback
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const fn = usdc.getFunction ? usdc.getFunction('allowance') : null;
-      if (fn && fn.staticCall) {
-        return await fn.staticCall(owner, spender);
+      return await usdc.allowance(owner, spender);
+    } catch (e) {
+      if (attempt < 2) {
+        await delay(1000 * (attempt + 1));
+        continue;
       }
-    } catch (_) {}
-    throw e;
+      // Last attempt: try staticCall fallback
+      try {
+        const fn = usdc.getFunction ? usdc.getFunction('allowance') : null;
+        if (fn && fn.staticCall) {
+          return await fn.staticCall(owner, spender);
+        }
+      } catch (_) {}
+      throw e;
+    }
   }
+  return 0n; // Fallback
 }
 
 function pickOutcome(prices) {
@@ -460,13 +500,19 @@ async function runForWallet(wallet, provider) {
 
       logInfo(wallet.address, '📡', `Fetched ${allMarketsData.length} market(s)`);
 
-      // Process each market
-      for (const data of allMarketsData) {
+      // Process each market with delay between them to avoid rate limits
+      for (let i = 0; i < allMarketsData.length; i++) {
+        const data = allMarketsData[i];
         if (!data || !data.market || !data.market.address || !data.isActive) {
           continue; // Skip inactive markets
         }
 
         await processMarket(wallet, provider, data);
+
+        // Add delay between markets to avoid rate limiting (except after last market)
+        if (i < allMarketsData.length - 1) {
+          await delay(500); // 500ms between markets
+        }
       }
     } catch (err) {
       logErr(wallet.address, '💥', 'Error in tick:', err && err.message ? err.message : err);
@@ -523,28 +569,37 @@ async function runForWallet(wallet, provider) {
       }
 
       if (!cachedContracts.has(marketAddress)) {
-        // Attach contracts directly to the wallet (signer) for ethers v6 compatibility
-        const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
-        const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
-        // Use market.conditionalTokens() to get ERC1155 address
-        const conditionalTokensAddress = await market.conditionalTokens();
-        const erc1155 = new ethers.Contract(ethers.getAddress(conditionalTokensAddress), ERC1155_ABI, wallet);
-        const decimals = Number(await usdc.decimals());
-        // Sanity: verify contracts have code
-        const [marketHasCode, usdcHasCode] = await Promise.all([
-          isContract(provider, marketAddress),
-          isContract(provider, collateralTokenAddress)
-        ]);
-        if (!marketHasCode) {
-          logErr(wallet.address, '❌', `[${marketAddress.substring(0, 8)}...] Market address has no code on this chain`);
+        try {
+          // Attach contracts directly to the wallet (signer) for ethers v6 compatibility
+          const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
+          const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
+
+          // Use market.conditionalTokens() to get ERC1155 address with retry
+          const conditionalTokensAddress = await retryRpcCall(async () => await market.conditionalTokens());
+          const erc1155 = new ethers.Contract(ethers.getAddress(conditionalTokensAddress), ERC1155_ABI, wallet);
+
+          // Get decimals with retry
+          const decimals = Number(await retryRpcCall(async () => await usdc.decimals()));
+
+          // Sanity: verify contracts have code
+          const [marketHasCode, usdcHasCode] = await Promise.all([
+            isContract(provider, marketAddress),
+            isContract(provider, collateralTokenAddress)
+          ]);
+          if (!marketHasCode) {
+            logErr(wallet.address, '❌', `[${marketAddress.substring(0, 8)}...] Market address has no code on this chain`);
+            return;
+          }
+          if (!usdcHasCode) {
+            logErr(wallet.address, '❌', `[${marketAddress.substring(0, 8)}...] USDC address has no code on this chain`);
+            return;
+          }
+          cachedContracts.set(marketAddress, { market, usdc, erc1155, decimals });
+          logInfo(wallet.address, '🧩', `[${marketAddress.substring(0, 8)}...] Loaded contracts (decimals=${decimals})`);
+        } catch (e) {
+          logErr(wallet.address, '💥', `[${marketAddress.substring(0, 8)}...] Failed to load contracts: ${e?.message || e}`);
           return;
         }
-        if (!usdcHasCode) {
-          logErr(wallet.address, '❌', `[${marketAddress.substring(0, 8)}...] USDC address has no code on this chain`);
-          return;
-        }
-        cachedContracts.set(marketAddress, { market, usdc, erc1155, decimals });
-        logInfo(wallet.address, '🧩', `[${marketAddress.substring(0, 8)}...] Loaded contracts (decimals=${decimals})`);
       }
 
       const { market, usdc, erc1155, decimals } = cachedContracts.get(marketAddress);
@@ -703,8 +758,8 @@ async function runForWallet(wallet, provider) {
       const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
 
       // Check USDC balance sufficient for bet
-      logInfo(wallet.address, '🔍', `Checking USDC balance for wallet ${wallet.address}...`);
-      const usdcBal = await usdc.balanceOf(wallet.address);
+      logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Checking USDC balance...`);
+      const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
       const usdcBalHuman = ethers.formatUnits(usdcBal, decimals);
       const needHuman = ethers.formatUnits(investment, decimals);
       logInfo(wallet.address, '💰', `USDC balance=${usdcBalHuman}, need=${needHuman} for buy`);
@@ -737,8 +792,8 @@ async function runForWallet(wallet, provider) {
       }
 
       // Compute minOutcomeTokensToBuy via calcBuyAmount and slippage
-      logInfo(wallet.address, '🧮', `Calculating expected tokens for investment=${investment}...`);
-      const expectedTokens = await market.calcBuyAmount(investment, outcomeToBuy);
+      logInfo(wallet.address, '🧮', `[${marketAddress.substring(0, 8)}...] Calculating expected tokens for investment=${investment}...`);
+      const expectedTokens = await retryRpcCall(async () => await market.calcBuyAmount(investment, outcomeToBuy));
       const minOutcomeTokensToBuy = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
       logInfo(wallet.address, '🛒', `Trigger hit (mode=${STRATEGY_MODE}). Buying outcome=${outcomeToBuy} invest=${investment} expectedTokens=${expectedTokens} minTokens=${minOutcomeTokensToBuy} slippage=${SLIPPAGE_BPS}bps`);
 
