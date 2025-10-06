@@ -11,7 +11,7 @@ const ERC1155_ABI = require('./abis/ERC1155.json');
 // ========= Config =========
 const RPC_URL = process.env.RPC_URL;
 const CHAIN_ID = parseInt(process.env.CHAIN_ID || '8453', 10);
-const PRICE_ORACLE_ID = process.env.PRICE_ORACLE_ID;
+const PRICE_ORACLE_IDS = (process.env.PRICE_ORACLE_ID || '').split(',').map(s => s.trim()).filter(Boolean);
 const FREQUENCY = process.env.FREQUENCY || 'hourly';
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
 const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 5; // human units
@@ -32,8 +32,8 @@ if (!RPC_URL) {
   console.error('RPC_URL is required');
   process.exit(1);
 }
-if (!PRICE_ORACLE_ID) {
-  console.error('PRICE_ORACLE_ID is required');
+if (PRICE_ORACLE_IDS.length === 0) {
+  console.error('PRICE_ORACLE_ID is required (comma separated for multiple markets)');
   process.exit(1);
 }
 if (PRIVATE_KEYS.length === 0) {
@@ -66,7 +66,8 @@ async function txOverrides(provider, gasLimit) {
 }
 
 // In-memory state: per-user cost basis to compute PnL
-const userState = new Map(); // key: wallet.address, value: { holding: { marketAddress, outcomeIndex, tokenId: bigint, amount: bigint, cost: bigint } | null, completedMarkets: Set<string> }
+// Updated for multi-market: holdings is now an array of positions
+const userState = new Map(); // key: wallet.address, value: { holdings: [{ marketAddress, outcomeIndex, tokenId: bigint, amount: bigint, cost: bigint }], completedMarkets: Set<string> }
 
 // ========= Logging helpers with emojis =========
 function logInfo(addr, emoji, msg) {
@@ -81,14 +82,30 @@ function logErr(addr, emoji, msg, err) {
   else console.error(base);
 }
 
-function setHolding(addr, holding) {
-  const prev = userState.get(addr) || {};
-  userState.set(addr, { ...prev, holding });
+function addHolding(addr, holding) {
+  const prev = userState.get(addr) || { holdings: [], completedMarkets: new Set() };
+  const holdings = prev.holdings || [];
+  // Remove any existing holding for same market before adding new one
+  const filtered = holdings.filter(h => h.marketAddress.toLowerCase() !== holding.marketAddress.toLowerCase());
+  filtered.push(holding);
+  userState.set(addr, { ...prev, holdings: filtered });
   scheduleSave();
 }
-function getHolding(addr) {
+function removeHolding(addr, marketAddress) {
+  const prev = userState.get(addr) || { holdings: [], completedMarkets: new Set() };
+  const holdings = prev.holdings || [];
+  const filtered = holdings.filter(h => h.marketAddress.toLowerCase() !== marketAddress.toLowerCase());
+  userState.set(addr, { ...prev, holdings: filtered });
+  scheduleSave();
+}
+function getHolding(addr, marketAddress) {
   const st = userState.get(addr);
-  return st ? st.holding : null;
+  if (!st || !st.holdings) return null;
+  return st.holdings.find(h => h.marketAddress.toLowerCase() === marketAddress.toLowerCase()) || null;
+}
+function getAllHoldings(addr) {
+  const st = userState.get(addr);
+  return st && st.holdings ? st.holdings : [];
 }
 
 function getCompletedMarkets(addr) {
@@ -112,13 +129,13 @@ function serializeState() {
   const out = {};
   for (const [addr, val] of userState.entries()) {
     out[addr] = {
-      holding: val.holding ? {
-        marketAddress: val.holding.marketAddress,
-        outcomeIndex: val.holding.outcomeIndex,
-        tokenId: val.holding.tokenId != null ? String(val.holding.tokenId) : null,
-        amount: val.holding.amount != null ? String(val.holding.amount) : null,
-        cost: val.holding.cost != null ? String(val.holding.cost) : null,
-      } : null,
+      holdings: (val.holdings || []).map(h => ({
+        marketAddress: h.marketAddress,
+        outcomeIndex: h.outcomeIndex,
+        tokenId: h.tokenId != null ? String(h.tokenId) : null,
+        amount: h.amount != null ? String(h.amount) : null,
+        cost: h.cost != null ? String(h.cost) : null,
+      })),
       completedMarkets: Array.from(val.completedMarkets || new Set())
     };
   }
@@ -130,15 +147,28 @@ function deserializeState(obj) {
   if (!obj || typeof obj !== 'object') return map;
   for (const addr of Object.keys(obj)) {
     const entry = obj[addr] || {};
-    const holding = entry.holding ? {
-      marketAddress: entry.holding.marketAddress,
-      outcomeIndex: entry.holding.outcomeIndex,
-      tokenId: entry.holding.tokenId != null ? BigInt(entry.holding.tokenId) : null,
-      amount: entry.holding.amount != null ? BigInt(entry.holding.amount) : null,
-      cost: entry.holding.cost != null ? BigInt(entry.holding.cost) : null,
-    } : null;
-    const completedMarkets = new Set((entry.completedMarkets || []).map(s => String(s).toLowerCase()))
-    map.set(addr, { holding, completedMarkets });
+    // Support both old format (single holding) and new format (multiple holdings array)
+    let holdings = [];
+    if (entry.holdings && Array.isArray(entry.holdings)) {
+      holdings = entry.holdings.map(h => ({
+        marketAddress: h.marketAddress,
+        outcomeIndex: h.outcomeIndex,
+        tokenId: h.tokenId != null ? BigInt(h.tokenId) : null,
+        amount: h.amount != null ? BigInt(h.amount) : null,
+        cost: h.cost != null ? BigInt(h.cost) : null,
+      }));
+    } else if (entry.holding) {
+      // Backward compatibility: convert old single holding to array
+      holdings = [{
+        marketAddress: entry.holding.marketAddress,
+        outcomeIndex: entry.holding.outcomeIndex,
+        tokenId: entry.holding.tokenId != null ? BigInt(entry.holding.tokenId) : null,
+        amount: entry.holding.amount != null ? BigInt(entry.holding.amount) : null,
+        cost: entry.holding.cost != null ? BigInt(entry.holding.cost) : null,
+      }];
+    }
+    const completedMarkets = new Set((entry.completedMarkets || []).map(s => String(s).toLowerCase()));
+    map.set(addr, { holdings, completedMarkets });
   }
   return map;
 }
@@ -201,10 +231,20 @@ function fmtUnitsPrec(amount, decimals, precision = 4) {
   }
 }
 
-async function fetchMarket() {
-  const url = `https://api.limitless.exchange/markets/prophet?priceOracleId=${PRICE_ORACLE_ID}&frequency=${FREQUENCY}`;
-  const res = await axios.get(url, { timeout: 15000 });
-  return res.data;
+async function fetchMarkets() {
+  // Fetch all markets for all oracle IDs in parallel
+  const promises = PRICE_ORACLE_IDS.map(async (oracleId) => {
+    try {
+      const url = `https://api.limitless.exchange/markets/prophet?priceOracleId=${oracleId}&frequency=${FREQUENCY}`;
+      const res = await axios.get(url, { timeout: 15000 });
+      return res.data;
+    } catch (e) {
+      console.warn(`⚠️ Failed to fetch market for oracle ${oracleId}:`, e?.message || e);
+      return null;
+    }
+  });
+  const results = await Promise.all(promises);
+  return results.filter(Boolean); // Filter out failed fetches
 }
 
 async function readAllowance(usdc, owner, spender) {
@@ -405,54 +445,68 @@ async function estimateGasFor(contract, wallet, fnName, args) {
 
 async function runForWallet(wallet, provider) {
   logInfo(wallet.address, '🚀', 'Worker started');
-  let lastMarketAddr = null;
-  let cachedContracts = null;
+  let cachedContracts = new Map(); // marketAddress -> { market, usdc, erc1155, decimals }
   let lastApprovalHour = -1; // Track which hour we last pre-approved
 
   async function tick() {
     try {
-      logInfo(wallet.address, '🔄', `Polling market data (oracle=${PRICE_ORACLE_ID}, freq=${FREQUENCY})...`);
-      const data = await fetchMarket();
+      logInfo(wallet.address, '🔄', `Polling market data (oracles=[${PRICE_ORACLE_IDS.join(', ')}], freq=${FREQUENCY})...`);
+      const allMarketsData = await fetchMarkets();
 
-      // Log full API response for debugging
-      logInfo(wallet.address, '📡', `API response received: ${JSON.stringify(data).substring(0, 200)}...`);
-
-      if (!data || !data.market || !data.market.address || !data.isActive) {
-        logWarn(wallet.address, '⏸️', `Market inactive or missing data. isActive=${data?.isActive}, hasMarket=${!!data?.market}, hasAddress=${!!data?.market?.address}`);
+      if (!allMarketsData || allMarketsData.length === 0) {
+        logWarn(wallet.address, '⏸️', `No active markets found`);
         return;
       }
 
+      logInfo(wallet.address, '📡', `Fetched ${allMarketsData.length} market(s)`);
+
+      // Process each market
+      for (const data of allMarketsData) {
+        if (!data || !data.market || !data.market.address || !data.isActive) {
+          continue; // Skip inactive markets
+        }
+
+        await processMarket(wallet, provider, data);
+      }
+    } catch (err) {
+      logErr(wallet.address, '💥', 'Error in tick:', err && err.message ? err.message : err);
+      if (err.stack) {
+        console.error(`Stack trace for ${wallet.address}:`, err.stack);
+      }
+    }
+  }
+
+  async function processMarket(wallet, provider, data) {
+    try {
+
       const marketInfo = data.market;
+      const marketAddress = ethers.getAddress(marketInfo.address);
+
       // Log market title to console for visibility
       if (marketInfo && marketInfo.title) {
-        logInfo(wallet.address, '📰', `Market: ${marketInfo.title}`);
+        logInfo(wallet.address, '📰', `[${marketAddress.substring(0, 8)}...] Market: ${marketInfo.title}`);
       }
-      const marketAddress = ethers.getAddress(marketInfo.address);
-      logInfo(wallet.address, '📍', `Market address: ${marketAddress}`);
+
       const prices = marketInfo.prices || [];
       const positionIds = marketInfo.positionIds || [];
       const collateralTokenAddress = ethers.getAddress(marketInfo.collateralToken.address);
 
-      logInfo(wallet.address, '💹', `Market prices: [${prices.join(', ')}]`);
-      logInfo(wallet.address, '🎫', `Position IDs: [${positionIds.join(', ')}]`);
-      logInfo(wallet.address, '💵', `Collateral token: ${collateralTokenAddress}`);
+      logInfo(wallet.address, '💹', `[${marketAddress.substring(0, 8)}...] Prices: [${prices.join(', ')}]`);
+      logInfo(wallet.address, '🎫', `[${marketAddress.substring(0, 8)}...] Position IDs: [${positionIds.join(', ')}]`);
 
       // Pre-compute timing guardrails for buying
       const nowMs = Date.now();
       let tooNewForBet = false;
       let nearDeadlineForBet = false;
 
-      logInfo(wallet.address, '🕐', `Market timing: createdAt=${marketInfo.createdAt || 'unknown'}, deadline=${marketInfo.deadline || 'unknown'}, now=${new Date(nowMs).toISOString()}`);
-
       if (marketInfo.createdAt) {
         const createdMs = new Date(marketInfo.createdAt).getTime();
         if (!Number.isNaN(createdMs)) {
           const ageMs = nowMs - createdMs;
           const ageMin = Math.max(0, Math.floor(ageMs / 60000));
-          logInfo(wallet.address, '⏱️', `Market age: ${ageMin} minutes`);
           if (ageMs < 10 * 60 * 1000) {
             tooNewForBet = true;
-            logInfo(wallet.address, '⏳', `Market age ${ageMin}m < 10m — skip betting`);
+            logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Market age ${ageMin}m < 10m — skip betting`);
           }
         }
       }
@@ -461,15 +515,14 @@ async function runForWallet(wallet, provider) {
         if (!Number.isNaN(deadlineMs)) {
           const remainingMs = deadlineMs - nowMs;
           const remMin = Math.max(0, Math.floor(remainingMs / 60000));
-          logInfo(wallet.address, '⏱️', `Time until deadline: ${remMin} minutes`);
           if (remainingMs < 5 * 60 * 1000) {
             nearDeadlineForBet = true;
-            logInfo(wallet.address, '⏳', `Time to deadline ${remMin}m < 5m — skip betting`);
+            logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Time to deadline ${remMin}m < 5m — skip betting`);
           }
         }
       }
 
-      if (lastMarketAddr !== marketAddress || !cachedContracts) {
+      if (!cachedContracts.has(marketAddress)) {
         // Attach contracts directly to the wallet (signer) for ethers v6 compatibility
         const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
         const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
@@ -478,27 +531,23 @@ async function runForWallet(wallet, provider) {
         const erc1155 = new ethers.Contract(ethers.getAddress(conditionalTokensAddress), ERC1155_ABI, wallet);
         const decimals = Number(await usdc.decimals());
         // Sanity: verify contracts have code
-        logInfo(wallet.address, '🔍', `Verifying contract addresses have code on chain ${CHAIN_ID}...`);
         const [marketHasCode, usdcHasCode] = await Promise.all([
           isContract(provider, marketAddress),
           isContract(provider, collateralTokenAddress)
         ]);
         if (!marketHasCode) {
-          logErr(wallet.address, '❌', `Market address has no code on this chain: ${marketAddress}`);
+          logErr(wallet.address, '❌', `[${marketAddress.substring(0, 8)}...] Market address has no code on this chain`);
           return;
         }
-        logInfo(wallet.address, '✅', `Market contract verified at ${marketAddress}`);
         if (!usdcHasCode) {
-          logErr(wallet.address, '❌', `USDC address has no code on this chain: ${collateralTokenAddress}. Check RPC/network.`);
+          logErr(wallet.address, '❌', `[${marketAddress.substring(0, 8)}...] USDC address has no code on this chain`);
           return;
         }
-        logInfo(wallet.address, '✅', `USDC contract verified at ${collateralTokenAddress}`);
-        cachedContracts = { market, usdc, erc1155, decimals };
-        lastMarketAddr = marketAddress;
-        logInfo(wallet.address, '🧩', `Loaded contracts: market=${marketAddress}, usdc=${collateralTokenAddress}, erc1155=${conditionalTokensAddress}, usdcDecimals=${decimals}`);
+        cachedContracts.set(marketAddress, { market, usdc, erc1155, decimals });
+        logInfo(wallet.address, '🧩', `[${marketAddress.substring(0, 8)}...] Loaded contracts (decimals=${decimals})`);
       }
 
-      const { market, usdc, erc1155, decimals } = cachedContracts;
+      const { market, usdc, erc1155, decimals } = cachedContracts.get(marketAddress);
 
       // Pre-approve USDC during first 10 minutes of each hour to save time during buy
       const now = new Date();
@@ -506,29 +555,27 @@ async function runForWallet(wallet, provider) {
       const currentMinute = now.getMinutes();
 
       if (currentMinute < 10 && lastApprovalHour !== currentHour) {
-        logInfo(wallet.address, '⏰', `First 10 minutes of hour ${currentHour} - pre-approving USDC for faster trades`);
+        logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] First 10 minutes of hour ${currentHour} - pre-approving USDC`);
         const maxApproval = ethers.parseUnits('1000000', decimals); // Large approval amount
         try {
           const currentAllowance = await readAllowance(usdc, wallet.address, marketAddress);
           if (currentAllowance < ethers.parseUnits('100', decimals)) { // Only approve if allowance is low
-            logInfo(wallet.address, '🔓', `Pre-approving USDC (current allowance: ${ethers.formatUnits(currentAllowance, decimals)})`);
+            logInfo(wallet.address, '🔓', `[${marketAddress.substring(0, 8)}...] Pre-approving USDC (current: ${ethers.formatUnits(currentAllowance, decimals)})`);
             const approved = await ensureUsdcApproval(wallet, usdc, marketAddress, maxApproval);
             if (approved) {
-              lastApprovalHour = currentHour;
-              logInfo(wallet.address, '✅', `Pre-approval successful for hour ${currentHour}`);
+              logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Pre-approval successful`);
             }
           } else {
-            logInfo(wallet.address, '✓', `Allowance sufficient (${ethers.formatUnits(currentAllowance, decimals)}), skipping pre-approval`);
-            lastApprovalHour = currentHour;
+            logInfo(wallet.address, '✓', `[${marketAddress.substring(0, 8)}...] Allowance sufficient (${ethers.formatUnits(currentAllowance, decimals)})`);
           }
         } catch (e) {
-          logWarn(wallet.address, '⚠️', `Pre-approval failed: ${e?.message || e}`);
+          logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Pre-approval failed: ${e?.message || e}`);
         }
+        lastApprovalHour = currentHour; // Mark hour as done after processing all markets
       }
 
-      // Check if user already holds any position (either outcome token)
-      const localHolding = getHolding(wallet.address);
-      const localHoldingThisMarket = localHolding && localHolding.marketAddress === marketAddress ? localHolding : null;
+      // Check if user already holds any position for this market
+      const localHoldingThisMarket = getHolding(wallet.address, marketAddress);
       const pid0 = positionIds[0] ? BigInt(positionIds[0]) : null;
       const pid1 = positionIds[1] ? BigInt(positionIds[1]) : null;
 
@@ -539,7 +586,7 @@ async function runForWallet(wallet, provider) {
       if (pid1 !== null) {
         bal1 = await safeBalanceOf(erc1155, wallet.address, pid1);
       }
-      logInfo(wallet.address, '🎟️', `Positions: pid0=${pid0 ?? 'null'} bal0=${bal0} | pid1=${pid1 ?? 'null'} bal1=${bal1}`);
+      logInfo(wallet.address, '🎟️', `[${marketAddress.substring(0, 8)}...] Balances: pid0=${pid0 ?? 'null'} (${bal0}) | pid1=${pid1 ?? 'null'} (${bal1})`);
       const hasOnchain = (bal0 > 0n) || (bal1 > 0n);
       const hasAny = hasOnchain || !!localHoldingThisMarket;
       if (hasAny) {
@@ -555,8 +602,8 @@ async function runForWallet(wallet, provider) {
         if (!holding || holding.tokenId !== tokenId) {
           const assumedCost = ethers.parseUnits(BUY_AMOUNT_USDC.toString(), decimals);
           holding = { marketAddress, outcomeIndex, tokenId, amount: tokenBalance, cost: assumedCost };
-          setHolding(wallet.address, holding);
-          logInfo(wallet.address, '💾', `Initialized cost basis from env: ${BUY_AMOUNT_USDC} USDC (tokenId=${tokenId})`);
+          addHolding(wallet.address, holding);
+          logInfo(wallet.address, '💾', `[${marketAddress.substring(0, 8)}...] Initialized cost basis: ${BUY_AMOUNT_USDC} USDC`);
         }
 
         // Position value per provided formula:
@@ -581,7 +628,7 @@ async function runForWallet(wallet, provider) {
         const valueHuman = fmtUnitsPrec(positionValue, decimals, 4);
         const costHuman = fmtUnitsPrec(cost, decimals, 4);
         const pnlAbsHuman = fmtUnitsPrec(pnlAbs >= 0n ? pnlAbs : -pnlAbs, decimals, 4);
-        logInfo(wallet.address, '📈', `Holding tokenId=${tokenId} balance=${tokenBalance} positionValue=${valueHuman} USDC cost=${costHuman} USDC PnL≈${pnlPct.toFixed(2)}% ${signEmoji} ${pnlAbsHuman} USDC`);
+        logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] Position: value=${valueHuman} cost=${costHuman} PnL=${pnlPct.toFixed(2)}% ${signEmoji}${pnlAbsHuman} USDC`);
         if (pnlAbs > 0n && pnlPct >= TARGET_PROFIT_PCT) {
           logInfo(wallet.address, '🎯', `Profit target reached! PnL=${pnlPct.toFixed(2)}% >= ${TARGET_PROFIT_PCT}%. Initiating sell...`);
           const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
@@ -608,30 +655,30 @@ async function runForWallet(wallet, provider) {
           logInfo(wallet.address, '🧾', `Sell tx: ${tx.hash}`);
           logInfo(wallet.address, '⏳', `Waiting for ${CONFIRMATIONS} confirmation(s)...`);
           await tx.wait(CONFIRMATIONS);
-          logInfo(wallet.address, '✅', `Sell completed. Final PnL: ${signEmoji} ${pnlAbsHuman} USDC (${pnlPct.toFixed(2)}%)`);
-          setHolding(wallet.address, null);
+          logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Sell completed. Final PnL: ${signEmoji}${pnlAbsHuman} USDC (${pnlPct.toFixed(2)}%)`);
+          removeHolding(wallet.address, marketAddress);
           markMarketCompleted(wallet.address, marketAddress);
-          logInfo(wallet.address, '🧭', `Market ${marketAddress} marked as completed; will not buy again in this run.`);
+          logInfo(wallet.address, '🧭', `[${marketAddress.substring(0, 8)}...] Market completed, won't re-enter`);
           return;
         } else {
-          logInfo(wallet.address, '📊', `Not yet profitable enough to sell. PnL=${pnlPct.toFixed(2)}% < ${TARGET_PROFIT_PCT}% target`);
+          logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] Not profitable yet: PnL=${pnlPct.toFixed(2)}% < ${TARGET_PROFIT_PCT}%`);
         }
 
         // Already holding; do not buy more
-        logInfo(wallet.address, '🛑', 'Already holding a position. Skipping buy.');
+        logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Already holding a position. Skipping buy.`);
         return;
       }
 
       // Not holding any position -> maybe buy per strategy
       if (!Array.isArray(prices) || prices.length < 2) {
-        logWarn(wallet.address, '⚠️', 'Prices unavailable; skipping.');
+        logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Prices unavailable; skipping.`);
         return;
       }
 
       // Do not re-enter a market once completed (bought & sold) in this run
       const completed = getCompletedMarkets(wallet.address);
       if (completed.has(marketAddress.toLowerCase())) {
-        logInfo(wallet.address, '🧭', `Market ${marketAddress} previously completed; skipping buy.`);
+        logInfo(wallet.address, '🧭', `[${marketAddress.substring(0, 8)}...] Previously completed; skipping buy.`);
         return;
       }
 
@@ -648,7 +695,7 @@ async function runForWallet(wallet, provider) {
 
       const outcomeToBuy = pickOutcome(prices);
       if (outcomeToBuy === null) {
-        logInfo(wallet.address, '🔎', `No trigger (mode=${STRATEGY_MODE}, prices=${prices.join(', ')}).`);
+        logInfo(wallet.address, '🔎', `[${marketAddress.substring(0, 8)}...] No trigger (mode=${STRATEGY_MODE}, prices=${prices.join(', ')}).`);
         return;
       }
 
@@ -715,8 +762,8 @@ async function runForWallet(wallet, provider) {
 
       const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
       // After buy, record cost basis
-      logInfo(wallet.address, '💾', `Recording position: marketAddress=${marketAddress}, outcomeIndex=${outcomeToBuy}, tokenId=${tokenId}, cost=${investment}`);
-      setHolding(wallet.address, {
+      logInfo(wallet.address, '💾', `[${marketAddress.substring(0, 8)}...] Recording position: outcome=${outcomeToBuy}, tokenId=${tokenId}, cost=${investment}`);
+      addHolding(wallet.address, {
         marketAddress,
         outcomeIndex: outcomeToBuy,
         tokenId,
@@ -741,10 +788,10 @@ async function runForWallet(wallet, provider) {
           logWarn(wallet.address, '⚠️', `Position balance still 0 after 3 attempts (may update later)`);
         }
       } catch (e) {
-        logWarn(wallet.address, '⚠️', `Failed to read position balance after buy: ${(e && e.message) ? e.message : e}`);
+        logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Failed to read position balance after buy: ${(e && e.message) ? e.message : e}`);
       }
     } catch (err) {
-      logErr(wallet.address, '💥', 'Error in tick:', err && err.message ? err.message : err);
+      logErr(wallet.address, '💥', `Error processing market: ${err && err.message ? err.message : err}`);
       if (err.stack) {
         console.error(`Stack trace for ${wallet.address}:`, err.stack);
       }
@@ -761,7 +808,7 @@ async function main() {
   console.log(`📋 Configuration:`);
   console.log(`   RPC_URL: ${RPC_URL}`);
   console.log(`   CHAIN_ID: ${CHAIN_ID}`);
-  console.log(`   PRICE_ORACLE_ID: ${PRICE_ORACLE_ID}`);
+  console.log(`   PRICE_ORACLE_IDS: [${PRICE_ORACLE_IDS.join(', ')}] (${PRICE_ORACLE_IDS.length} market(s))`);
   console.log(`   FREQUENCY: ${FREQUENCY}`);
   console.log(`   POLL_INTERVAL_MS: ${POLL_INTERVAL_MS}`);
   console.log(`   BUY_AMOUNT_USDC: ${BUY_AMOUNT_USDC}`);
@@ -802,13 +849,13 @@ async function main() {
     const existing = persisted.get(w.address);
     if (existing) {
       userState.set(w.address, {
-        holding: existing.holding || null,
+        holdings: existing.holdings || [],
         completedMarkets: existing.completedMarkets || new Set()
       });
-      const holdingInfo = existing.holding ? `market=${existing.holding.marketAddress}, outcome=${existing.holding.outcomeIndex}, cost=${existing.holding.cost}` : 'none';
-      logInfo(w.address, '📂', `State restored: holding=${holdingInfo}, completedMarkets=${(existing.completedMarkets || new Set()).size}`);
+      const holdingsCount = (existing.holdings || []).length;
+      logInfo(w.address, '📂', `State restored: ${holdingsCount} holding(s), ${(existing.completedMarkets || new Set()).size} completed market(s)`);
     } else {
-      userState.set(w.address, { holding: null, completedMarkets: new Set() });
+      userState.set(w.address, { holdings: [], completedMarkets: new Set() });
       logInfo(w.address, '🆕', `Initialized new state for wallet`);
     }
   }
