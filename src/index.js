@@ -866,13 +866,14 @@ async function runForWallet(wallet, provider) {
         logWarn(wallet.address, '🛑', 'Position IDs missing/invalid — skip betting');
         return;
       }
-      if (tooNewForBet || nearDeadlineForBet) {
-        // Reasons already logged above
-        return;
-      }
 
       // NEW LOGIC: Check if we should use last 9 minutes strategy
       if (inLastNineMinutes) {
+        // In last 9 minutes - IGNORE the "too new" check, only check if deadline is too close
+        if (nearDeadlineForBet) {
+          logWarn(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Too close to deadline - skipping`);
+          return;
+        }
         // Only buy if one side is > 75%
         const maxPrice = Math.max(...prices);
         if (maxPrice <= 75) {
@@ -901,6 +902,12 @@ async function runForWallet(wallet, provider) {
 
         // Check allowance and execute buy (same as normal flow)
         await executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155);
+        return;
+      }
+
+      // Not in last 9 minutes - check age/deadline restrictions
+      if (tooNewForBet || nearDeadlineForBet) {
+        // Market too new or too close to deadline - skip
         return;
       }
 
