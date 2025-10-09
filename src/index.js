@@ -646,7 +646,8 @@ async function runForWallet(wallet, provider) {
       const nowMs = Date.now();
       let tooNewForBet = false;
       let nearDeadlineForBet = false;
-      let inLastNineMinutes = false;
+      let inLastThirteenMinutes = false;
+      let inLastTwoMinutes = false;
 
       if (marketInfo.createdAt) {
         const createdMs = new Date(marketInfo.createdAt).getTime();
@@ -665,10 +666,16 @@ async function runForWallet(wallet, provider) {
           const remainingMs = deadlineMs - nowMs;
           const remMin = Math.max(0, Math.floor(remainingMs / 60000));
 
-          // NEW LOGIC: Check if in last 9 minutes
-          if (remainingMs <= 9 * 60 * 1000 && remainingMs > 0) {
-            inLastNineMinutes = true;
-            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last 9 minutes (${remMin}m remaining) - can buy if >75%`);
+          // Check if in last 2 minutes
+          if (remainingMs <= 2 * 60 * 1000 && remainingMs > 0) {
+            inLastTwoMinutes = true;
+            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last 2 minutes (${remMin}m remaining) - emergency sell if down below 40%`);
+          }
+
+          // NEW LOGIC: Check if in last 13 minutes
+          if (remainingMs <= 13 * 60 * 1000 && remainingMs > 0) {
+            inLastThirteenMinutes = true;
+            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last 13 minutes (${remMin}m remaining) - can buy if 75-85%`);
           }
 
           if (remainingMs < 5 * 60 * 1000) {
@@ -795,9 +802,38 @@ async function runForWallet(wallet, provider) {
         const pnlAbsHuman = fmtUnitsPrec(pnlAbs >= 0n ? pnlAbs : -pnlAbs, decimals, 4);
         logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] Position: value=${valueHuman} cost=${costHuman} PnL=${pnlPct.toFixed(2)}% ${signEmoji}${pnlAbsHuman} USDC`);
 
-        // NEW LOGIC: Don't sell if in last 9 minutes strategy - hold until close
-        if (inLastNineMinutes) {
-          logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Holding position until market closes (last 9min strategy)`);
+        // NEW LOGIC: Emergency sell in last 2 minutes if position is down below 40%
+        if (inLastTwoMinutes && pnlPct < -40) {
+          logInfo(wallet.address, '🚨', `[${marketAddress.substring(0, 8)}...] Emergency sell! Last 2 minutes and position down ${pnlPct.toFixed(2)}% (below -40%)`);
+          const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
+          if (!approvedOk) {
+            logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping emergency sell this tick.');
+            return;
+          }
+          const maxOutcomeTokensToSell = tokenBalance;
+          const returnAmountForSell = positionValue > 0n ? positionValue - (positionValue / 100n) : 0n; // minus 1% safety
+          logInfo(wallet.address, '🧮', `Emergency sell: maxTokens=${maxOutcomeTokensToSell}, returnAmount=${returnAmountForSell}`);
+          const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
+          if (!gasEst) {
+            logWarn(wallet.address, '🛑', 'Gas estimate sell failed; skipping emergency sell this tick.');
+            return;
+          }
+          logInfo(wallet.address, '⛽', `Gas estimate sell: ${gasEst}`);
+          const padded = (gasEst * 120n) / 100n + 10000n;
+          const sellOv = await txOverrides(wallet.provider, padded);
+          logInfo(wallet.address, '💸', `Sending emergency sell transaction: returnAmount=${returnAmountForSell}, outcome=${outcomeIndex}, maxTokens=${maxOutcomeTokensToSell}`);
+          const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
+          logInfo(wallet.address, '🧾', `Emergency sell tx: ${tx.hash}`);
+          await tx.wait(CONFIRMATIONS);
+          logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Emergency sell completed. Final PnL: ${signEmoji}${pnlAbsHuman} USDC (${pnlPct.toFixed(2)}%)`);
+          removeHolding(wallet.address, marketAddress);
+          markMarketCompleted(wallet.address, marketAddress);
+          return;
+        }
+
+        // NEW LOGIC: Don't sell if in last 13 minutes strategy - hold until close (unless emergency sell above)
+        if (inLastThirteenMinutes) {
+          logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Holding position until market closes (last 13min strategy)`);
           return;
         }
 
@@ -867,36 +903,30 @@ async function runForWallet(wallet, provider) {
         return;
       }
 
-      // NEW LOGIC: Check if we should use last 9 minutes strategy
-      if (inLastNineMinutes) {
-        // In last 9 minutes - IGNORE the "too new" check, only check if deadline is too close
+      // NEW LOGIC: Check if we should use last 13 minutes strategy
+      if (inLastThirteenMinutes) {
+        // Check if in last 2 minutes - don't buy
+        if (inLastTwoMinutes) {
+          logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] In last 2 minutes - not buying`);
+          return;
+        }
+
+        // In last 13 minutes - IGNORE the "too new" check, only check if deadline is too close
         if (nearDeadlineForBet) {
           logWarn(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Too close to deadline - skipping`);
           return;
         }
 
-        // Check if in last 2 minutes - don't buy
-        if (marketInfo.deadline) {
-          const deadlineMs = new Date(marketInfo.deadline).getTime();
-          if (!Number.isNaN(deadlineMs)) {
-            const remainingMs = deadlineMs - nowMs;
-            if (remainingMs <= 2 * 60 * 1000) {
-              logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] In last 2 minutes - not buying`);
-              return;
-            }
-          }
-        }
-
         // Only buy if one side is in range 75-85%
         const maxPrice = Math.max(...prices);
         if (maxPrice < 75 || maxPrice > 85) {
-          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] In last 9min but no side in 75-85% range (prices: [${prices.join(', ')}]) - skipping`);
+          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] In last 13min but no side in 75-85% range (prices: [${prices.join(', ')}]) - skipping`);
           return;
         }
 
         // Buy the side that is in 75-85% range
         const outcomeToBuy = prices[0] >= 75 && prices[0] <= 85 ? 0 : 1;
-        logInfo(wallet.address, '🎯', `[${marketAddress.substring(0, 8)}...] Last 9min strategy: Buying outcome ${outcomeToBuy} at ${prices[outcomeToBuy]}%`);
+        logInfo(wallet.address, '🎯', `[${marketAddress.substring(0, 8)}...] Last 13min strategy: Buying outcome ${outcomeToBuy} at ${prices[outcomeToBuy]}%`);
 
         // Continue to buy logic below with this outcome
         const investmentHuman = BUY_AMOUNT_USDC;
@@ -918,14 +948,14 @@ async function runForWallet(wallet, provider) {
         return;
       }
 
-      // Not in last 9 minutes - check age/deadline restrictions
+      // Not in last 13 minutes - check age/deadline restrictions
       if (tooNewForBet || nearDeadlineForBet) {
         // Market too new or too close to deadline - skip
         return;
       }
 
-      // Regular buy logic is DISABLED - only using last 9 minutes strategy
-      logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Not in last 9 minutes - regular buying disabled. Waiting for last 9min window.`);
+      // Regular buy logic is DISABLED - only using last 13 minutes strategy
+      logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Not in last 13 minutes - regular buying disabled. Waiting for last 13min window.`);
       return;
     } catch (err) {
       logErr(wallet.address, '💥', `Error processing market: ${err && err.message ? err.message : err}`);
