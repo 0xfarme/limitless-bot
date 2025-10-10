@@ -809,33 +809,36 @@ async function runForWallet(wallet, provider) {
         const pnlAbsHuman = fmtUnitsPrec(pnlAbs >= 0n ? pnlAbs : -pnlAbs, decimals, 4);
         logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] Position: value=${valueHuman} cost=${costHuman} PnL=${pnlPct.toFixed(2)}% ${signEmoji}${pnlAbsHuman} USDC`);
 
-        // Stop loss in last 3 minutes: sell if down below 40%
-        if (inLastThreeMinutes && pnlPct < -40) {
-          logInfo(wallet.address, '🚨', `[${marketAddress.substring(0, 8)}...] Stop loss! Last 3 minutes and position down ${pnlPct.toFixed(2)}% (below -40%)`);
-          const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
-          if (!approvedOk) {
-            logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping stop loss sell this tick.');
+        // Stop loss in last 3 minutes: sell if our position's odds drop below 50%
+        if (inLastThreeMinutes) {
+          const ourPositionPrice = prices[outcomeIndex];
+          if (ourPositionPrice < 50) {
+            logInfo(wallet.address, '🚨', `[${marketAddress.substring(0, 8)}...] Stop loss! Last 3 minutes and our outcome ${outcomeIndex} odds at ${ourPositionPrice}% (below 50%)`);
+            const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
+            if (!approvedOk) {
+              logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping stop loss sell this tick.');
+              return;
+            }
+            const maxOutcomeTokensToSell = tokenBalance;
+            const returnAmountForSell = positionValue > 0n ? positionValue - (positionValue / 100n) : 0n; // minus 1% safety
+            logInfo(wallet.address, '🧮', `Stop loss sell: maxTokens=${maxOutcomeTokensToSell}, returnAmount=${returnAmountForSell}`);
+            const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
+            if (!gasEst) {
+              logWarn(wallet.address, '🛑', 'Gas estimate sell failed; skipping stop loss sell this tick.');
+              return;
+            }
+            logInfo(wallet.address, '⛽', `Gas estimate sell: ${gasEst}`);
+            const padded = (gasEst * 120n) / 100n + 10000n;
+            const sellOv = await txOverrides(wallet.provider, padded);
+            logInfo(wallet.address, '💸', `Sending stop loss sell transaction: returnAmount=${returnAmountForSell}, outcome=${outcomeIndex}, maxTokens=${maxOutcomeTokensToSell}`);
+            const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
+            logInfo(wallet.address, '🧾', `Stop loss sell tx: ${tx.hash}`);
+            await tx.wait(CONFIRMATIONS);
+            logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Stop loss sell completed. Position odds: ${ourPositionPrice}% (below 50%)`);
+            removeHolding(wallet.address, marketAddress);
+            markMarketCompleted(wallet.address, marketAddress);
             return;
           }
-          const maxOutcomeTokensToSell = tokenBalance;
-          const returnAmountForSell = positionValue > 0n ? positionValue - (positionValue / 100n) : 0n; // minus 1% safety
-          logInfo(wallet.address, '🧮', `Stop loss sell: maxTokens=${maxOutcomeTokensToSell}, returnAmount=${returnAmountForSell}`);
-          const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
-          if (!gasEst) {
-            logWarn(wallet.address, '🛑', 'Gas estimate sell failed; skipping stop loss sell this tick.');
-            return;
-          }
-          logInfo(wallet.address, '⛽', `Gas estimate sell: ${gasEst}`);
-          const padded = (gasEst * 120n) / 100n + 10000n;
-          const sellOv = await txOverrides(wallet.provider, padded);
-          logInfo(wallet.address, '💸', `Sending stop loss sell transaction: returnAmount=${returnAmountForSell}, outcome=${outcomeIndex}, maxTokens=${maxOutcomeTokensToSell}`);
-          const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
-          logInfo(wallet.address, '🧾', `Stop loss sell tx: ${tx.hash}`);
-          await tx.wait(CONFIRMATIONS);
-          logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Stop loss sell completed. Final PnL: ${signEmoji}${pnlAbsHuman} USDC (${pnlPct.toFixed(2)}%)`);
-          removeHolding(wallet.address, marketAddress);
-          markMarketCompleted(wallet.address, marketAddress);
-          return;
         }
 
         // Hold positions during last 13 minutes - don't take profits early
