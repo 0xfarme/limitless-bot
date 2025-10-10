@@ -648,6 +648,7 @@ async function runForWallet(wallet, provider) {
       let nearDeadlineForBet = false;
       let inLastThirteenMinutes = false;
       let inLastTwoMinutes = false;
+      let inLastThreeMinutes = false;
 
       if (marketInfo.createdAt) {
         const createdMs = new Date(marketInfo.createdAt).getTime();
@@ -666,16 +667,22 @@ async function runForWallet(wallet, provider) {
           const remainingMs = deadlineMs - nowMs;
           const remMin = Math.max(0, Math.floor(remainingMs / 60000));
 
-          // Check if in last 2 minutes
+          // Check if in last 2 minutes - no buys allowed
           if (remainingMs <= 2 * 60 * 1000 && remainingMs > 0) {
             inLastTwoMinutes = true;
-            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last 2 minutes (${remMin}m remaining) - emergency sell if down below 40%`);
+            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last 2 minutes (${remMin}m remaining) - no buys allowed`);
+          }
+
+          // Check if in last 3 minutes - stop loss active
+          if (remainingMs <= 3 * 60 * 1000 && remainingMs > 0) {
+            inLastThreeMinutes = true;
+            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last 3 minutes (${remMin}m remaining) - stop loss active if down below 40%`);
           }
 
           // NEW LOGIC: Check if in last 13 minutes
           if (remainingMs <= 13 * 60 * 1000 && remainingMs > 0) {
             inLastThirteenMinutes = true;
-            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last 13 minutes (${remMin}m remaining) - can buy if 75-85%`);
+            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last 13 minutes (${remMin}m remaining) - can buy if 75-95%`);
           }
 
           if (remainingMs < 5 * 60 * 1000) {
@@ -802,9 +809,9 @@ async function runForWallet(wallet, provider) {
         const pnlAbsHuman = fmtUnitsPrec(pnlAbs >= 0n ? pnlAbs : -pnlAbs, decimals, 4);
         logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] Position: value=${valueHuman} cost=${costHuman} PnL=${pnlPct.toFixed(2)}% ${signEmoji}${pnlAbsHuman} USDC`);
 
-        // Stop loss in last 2 minutes: sell if down below 40%
-        if (inLastTwoMinutes && pnlPct < -40) {
-          logInfo(wallet.address, '🚨', `[${marketAddress.substring(0, 8)}...] Stop loss! Last 2 minutes and position down ${pnlPct.toFixed(2)}% (below -40%)`);
+        // Stop loss in last 3 minutes: sell if down below 40%
+        if (inLastThreeMinutes && pnlPct < -40) {
+          logInfo(wallet.address, '🚨', `[${marketAddress.substring(0, 8)}...] Stop loss! Last 3 minutes and position down ${pnlPct.toFixed(2)}% (below -40%)`);
           const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
           if (!approvedOk) {
             logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping stop loss sell this tick.');
