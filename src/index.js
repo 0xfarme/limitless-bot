@@ -917,15 +917,15 @@ async function runForWallet(wallet, provider) {
           return;
         }
 
-        // Only buy if one side is in range 75-85%
+        // Only buy if one side is in range 75-95%
         const maxPrice = Math.max(...prices);
-        if (maxPrice < 75 || maxPrice > 85) {
-          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] In last 13min but no side in 75-85% range (prices: [${prices.join(', ')}]) - skipping`);
+        if (maxPrice < 75 || maxPrice > 95) {
+          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] In last 13min but no side in 75-95% range (prices: [${prices.join(', ')}]) - skipping`);
           return;
         }
 
-        // Buy the side that is in 75-85% range
-        const outcomeToBuy = prices[0] >= 75 && prices[0] <= 85 ? 0 : 1;
+        // Buy the side that is in 75-95% range
+        const outcomeToBuy = prices[0] >= 75 && prices[0] <= 95 ? 0 : 1;
         logInfo(wallet.address, '🎯', `[${marketAddress.substring(0, 8)}...] Last 13min strategy: Buying outcome ${outcomeToBuy} at ${prices[outcomeToBuy]}%`);
 
         // Continue to buy logic below with this outcome
