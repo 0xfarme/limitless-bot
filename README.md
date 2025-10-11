@@ -4,7 +4,7 @@
 >
 > ### 👉 [https://limitless.exchange/?r=7EWN40FT4N](https://limitless.exchange/?r=7EWN40FT4N) 👈
 
-Automated trading bot for Limitless prediction markets on Base. Trade hourly crypto price predictions or experiment with custom strategies on daily/weekly markets.
+Automated trading bot for Limitless prediction markets on Base. Trades hourly crypto price predictions with configurable strategy parameters and comprehensive PNL tracking.
 
 ---
 
@@ -12,25 +12,24 @@ Automated trading bot for Limitless prediction markets on Base. Trade hourly cry
 
 - [Features](#-features)
 - [Quick Start](#-quick-start)
+- [How It Works](#-how-it-works)
 - [Configuration](#-configuration)
-- [Bot Modes](#-bot-modes)
-- [Strategy Examples](#-strategy-examples)
-- [Advanced Usage](#-advanced-usage)
+- [Trade Logging & Analytics](#-trade-logging--analytics)
+- [Strategy Guide](#-strategy-guide)
 - [Troubleshooting](#-troubleshooting)
-- [Contributing](#-contributing)
 
 ---
 
 ## ✨ Features
 
-- 🎯 **Fixed profit targets** - No stop losses, only take profits
-- 📊 **Multiple strategies** - Dominant side, opposite side, or custom
-- 💰 **Multi-wallet support** - Run multiple accounts simultaneously
-- 💾 **Persistent state** - Survives restarts without losing positions
-- 📈 **Analytics & logging** - Track performance with detailed metrics
-- ⚡ **Pre-approval system** - Faster trades with USDC pre-approval
-- 🔄 **Automatic retries** - Handles temporary RPC/network issues
-- 🎨 **Beautiful logs** - Easy-to-read emoji-based status updates
+- 🎯 **Smart timing** - Only trades in the last few minutes before market closes
+- 📊 **Odds-based strategy** - Configurable odds range for entry
+- 💰 **Stop loss protection** - Automatic sell if odds drop below threshold
+- 💾 **Comprehensive logging** - Every trade logged with full details
+- 📈 **Real-time analytics** - Track win rate, profit/loss, and performance
+- ⚡ **Multi-wallet support** - Run multiple accounts simultaneously
+- 🔄 **Robust error handling** - Automatic retries for RPC/network issues
+- 🎨 **Beautiful logs** - Timestamped, emoji-based status updates
 
 ---
 
@@ -68,9 +67,12 @@ Edit `.env` and add:
 RPC_URL=https://mainnet.base.org
 PRIVATE_KEYS=your_private_key_here
 
-# Hourly bot (recommended to start)
-PRICE_ORACLE_IDS=58,59  # ETH and SOL hourly predictions
+# Market Selection
+PRICE_ORACLE_ID=58,59  # ETH and SOL hourly predictions
 FREQUENCY=hourly
+
+# Trading Amount
+BUY_AMOUNT_USDC=5
 ```
 
 ### Run the Bot
@@ -81,135 +83,189 @@ npm start
 
 ---
 
+## 🎯 How It Works
+
+### Trading Strategy
+
+The bot uses a **last-minute timing strategy** to maximize win probability:
+
+1. **Wait for buy window** - Only buys in the last 13 minutes (configurable)
+2. **Check odds** - Only buys if odds are 75-95% (configurable)
+3. **Stop loss protection** - Sells in last 3 minutes if odds drop below 50%
+4. **Hold to close** - Otherwise holds position until market closes
+
+### Timeline Example
+
+```
+Market opens at 12:00 PM, closes at 1:00 PM
+
+12:00 - 12:47 PM: ⏸️  Waiting (not in buy window)
+12:47 - 12:58 PM: ✅  Buy window active (if odds 75-95%)
+12:58 - 1:00 PM:  🚫  No new buys (too close to deadline)
+12:57 - 1:00 PM:  🛡️  Stop loss active (sell if odds < 50%)
+```
+
+### Safety Features
+
+- **Minimum market age**: Won't buy markets less than 10 minutes old
+- **No last-minute buys**: Blocks purchases in final 2 minutes
+- **One position per market**: Prevents duplicate trades
+- **Completed market tracking**: Never re-enters a market after exiting
+
+---
+
 ## ⚙️ Configuration
 
-### Essential Settings
+### Required Settings
 
-| Variable | Description | Default | Example |
-|----------|-------------|---------|---------|
-| `RPC_URL` | Base RPC endpoint | Required | `https://mainnet.base.org` |
-| `PRIVATE_KEYS` | Wallet private keys (comma-separated) | Required | `0xabc...,0xdef...` |
-| `PRICE_ORACLE_IDS` | Oracle IDs to trade (comma-separated) | Required | `58,59,60` |
-| `FREQUENCY` | Market frequency | `hourly` | `hourly`, `daily`, `weekly` |
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `RPC_URL` | Base RPC endpoint | `https://mainnet.base.org` |
+| `PRIVATE_KEYS` | Wallet private keys (comma-separated) | `0xabc...,0xdef...` |
+| `PRICE_ORACLE_ID` | Oracle IDs to trade (comma-separated) | `58,59,60` |
 
 ### Trading Parameters
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `BUY_AMOUNT_USDC` | Position size in USDC | `2` |
-| `TARGET_PROFIT_PCT` | Take profit percentage | `12` |
-| `SLIPPAGE_BPS` | Slippage tolerance (basis points) | `150` (1.5%) |
-| `POLL_INTERVAL_MS` | Check interval (milliseconds) | `10000` (10s) |
+| `BUY_AMOUNT_USDC` | Position size in USDC | `5` |
+| `TARGET_PROFIT_PCT` | Take profit percentage | `20` |
+| `SLIPPAGE_BPS` | Slippage tolerance (basis points) | `100` (1%) |
+| `POLL_INTERVAL_MS` | Check interval in milliseconds | `10000` (10s) |
 
-### Strategy Settings
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `STRATEGY_MODE` | `dominant` or `opposite` | `dominant` |
-| `TRIGGER_PCT` | Entry trigger percentage | `55` |
-| `TRIGGER_BAND` | Band around trigger for opposite mode | `5` |
-
-### Risk Management
+### Strategy Timing Settings
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MIN_TIME_TO_ENTER_MINUTES` | Don't enter if < X min remaining | `20` |
-| `MIN_TIME_TO_EXIT_MINUTES` | Exit profitable positions if < X min | `5` |
-| `TIME_DECAY_THRESHOLD_MINUTES` | Reduce position size if < X min | `15` |
+| `BUY_WINDOW_MINUTES` | Last N minutes to allow buys | `13` |
+| `NO_BUY_FINAL_MINUTES` | Don't buy in last N minutes | `2` |
+| `STOP_LOSS_MINUTES` | Stop loss active in last N minutes | `3` |
+| `MIN_MARKET_AGE_MINUTES` | Don't buy markets younger than N min | `10` |
 
-### Pre-Approval (Faster Trading)
+### Odds Configuration
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PRE_APPROVE_USDC` | Enable pre-approval | `true` |
-| `PRE_APPROVAL_AMOUNT_USDC` | Amount to pre-approve | `100` |
-| `PRE_APPROVAL_INTERVAL_MS` | Re-approval interval | `3600000` (1h) |
+| `MIN_ODDS` | Minimum odds to buy (%) | `75` |
+| `MAX_ODDS` | Maximum odds to buy (%) | `95` |
+| `STOP_LOSS_ODDS_THRESHOLD` | Sell if odds drop below (%) | `50` |
+
+### File Paths (Optional)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `STATE_FILE` | Position state file | `data/state.json` |
+| `TRADES_LOG_FILE` | Trade log file | `data/trades.jsonl` |
+| `STATS_FILE` | Statistics file | `data/stats.json` |
 
 ---
 
-## 🎮 Bot Modes
+## 📊 Trade Logging & Analytics
 
-### Hourly Bot (Default)
+### Trade Logs
 
-Perfect for beginners - trades hourly crypto price predictions.
+Every trade is logged to `data/trades.jsonl` with complete details:
 
-```bash
-# .env
-FREQUENCY=hourly
-PRICE_ORACLE_IDS=58,59  # ETH, SOL
-BUY_AMOUNT_USDC=2
-TARGET_PROFIT_PCT=12
+```json
+{
+  "timestamp": "2025-01-15T12:47:23.456Z",
+  "type": "BUY",
+  "wallet": "0x742d35Cc...",
+  "marketAddress": "0x1234...",
+  "marketTitle": "Will ETH be above $3,500 at 1:00 PM?",
+  "outcome": 0,
+  "investmentUSDC": "5.0",
+  "txHash": "0xabc...",
+  "blockNumber": 12345678,
+  "gasUsed": "123456"
+}
 ```
 
-**Strategy:**
-- Enters when one side reaches 55%+ probability
-- Exits at 12% profit OR 10 minutes before deadline (if profitable)
-- No stop losses - holds losing positions until deadline
+### Statistics Dashboard
 
-### Long-Term Bot
+Real-time stats saved to `data/stats.json` and displayed after each trade:
 
-For daily/weekly markets - requires more capital and patience.
-
-```bash
-# .env for long-term
-FREQUENCY=daily  # or weekly
-BUY_AMOUNT_USDC=10
-TARGET_PROFIT_PCT=15
+```
+📊 ========= BOT STATISTICS =========
+📈 Total Trades: 15
+✅ Profitable: 11 | ❌ Losing: 4
+💰 Total Profit: $47.2340 USDC
+💸 Total Loss: $18.1200 USDC
+📊 Net P&L: $29.1140 USDC
+🎯 Win Rate: 73.33%
+⏱️  Uptime: 8.5 hours
+=====================================
 ```
 
-**Strategy:**
-- Exits at 15% profit
-- Final phase exit: Last 2h (daily) or 12h (weekly) if profitable
-- No stop losses
+### Console Logs
+
+All logs include timestamps for easy tracking:
+
+```
+2025-01-15T12:47:23.456Z 🔄 [0x742d35Cc...] Polling market data...
+2025-01-15T12:47:24.123Z 📰 [0x742d35Cc...] Market: Will ETH be above $3,500?
+2025-01-15T12:47:24.234Z 💹 [0x742d35Cc...] Prices: [82, 18]
+2025-01-15T12:47:24.345Z 🎯 [0x742d35Cc...] Last 13min strategy: Buying outcome 0 at 82%
+2025-01-15T12:47:30.567Z ✅ [0x742d35Cc...] Buy completed in block 12345678
+```
 
 ---
 
-## 💡 Strategy Examples
+## 💡 Strategy Guide
 
 ### Conservative (Recommended for Beginners)
 
 ```bash
-STRATEGY_MODE=dominant
-TRIGGER_PCT=60
-BUY_AMOUNT_USDC=2
-TARGET_PROFIT_PCT=12
-```
-
-**Logic:** Only buy when probability is 60%+, take 12% profit
-
-### Aggressive High-Confidence
-
-```bash
-STRATEGY_MODE=dominant
-TRIGGER_PCT=70
-BUY_AMOUNT_USDC=5
-TARGET_PROFIT_PCT=20
-```
-
-**Logic:** Wait for 70%+ probability, target 20% gains
-
-### Contrarian
-
-```bash
-STRATEGY_MODE=opposite
-TRIGGER_PCT=60
-TRIGGER_BAND=5
-BUY_AMOUNT_USDC=3
+# Wait for high confidence, quick profit target
+BUY_WINDOW_MINUTES=10
+MIN_ODDS=80
+MAX_ODDS=95
 TARGET_PROFIT_PCT=15
+BUY_AMOUNT_USDC=2
 ```
 
-**Logic:** Buy opposite side when price is 55-65% (mean reversion)
+**Expected:** High win rate (~75%+), smaller profits
+
+### Balanced (Default)
+
+```bash
+# Standard settings with good risk/reward
+BUY_WINDOW_MINUTES=13
+MIN_ODDS=75
+MAX_ODDS=95
+STOP_LOSS_ODDS_THRESHOLD=50
+TARGET_PROFIT_PCT=20
+BUY_AMOUNT_USDC=5
+```
+
+**Expected:** Moderate win rate (~65-70%), moderate profits
+
+### Aggressive
+
+```bash
+# Wider odds range, higher targets
+BUY_WINDOW_MINUTES=15
+MIN_ODDS=70
+MAX_ODDS=98
+STOP_LOSS_ODDS_THRESHOLD=40
+TARGET_PROFIT_PCT=30
+BUY_AMOUNT_USDC=10
+```
+
+**Expected:** Lower win rate (~55-60%), higher profits when winning
 
 ### Last-Minute Sniper
 
 ```bash
-TRIGGER_PCT=80
-MIN_TIME_TO_ENTER_MINUTES=10
-BUY_AMOUNT_USDC=2
-TARGET_PROFIT_PCT=5
+# Only trade in final minutes with extreme confidence
+BUY_WINDOW_MINUTES=5
+NO_BUY_FINAL_MINUTES=1
+MIN_ODDS=85
+MAX_ODDS=98
+TARGET_PROFIT_PCT=10
 ```
 
-**Logic:** Only enter in last 10 min if probability is 80%+, quick 5% profit
+**Expected:** Very high win rate (~80%+), quick trades
 
 ---
 
@@ -223,47 +279,37 @@ Run multiple accounts simultaneously:
 PRIVATE_KEYS=0xkey1,0xkey2,0xkey3
 ```
 
-Each wallet trades independently with its own state.
+Each wallet:
+- Trades independently
+- Has its own state tracking
+- Logs trades separately
 
 ### Custom Oracle Selection
 
-Find oracle IDs at `https://limitless.exchange/markets`:
+Find oracle IDs at [limitless.exchange/markets](https://limitless.exchange/markets):
 
 ```bash
-# Trade specific hourly predictions
-PRICE_ORACLE_IDS=58,59,60,61,62
-# 58 = ETH hourly
-# 59 = SOL hourly
-# 60 = BTC hourly
-# etc.
+# Hourly crypto predictions
+PRICE_ORACLE_ID=58,59,60  # ETH, SOL, BTC
+
+# Or trade specific markets
+PRICE_ORACLE_ID=58  # ETH only
 ```
 
-### Performance Analytics
-
-Check your stats:
+### Viewing Analytics
 
 ```bash
-# View summary
-cat data/summary.json
+# Real-time statistics
+cat data/stats.json
 
-# Detailed analytics
-cat data/analytics.json
+# All trades (one JSON per line)
+cat data/trades.jsonl
 
-# Trade history CSV
-cat data/trades.csv
-```
-
-### State Management
-
-```bash
-# View current positions
+# Current positions
 cat data/state.json
 
-# View failed exits (markets with issues)
-cat data/failed_exits.json
-
-# Clear state (fresh start)
-rm -rf data/
+# Filter profitable trades only
+grep "SELL_PROFIT" data/trades.jsonl | jq .
 ```
 
 ---
@@ -272,114 +318,53 @@ rm -rf data/
 
 ### Common Issues
 
-**"calcSellAmount failed"**
-- Market likely expired - bot will auto-mark as completed after 5 retries
-- Check `data/failed_exits.json` for details
+**"Buy already in progress for this market"**
+- Normal - prevents duplicate trades
+- Will retry next tick if conditions still met
+
+**"Not in last N minutes - waiting for buy window"**
+- Normal - bot only trades in configured window
+- Adjust `BUY_WINDOW_MINUTES` if needed
+
+**"No side in odds range"**
+- Normal - waiting for odds to be in configured range
+- Adjust `MIN_ODDS`/`MAX_ODDS` to trade more frequently
 
 **"Insufficient USDC"**
 - Add more USDC to your wallet
 - Reduce `BUY_AMOUNT_USDC`
 
-**"Only X.Xm left < 20m - too risky to enter"**
-- Normal - bot won't enter new positions near deadline
-- Will still manage existing positions
-
 **"Gas estimate failed"**
-- Increase `GAS_PRICE_GWEI` (default: 0.005)
 - Check your ETH balance for gas
+- Increase `GAS_PRICE_GWEI` (default: 0.005)
 
-**Transactions too slow**
-- Increase `GAS_PRICE_GWEI` to 0.01 or higher
-- Enable pre-approval: `PRE_APPROVE_USDC=true`
+### Debug Tips
 
-### Debug Mode
-
-```bash
-# Add to .env for verbose logging
-DEBUG=*
-```
+1. **Check logs** - All timestamps help you trace execution
+2. **Review trades.jsonl** - See exactly what happened
+3. **Monitor stats.json** - Track performance over time
+4. **Start small** - Test with `BUY_AMOUNT_USDC=1` first
 
 ---
 
-## 🎯 Gotchas & Tips
+## ⚠️ Important Notes
 
-### ⚠️ Important Warnings
+### Risk Warnings
 
-1. **No stop losses** - Bot NEVER sells at a loss automatically
-2. **Holds until deadline** - Losing positions are held hoping for recovery
-3. **Gas costs** - Factor in ~$0.001-0.01 per trade in gas fees
-4. **Liquidity** - Large positions may have slippage beyond `SLIPPAGE_BPS`
-5. **Market expiry** - Expired positions with losing outcomes = total loss
+1. **Stop loss is not guaranteed** - Depends on odds updating in time
+2. **Holding to close** - Most positions held until market closes
+3. **Gas costs** - Factor in ~$0.001-0.01 per trade
+4. **Liquidity** - Large positions may have slippage
+5. **Market expiry** - Losing positions = total loss
 
-### 💎 Pro Tips
+### Pro Tips
 
-1. **Start small** - Test with `BUY_AMOUNT_USDC=1` first
-2. **Use pre-approval** - Saves ~30% on transaction costs
-3. **Monitor analytics** - Check `data/analytics.json` regularly
-4. **Track by outcome** - See which outcomes (0 or 1) perform better
-5. **Price range analysis** - Analytics show which entry prices are most profitable
-6. **Multiple wallets** - Diversify across accounts to reduce risk
-7. **Experiment** - Try different strategies on different oracles
-
-### 📊 Reading the Logs
-
-```
-✅ [0x967e...d867] BUY completed at 62.3%
-📈 [0x967e...d867] Value: 2.18 | PnL: 9.2% | Time left: 42m
-🎯 [0x967e...d867] Target profit reached: TARGET_PROFIT (12.1%)
-✅ [0x967e...d867] SOLD at 12.1% (TARGET_PROFIT)
-```
-
-- 🎯 = Buy signal triggered
-- 📈 = Winning position
-- 📉 = Losing position
-- 🎯 = Target profit reached
-- ⏰ = Deadline approaching
-- 💥 = Error occurred
-
----
-
-## 🤝 Contributing
-
-### Share Your Strategies
-
-Found a profitable strategy? Share it! Create an issue with:
-
-1. Your config settings
-2. Oracle IDs used
-3. Performance stats (win rate, avg PnL)
-4. Any gotchas
-
-### Report Bugs
-
-Open an issue with:
-- Error message
-- Your config (remove private keys!)
-- Log snippet
-- Expected vs actual behavior
-
-### Example Strategy Template
-
-```markdown
-## Strategy Name
-
-**Config:**
-```bash
-STRATEGY_MODE=dominant
-TRIGGER_PCT=65
-BUY_AMOUNT_USDC=3
-TARGET_PROFIT_PCT=15
-```
-
-**Performance:**
-- Win rate: 72%
-- Avg PnL: +8.2%
-- Best for: ETH hourly (Oracle 58)
-
-**Notes:**
-- Works best during high volatility
-- Avoid during low volume hours
-```
+1. ✅ Start with small amounts
+2. ✅ Monitor `data/stats.json` regularly
+3. ✅ Test different odds ranges for your markets
+4. ✅ Use multiple wallets to diversify
+5. ✅ Check trade logs to understand bot decisions
+6. ✅ Adjust `BUY_WINDOW_MINUTES` based on market behavior
 
 ---
 
@@ -398,7 +383,7 @@ MIT License - See LICENSE file for details
 - Requires you to understand the risks
 - Is not financial advice
 
-Always start with small amounts and test thoroughly.
+Always test thoroughly with small amounts first.
 
 ---
 

@@ -29,6 +29,15 @@ const STATE_FILE = process.env.STATE_FILE || path.join('data', 'state.json');
 const TRADES_LOG_FILE = process.env.TRADES_LOG_FILE || path.join('data', 'trades.jsonl');
 const STATS_FILE = process.env.STATS_FILE || path.join('data', 'stats.json');
 
+// ========= Trading Strategy Config =========
+const BUY_WINDOW_MINUTES = parseInt(process.env.BUY_WINDOW_MINUTES || '13', 10); // Last N minutes to buy
+const NO_BUY_FINAL_MINUTES = parseInt(process.env.NO_BUY_FINAL_MINUTES || '2', 10); // Don't buy in last N minutes
+const STOP_LOSS_MINUTES = parseInt(process.env.STOP_LOSS_MINUTES || '3', 10); // Stop loss active in last N minutes
+const STOP_LOSS_ODDS_THRESHOLD = parseInt(process.env.STOP_LOSS_ODDS_THRESHOLD || '50', 10); // Sell if odds below N%
+const MIN_ODDS = parseInt(process.env.MIN_ODDS || '75', 10); // Minimum odds to buy
+const MAX_ODDS = parseInt(process.env.MAX_ODDS || '95', 10); // Maximum odds to buy
+const MIN_MARKET_AGE_MINUTES = parseInt(process.env.MIN_MARKET_AGE_MINUTES || '10', 10); // Don't buy markets younger than N minutes
+
 if (!RPC_URL) {
   console.error('RPC_URL is required');
   process.exit(1);
@@ -733,9 +742,9 @@ async function runForWallet(wallet, provider) {
         if (!Number.isNaN(createdMs)) {
           const ageMs = nowMs - createdMs;
           const ageMin = Math.max(0, Math.floor(ageMs / 60000));
-          if (ageMs < 10 * 60 * 1000) {
+          if (ageMs < MIN_MARKET_AGE_MINUTES * 60 * 1000) {
             tooNewForBet = true;
-            logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Market age ${ageMin}m < 10m — skip betting`);
+            logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Market age ${ageMin}m < ${MIN_MARKET_AGE_MINUTES}m — skip betting`);
           }
         }
       }
@@ -745,22 +754,22 @@ async function runForWallet(wallet, provider) {
           const remainingMs = deadlineMs - nowMs;
           const remMin = Math.max(0, Math.floor(remainingMs / 60000));
 
-          // Check if in last 2 minutes - no buys allowed
-          if (remainingMs <= 2 * 60 * 1000 && remainingMs > 0) {
+          // Check if in last N minutes - no buys allowed
+          if (remainingMs <= NO_BUY_FINAL_MINUTES * 60 * 1000 && remainingMs > 0) {
             inLastTwoMinutes = true;
-            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last 2 minutes (${remMin}m remaining) - no buys allowed`);
+            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last ${NO_BUY_FINAL_MINUTES} minutes (${remMin}m remaining) - no buys allowed`);
           }
 
-          // Check if in last 3 minutes - stop loss active
-          if (remainingMs <= 3 * 60 * 1000 && remainingMs > 0) {
+          // Check if in last N minutes - stop loss active
+          if (remainingMs <= STOP_LOSS_MINUTES * 60 * 1000 && remainingMs > 0) {
             inLastThreeMinutes = true;
-            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last 3 minutes (${remMin}m remaining) - stop loss active if down below 40%`);
+            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last ${STOP_LOSS_MINUTES} minutes (${remMin}m remaining) - stop loss active if below ${STOP_LOSS_ODDS_THRESHOLD}%`);
           }
 
-          // NEW LOGIC: Check if in last 13 minutes
-          if (remainingMs <= 13 * 60 * 1000 && remainingMs > 0) {
+          // Check if in buy window
+          if (remainingMs <= BUY_WINDOW_MINUTES * 60 * 1000 && remainingMs > 0) {
             inLastThirteenMinutes = true;
-            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last 13 minutes (${remMin}m remaining) - can buy if 75-95%`);
+            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last ${BUY_WINDOW_MINUTES} minutes (${remMin}m remaining) - can buy if ${MIN_ODDS}-${MAX_ODDS}%`);
           }
 
           if (remainingMs < 5 * 60 * 1000) {
@@ -887,11 +896,11 @@ async function runForWallet(wallet, provider) {
         const pnlAbsHuman = fmtUnitsPrec(pnlAbs >= 0n ? pnlAbs : -pnlAbs, decimals, 4);
         logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] Position: value=${valueHuman} cost=${costHuman} PnL=${pnlPct.toFixed(2)}% ${signEmoji}${pnlAbsHuman} USDC`);
 
-        // Stop loss in last 3 minutes: sell if our position's odds drop below 50%
+        // Stop loss: sell if our position's odds drop below threshold
         if (inLastThreeMinutes) {
           const ourPositionPrice = prices[outcomeIndex];
-          if (ourPositionPrice < 50) {
-            logInfo(wallet.address, '🚨', `[${marketAddress.substring(0, 8)}...] Stop loss! Last 3 minutes and our outcome ${outcomeIndex} odds at ${ourPositionPrice}% (below 50%)`);
+          if (ourPositionPrice < STOP_LOSS_ODDS_THRESHOLD) {
+            logInfo(wallet.address, '🚨', `[${marketAddress.substring(0, 8)}...] Stop loss! Last ${STOP_LOSS_MINUTES} minutes and our outcome ${outcomeIndex} odds at ${ourPositionPrice}% (below ${STOP_LOSS_ODDS_THRESHOLD}%)`);
             const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
             if (!approvedOk) {
               logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping stop loss sell this tick.');
@@ -928,7 +937,7 @@ async function runForWallet(wallet, provider) {
               returnUSDC: ethers.formatUnits(positionValue, decimals),
               pnlUSDC: pnlUSDC.toFixed(4),
               pnlPercent: pnlPct.toFixed(2),
-              reason: `Stop loss - odds ${ourPositionPrice}% < 50%`,
+              reason: `Stop loss - odds ${ourPositionPrice}% < ${STOP_LOSS_ODDS_THRESHOLD}%`,
               txHash: tx.hash,
               blockNumber: sellReceipt.blockNumber,
               gasUsed: sellReceipt.gasUsed.toString()
@@ -1053,16 +1062,16 @@ async function runForWallet(wallet, provider) {
           return;
         }
 
-        // Only buy if one side is in range 75-95%
+        // Only buy if one side is in configured odds range
         const maxPrice = Math.max(...prices);
-        if (maxPrice < 75 || maxPrice > 95) {
-          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] In last 13min but no side in 75-95% range (prices: [${prices.join(', ')}]) - skipping`);
+        if (maxPrice < MIN_ODDS || maxPrice > MAX_ODDS) {
+          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] In last ${BUY_WINDOW_MINUTES}min but no side in ${MIN_ODDS}-${MAX_ODDS}% range (prices: [${prices.join(', ')}]) - skipping`);
           return;
         }
 
-        // Buy the side that is in 75-95% range
-        const outcomeToBuy = prices[0] >= 75 && prices[0] <= 95 ? 0 : 1;
-        logInfo(wallet.address, '🎯', `[${marketAddress.substring(0, 8)}...] Last 13min strategy: Buying outcome ${outcomeToBuy} at ${prices[outcomeToBuy]}%`);
+        // Buy the side that is in odds range
+        const outcomeToBuy = prices[0] >= MIN_ODDS && prices[0] <= MAX_ODDS ? 0 : 1;
+        logInfo(wallet.address, '🎯', `[${marketAddress.substring(0, 8)}...] Last ${BUY_WINDOW_MINUTES}min strategy: Buying outcome ${outcomeToBuy} at ${prices[outcomeToBuy]}%`);
 
         // Continue to buy logic below with this outcome
         const investmentHuman = BUY_AMOUNT_USDC;
@@ -1090,8 +1099,8 @@ async function runForWallet(wallet, provider) {
         return;
       }
 
-      // Regular buy logic is DISABLED - only using last 13 minutes strategy
-      logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Not in last 13 minutes - regular buying disabled. Waiting for last 13min window.`);
+      // Regular buy logic is DISABLED - only using configured buy window strategy
+      logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Not in last ${BUY_WINDOW_MINUTES} minutes - regular buying disabled. Waiting for buy window.`);
       return;
     } catch (err) {
       logErr(wallet.address, '💥', `Error processing market: ${err && err.message ? err.message : err}`);
