@@ -26,6 +26,8 @@ const LOOKBACK_BLOCKS = parseInt(process.env.LOOKBACK_BLOCKS || '500000', 10);
 
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
 const STATE_FILE = process.env.STATE_FILE || path.join('data', 'state.json');
+const TRADES_LOG_FILE = process.env.TRADES_LOG_FILE || path.join('data', 'trades.jsonl');
+const STATS_FILE = process.env.STATS_FILE || path.join('data', 'stats.json');
 
 if (!RPC_URL) {
   console.error('RPC_URL is required');
@@ -68,17 +70,83 @@ async function txOverrides(provider, gasLimit) {
 // Updated for multi-market: holdings is now an array of positions
 const userState = new Map(); // key: wallet.address, value: { holdings: [{ marketAddress, outcomeIndex, tokenId: bigint, amount: bigint, cost: bigint }], completedMarkets: Set<string> }
 
+// Global statistics tracking
+const botStats = {
+  totalTrades: 0,
+  profitableTrades: 0,
+  losingTrades: 0,
+  totalProfitUSDC: 0,
+  totalLossUSDC: 0,
+  startTime: Date.now(),
+  lastUpdated: Date.now()
+};
+
 // ========= Logging helpers with emojis =========
 function logInfo(addr, emoji, msg) {
-  console.log(`${emoji} [${addr}] ${msg}`);
+  const timestamp = new Date().toISOString();
+  console.log(`${timestamp} ${emoji} [${addr}] ${msg}`);
 }
 function logWarn(addr, emoji, msg) {
-  console.warn(`${emoji} [${addr}] ${msg}`);
+  const timestamp = new Date().toISOString();
+  console.warn(`${timestamp} ${emoji} [${addr}] ${msg}`);
 }
 function logErr(addr, emoji, msg, err) {
-  const base = `${emoji} [${addr}] ${msg}`;
+  const timestamp = new Date().toISOString();
+  const base = `${timestamp} ${emoji} [${addr}] ${msg}`;
   if (err) console.error(base, err);
   else console.error(base);
+}
+
+// ========= Trade Logging =========
+function logTrade(tradeData) {
+  try {
+    ensureDirSync(path.dirname(TRADES_LOG_FILE));
+    const logEntry = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      ...tradeData
+    }) + '\n';
+    fs.appendFileSync(TRADES_LOG_FILE, logEntry);
+  } catch (e) {
+    console.error('⚠️ Failed to log trade:', e?.message || e);
+  }
+}
+
+function updateStats(pnlUSDC) {
+  botStats.totalTrades++;
+  botStats.lastUpdated = Date.now();
+
+  if (pnlUSDC > 0) {
+    botStats.profitableTrades++;
+    botStats.totalProfitUSDC += pnlUSDC;
+  } else if (pnlUSDC < 0) {
+    botStats.losingTrades++;
+    botStats.totalLossUSDC += Math.abs(pnlUSDC);
+  }
+
+  // Save stats to file
+  try {
+    ensureDirSync(path.dirname(STATS_FILE));
+    const statsData = {
+      ...botStats,
+      netProfitUSDC: botStats.totalProfitUSDC - botStats.totalLossUSDC,
+      winRate: botStats.totalTrades > 0 ? ((botStats.profitableTrades / botStats.totalTrades) * 100).toFixed(2) + '%' : '0%',
+      uptimeHours: ((Date.now() - botStats.startTime) / (1000 * 60 * 60)).toFixed(2)
+    };
+    fs.writeFileSync(STATS_FILE, JSON.stringify(statsData, null, 2));
+
+    // Log summary to console
+    console.log('\n📊 ========= BOT STATISTICS =========');
+    console.log(`📈 Total Trades: ${botStats.totalTrades}`);
+    console.log(`✅ Profitable: ${botStats.profitableTrades} | ❌ Losing: ${botStats.losingTrades}`);
+    console.log(`💰 Total Profit: $${botStats.totalProfitUSDC.toFixed(4)} USDC`);
+    console.log(`💸 Total Loss: $${botStats.totalLossUSDC.toFixed(4)} USDC`);
+    console.log(`📊 Net P&L: $${statsData.netProfitUSDC.toFixed(4)} USDC`);
+    console.log(`🎯 Win Rate: ${statsData.winRate}`);
+    console.log(`⏱️  Uptime: ${statsData.uptimeHours} hours`);
+    console.log('=====================================\n');
+  } catch (e) {
+    console.error('⚠️ Failed to save stats:', e?.message || e);
+  }
 }
 
 function addHolding(addr, holding) {
@@ -600,6 +668,19 @@ async function runForWallet(wallet, provider) {
       cost: investment
     });
 
+    // Log buy trade
+    logTrade({
+      type: 'BUY',
+      wallet: wallet.address,
+      marketAddress,
+      marketTitle: marketInfo?.title || 'Unknown',
+      outcome: outcomeToBuy,
+      investmentUSDC: ethers.formatUnits(investment, decimals),
+      txHash: buyTx.hash,
+      blockNumber: receipt.blockNumber,
+      gasUsed: receipt.gasUsed.toString()
+    });
+
     // Try to confirm on-chain ERC1155 balance
     try {
       let balNow = 0n;
@@ -830,8 +911,30 @@ async function runForWallet(wallet, provider) {
             logInfo(wallet.address, '💸', `Sending stop loss sell transaction: returnAmount=${returnAmountForSell}, outcome=${outcomeIndex}, maxTokens=${maxOutcomeTokensToSell}`);
             const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
             logInfo(wallet.address, '🧾', `Stop loss sell tx: ${tx.hash}`);
-            await tx.wait(CONFIRMATIONS);
+            const sellReceipt = await tx.wait(CONFIRMATIONS);
+
+            // Calculate PNL for stop loss
+            const pnlUSDC = parseFloat(ethers.formatUnits(positionValue - cost, decimals));
             logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Stop loss sell completed. Position odds: ${ourPositionPrice}% (below 50%)`);
+
+            // Log sell trade and update stats
+            logTrade({
+              type: 'SELL_STOP_LOSS',
+              wallet: wallet.address,
+              marketAddress,
+              marketTitle: marketInfo?.title || 'Unknown',
+              outcome: outcomeIndex,
+              costUSDC: ethers.formatUnits(cost, decimals),
+              returnUSDC: ethers.formatUnits(positionValue, decimals),
+              pnlUSDC: pnlUSDC.toFixed(4),
+              pnlPercent: pnlPct.toFixed(2),
+              reason: `Stop loss - odds ${ourPositionPrice}% < 50%`,
+              txHash: tx.hash,
+              blockNumber: sellReceipt.blockNumber,
+              gasUsed: sellReceipt.gasUsed.toString()
+            });
+            updateStats(pnlUSDC);
+
             removeHolding(wallet.address, marketAddress);
             markMarketCompleted(wallet.address, marketAddress);
             return;
@@ -869,8 +972,30 @@ async function runForWallet(wallet, provider) {
           const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
           logInfo(wallet.address, '🧾', `Sell tx: ${tx.hash}`);
           logInfo(wallet.address, '⏳', `Waiting for ${CONFIRMATIONS} confirmation(s)...`);
-          await tx.wait(CONFIRMATIONS);
+          const profitSellReceipt = await tx.wait(CONFIRMATIONS);
+
+          // Calculate PNL for profit taking
+          const pnlUSDC = parseFloat(ethers.formatUnits(pnlAbs, decimals));
           logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Sell completed. Final PnL: ${signEmoji}${pnlAbsHuman} USDC (${pnlPct.toFixed(2)}%)`);
+
+          // Log sell trade and update stats
+          logTrade({
+            type: 'SELL_PROFIT',
+            wallet: wallet.address,
+            marketAddress,
+            marketTitle: marketInfo?.title || 'Unknown',
+            outcome: outcomeIndex,
+            costUSDC: ethers.formatUnits(cost, decimals),
+            returnUSDC: ethers.formatUnits(positionValue, decimals),
+            pnlUSDC: pnlUSDC.toFixed(4),
+            pnlPercent: pnlPct.toFixed(2),
+            reason: `Profit target reached ${pnlPct.toFixed(2)}% >= ${TARGET_PROFIT_PCT}%`,
+            txHash: tx.hash,
+            blockNumber: profitSellReceipt.blockNumber,
+            gasUsed: profitSellReceipt.gasUsed.toString()
+          });
+          updateStats(pnlUSDC);
+
           removeHolding(wallet.address, marketAddress);
           markMarketCompleted(wallet.address, marketAddress);
           logInfo(wallet.address, '🧭', `[${marketAddress.substring(0, 8)}...] Market completed, won't re-enter`);
