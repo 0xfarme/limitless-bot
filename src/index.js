@@ -505,7 +505,7 @@ async function runForWallet(wallet, provider) {
   let buyingInProgress = new Set(); // Track markets currently being bought in this tick to prevent duplicates
 
   async function tick() {
-    buyingInProgress.clear(); // Clear at start of each tick
+    // DON'T clear buyingInProgress - keep it persistent to prevent any double buys
     try {
       logInfo(wallet.address, '🔄', `Polling market data (oracles=[${PRICE_ORACLE_IDS.join(', ')}], freq=${FREQUENCY})...`);
       const allMarketsData = await fetchMarkets();
@@ -570,15 +570,11 @@ async function runForWallet(wallet, provider) {
     const minOutcomeTokensToBuy = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
     logInfo(wallet.address, '🛒', `Buying outcome=${outcomeToBuy} invest=${investment} expectedTokens=${expectedTokens} minTokens=${minOutcomeTokensToBuy} slippage=${SLIPPAGE_BPS}bps`);
 
-    // Mark this market as being bought to prevent duplicates in this tick
-    buyingInProgress.add(marketAddress.toLowerCase());
-
     // Estimate gas then buy
     logInfo(wallet.address, '⚡', `Estimating gas for buy transaction...`);
     const gasEst = await estimateGasFor(market, wallet, 'buy', [investment, outcomeToBuy, minOutcomeTokensToBuy]);
     if (!gasEst) {
       logWarn(wallet.address, '🛑', 'Gas estimate buy failed; skipping buy this tick.');
-      buyingInProgress.delete(marketAddress.toLowerCase());
       return;
     }
     logInfo(wallet.address, '⛽', `Gas estimate buy: ${gasEst}`);
@@ -900,11 +896,15 @@ async function runForWallet(wallet, provider) {
         return;
       }
 
-      // Prevent duplicate buys in the same tick cycle
-      if (buyingInProgress.has(marketAddress.toLowerCase())) {
-        logInfo(wallet.address, '🔒', `[${marketAddress.substring(0, 8)}...] Buy already in progress for this market in current tick; skipping.`);
+      // Prevent duplicate buys - check if buy is in progress or if we ever bought this market
+      const marketKey = marketAddress.toLowerCase();
+      if (buyingInProgress.has(marketKey)) {
+        logInfo(wallet.address, '🔒', `[${marketAddress.substring(0, 8)}...] Buy already in progress for this market; skipping.`);
         return;
       }
+
+      // Mark as buying NOW to prevent race conditions
+      buyingInProgress.add(marketKey);
 
       // Additional guardrails for betting:
       const positionIdsValid = Array.isArray(positionIds) && positionIds.length >= 2 && positionIds[0] && positionIds[1];
