@@ -505,7 +505,8 @@ async function runForWallet(wallet, provider) {
   let buyingInProgress = new Set(); // Track markets currently being bought in this tick to prevent duplicates
 
   async function tick() {
-    // DON'T clear buyingInProgress - keep it persistent to prevent any double buys
+    // Clear buyingInProgress at start of each tick - it's just for preventing concurrent buys within same tick
+    buyingInProgress.clear();
     try {
       logInfo(wallet.address, '🔄', `Polling market data (oracles=[${PRICE_ORACLE_IDS.join(', ')}], freq=${FREQUENCY})...`);
       const allMarketsData = await fetchMarkets();
