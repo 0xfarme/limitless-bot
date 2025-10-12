@@ -416,14 +416,34 @@ By using this bot, you acknowledge and agree that:
 
 ---
 
+## 💝 Support the Project
+
+If this bot helped you or you found it useful, consider supporting the development:
+
+### Donate
+
+**ETH/USDC (Base Network):**
+```
+0x967ee892abEbD0953b1C50EFA25b9b17df96d867
+```
+
+### Other Ways to Support
+
+- ⭐ Star this repository
+- 🔗 Use referral code: [7EWN40FT4N](https://limitless.exchange/?r=7EWN40FT4N)
+- 🐛 Report bugs and suggest features
+- 📢 Share with others who might find it useful
+
+Your support helps maintain and improve this project. Thank you! 🙏
+
+---
+
 ## 🙏 Credits
 
 Built with:
 - [ethers.js](https://docs.ethers.org/) - Ethereum library
 - [axios](https://axios-http.com/) - HTTP client
 - [Limitless Exchange](https://limitless.exchange/) - Prediction market platform
-
-**Support development:** Use referral code [7EWN40FT4N](https://limitless.exchange/?r=7EWN40FT4N)
 
 ---
 
