@@ -1,5 +1,12 @@
 # 🤖 Limitless Trading Bot
 
+> ⚠️ **EDUCATIONAL USE ONLY - READ DISCLAIMER BELOW**
+>
+> This bot is for educational purposes only. Use at your own risk. The author is NOT responsible for any losses.
+> **Always use a dedicated test wallet with minimal funds.**
+
+---
+
 > **New to Limitless?** Please consider joining via this referral to support the development:
 >
 > ### 👉 [https://limitless.exchange/?r=7EWN40FT4N](https://limitless.exchange/?r=7EWN40FT4N) 👈
@@ -38,8 +45,19 @@ Automated trading bot for Limitless prediction markets on Base. Trades hourly cr
 ### Prerequisites
 
 - Node.js 18 or higher
+- **NEW wallet dedicated for this bot** (see security note below)
 - Base network wallet with ETH for gas
 - USDC on Base for trading
+
+> ⚠️ **IMPORTANT SECURITY RECOMMENDATION**
+>
+> **Create a new wallet specifically for this bot.** Do NOT use your main wallet or any wallet with significant funds.
+>
+> Steps:
+> 1. Create a fresh wallet (MetaMask, Rabby, etc.)
+> 2. Transfer only the funds you're willing to risk for testing
+> 3. Use that wallet's private key in the bot
+> 4. Never share your private key or commit it to git
 
 ### Installation
 
@@ -376,14 +394,25 @@ MIT License - See LICENSE file for details
 
 ## ⚠️ Disclaimer
 
-**Use at your own risk.** This bot:
-- Is experimental and may have bugs
-- Does not guarantee profits
-- Can lose money
-- Requires you to understand the risks
-- Is not financial advice
+**THIS SOFTWARE IS FOR EDUCATIONAL PURPOSES ONLY.**
 
-Always test thoroughly with small amounts first.
+By using this bot, you acknowledge and agree that:
+
+1. **No Guarantees**: This bot is experimental software with no guarantees of profitability or correct operation
+2. **Risk of Loss**: You may lose ALL funds used with this bot
+3. **Your Responsibility**: You are solely responsible for any losses, damages, or issues that arise from using this software
+4. **Not Financial Advice**: This is not financial, investment, or trading advice
+5. **Use at Your Own Risk**: The author(s) and contributors are NOT responsible for any financial losses or damages
+6. **Security Risks**: Storing private keys carries inherent security risks
+7. **No Liability**: Under no circumstances shall the author(s) be liable for any direct, indirect, incidental, special, or consequential damages
+
+**STRONGLY RECOMMENDED:**
+- Create a dedicated wallet with only test funds
+- Start with minimal amounts you can afford to lose completely
+- Thoroughly test and understand the bot before risking real money
+- Never use your main wallet or significant funds
+
+**YOU HAVE BEEN WARNED. USE AT YOUR OWN RISK.**
 
 ---
 
