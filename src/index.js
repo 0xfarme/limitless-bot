@@ -34,6 +34,7 @@ const BUY_WINDOW_MINUTES = parseInt(process.env.BUY_WINDOW_MINUTES || '13', 10);
 const NO_BUY_FINAL_MINUTES = parseInt(process.env.NO_BUY_FINAL_MINUTES || '2', 10); // Don't buy in last N minutes
 const STOP_LOSS_MINUTES = parseInt(process.env.STOP_LOSS_MINUTES || '3', 10); // Stop loss active in last N minutes
 const STOP_LOSS_ODDS_THRESHOLD = parseInt(process.env.STOP_LOSS_ODDS_THRESHOLD || '50', 10); // Sell if odds below N%
+const STOP_LOSS_PNL_THRESHOLD = parseInt(process.env.STOP_LOSS_PNL_THRESHOLD || '-40', 10); // Sell if PnL below N%
 const MIN_ODDS = parseInt(process.env.MIN_ODDS || '75', 10); // Minimum odds to buy
 const MAX_ODDS = parseInt(process.env.MAX_ODDS || '95', 10); // Maximum odds to buy
 const MIN_MARKET_AGE_MINUTES = parseInt(process.env.MIN_MARKET_AGE_MINUTES || '10', 10); // Don't buy markets younger than N minutes
@@ -896,11 +897,18 @@ async function runForWallet(wallet, provider) {
         const pnlAbsHuman = fmtUnitsPrec(pnlAbs >= 0n ? pnlAbs : -pnlAbs, decimals, 4);
         logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] Position: value=${valueHuman} cost=${costHuman} PnL=${pnlPct.toFixed(2)}% ${signEmoji}${pnlAbsHuman} USDC`);
 
-        // Stop loss: sell if our position's odds drop below threshold
+        // Stop loss: sell if our position's odds drop below threshold OR if PnL is down more than threshold
         if (inLastThreeMinutes) {
           const ourPositionPrice = prices[outcomeIndex];
-          if (ourPositionPrice < STOP_LOSS_ODDS_THRESHOLD) {
-            logInfo(wallet.address, '🚨', `[${marketAddress.substring(0, 8)}...] Stop loss! Last ${STOP_LOSS_MINUTES} minutes and our outcome ${outcomeIndex} odds at ${ourPositionPrice}% (below ${STOP_LOSS_ODDS_THRESHOLD}%)`);
+
+          const shouldStopLoss = ourPositionPrice < STOP_LOSS_ODDS_THRESHOLD || pnlPct < STOP_LOSS_PNL_THRESHOLD;
+
+          if (shouldStopLoss) {
+            const reason = ourPositionPrice < STOP_LOSS_ODDS_THRESHOLD
+              ? `odds ${ourPositionPrice}% < ${STOP_LOSS_ODDS_THRESHOLD}%`
+              : `PnL ${pnlPct.toFixed(2)}% < ${STOP_LOSS_PNL_THRESHOLD}%`;
+
+            logInfo(wallet.address, '🚨', `[${marketAddress.substring(0, 8)}...] Stop loss! Last ${STOP_LOSS_MINUTES} minutes - ${reason}`);
             const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
             if (!approvedOk) {
               logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping stop loss sell this tick.');
@@ -924,7 +932,7 @@ async function runForWallet(wallet, provider) {
 
             // Calculate PNL for stop loss
             const pnlUSDC = parseFloat(ethers.formatUnits(positionValue - cost, decimals));
-            logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Stop loss sell completed. Position odds: ${ourPositionPrice}% (below 50%)`);
+            logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Stop loss sell completed. Reason: ${reason}`);
 
             // Log sell trade and update stats
             logTrade({
@@ -937,7 +945,7 @@ async function runForWallet(wallet, provider) {
               returnUSDC: ethers.formatUnits(positionValue, decimals),
               pnlUSDC: pnlUSDC.toFixed(4),
               pnlPercent: pnlPct.toFixed(2),
-              reason: `Stop loss - odds ${ourPositionPrice}% < ${STOP_LOSS_ODDS_THRESHOLD}%`,
+              reason: `Stop loss - ${reason}`,
               txHash: tx.hash,
               blockNumber: sellReceipt.blockNumber,
               gasUsed: sellReceipt.gasUsed.toString()
