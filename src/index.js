@@ -38,6 +38,12 @@ const MIN_ODDS = parseInt(process.env.MIN_ODDS || '75', 10); // Minimum odds to 
 const MAX_ODDS = parseInt(process.env.MAX_ODDS || '95', 10); // Maximum odds to buy
 const MIN_MARKET_AGE_MINUTES = parseInt(process.env.MIN_MARKET_AGE_MINUTES || '10', 10); // Don't buy markets younger than N minutes
 
+// ========= Early Contrarian Strategy Config =========
+const EARLY_STRATEGY_ENABLED = (process.env.EARLY_STRATEGY_ENABLED || 'true').toLowerCase() === 'true'; // Enable early contrarian strategy
+const EARLY_WINDOW_MINUTES = parseInt(process.env.EARLY_WINDOW_MINUTES || '30', 10); // First N minutes for contrarian buys
+const EARLY_TRIGGER_ODDS = parseInt(process.env.EARLY_TRIGGER_ODDS || '70', 10); // Buy opposite side if one side reaches N%
+const EARLY_PROFIT_TARGET_PCT = parseInt(process.env.EARLY_PROFIT_TARGET_PCT || '20', 10); // Sell at N% profit
+
 if (!RPC_URL) {
   console.error('RPC_URL is required');
   process.exit(1);
@@ -700,7 +706,7 @@ async function runForWallet(wallet, provider) {
   }
 
   // Helper function to execute buy transaction
-  async function executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155) {
+  async function executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, strategy = 'default') {
     // Check if USDC allowance is sufficient
     logInfo(wallet.address, '🔐', `Checking USDC allowance for market ${marketAddress}...`);
     let currentAllowance;
@@ -750,13 +756,14 @@ async function runForWallet(wallet, provider) {
 
     const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
     // After buy, record cost basis
-    logInfo(wallet.address, '💾', `[${marketAddress.substring(0, 8)}...] Recording position: outcome=${outcomeToBuy}, tokenId=${tokenId}, cost=${investment}`);
+    logInfo(wallet.address, '💾', `[${marketAddress.substring(0, 8)}...] Recording position: outcome=${outcomeToBuy}, tokenId=${tokenId}, cost=${investment}, strategy=${strategy}`);
     addHolding(wallet.address, {
       marketAddress,
       outcomeIndex: outcomeToBuy,
       tokenId,
       amount: investment,
-      cost: investment
+      cost: investment,
+      strategy: strategy // 'default', 'early_contrarian', or other strategies
     });
 
     // Log buy trade
@@ -818,12 +825,20 @@ async function runForWallet(wallet, provider) {
       let inLastThirteenMinutes = false;
       let inLastTwoMinutes = false;
       let inLastThreeMinutes = false;
+      let inEarlyWindow = false;
 
       if (marketInfo.createdAt) {
         const createdMs = new Date(marketInfo.createdAt).getTime();
         if (!Number.isNaN(createdMs)) {
           const ageMs = nowMs - createdMs;
           const ageMin = Math.max(0, Math.floor(ageMs / 60000));
+
+          // Check if in early contrarian strategy window (first 30 minutes)
+          if (EARLY_STRATEGY_ENABLED && ageMs <= EARLY_WINDOW_MINUTES * 60 * 1000) {
+            inEarlyWindow = true;
+            logInfo(wallet.address, '🌅', `[${marketAddress.substring(0, 8)}...] In early window (${ageMin}m old, <= ${EARLY_WINDOW_MINUTES}m) - contrarian strategy active`);
+          }
+
           if (ageMs < MIN_MARKET_AGE_MINUTES * 60 * 1000) {
             tooNewForBet = true;
             logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Market age ${ageMin}m < ${MIN_MARKET_AGE_MINUTES}m — skip betting`);
@@ -1008,14 +1023,18 @@ async function runForWallet(wallet, provider) {
           }
         }
 
-        // Hold positions during last 13 minutes - don't take profits early
-        if (inLastThirteenMinutes) {
+        // Determine profit target based on strategy
+        const strategyType = localHoldingThisMarket.strategy || 'default';
+        const profitTarget = strategyType === 'early_contrarian' ? EARLY_PROFIT_TARGET_PCT : TARGET_PROFIT_PCT;
+
+        // Hold positions during last 13 minutes if using last-minute strategy - don't take profits early
+        if (inLastThirteenMinutes && strategyType === 'default') {
           logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Holding position until market closes (last 13min strategy)`);
           return;
         }
 
-        if (pnlAbs > 0n && pnlPct >= TARGET_PROFIT_PCT) {
-          logInfo(wallet.address, '🎯', `Profit target reached! PnL=${pnlPct.toFixed(2)}% >= ${TARGET_PROFIT_PCT}%. Initiating sell...`);
+        if (pnlAbs > 0n && pnlPct >= profitTarget) {
+          logInfo(wallet.address, '🎯', `Profit target reached! PnL=${pnlPct.toFixed(2)}% >= ${profitTarget}% (${strategyType} strategy). Initiating sell...`);
           const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
           if (!approvedOk) {
             logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping sell this tick.');
@@ -1068,7 +1087,7 @@ async function runForWallet(wallet, provider) {
           logInfo(wallet.address, '🧭', `[${marketAddress.substring(0, 8)}...] Market completed, won't re-enter`);
           return;
         } else {
-          logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] Not profitable yet: PnL=${pnlPct.toFixed(2)}% < ${TARGET_PROFIT_PCT}%`);
+          logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] Not profitable yet: PnL=${pnlPct.toFixed(2)}% < ${profitTarget}% (${strategyType} strategy)`);
         }
 
         // Already holding; do not buy more
@@ -1151,14 +1170,49 @@ async function runForWallet(wallet, provider) {
         return;
       }
 
+      // Early contrarian strategy: Buy opposite side if one side reaches 70%+ in first 30 minutes
+      if (inEarlyWindow && !tooNewForBet && !nearDeadlineForBet) {
+        // Check if either side has reached the trigger threshold
+        const maxPrice = Math.max(...prices);
+
+        if (maxPrice >= EARLY_TRIGGER_ODDS) {
+          // Buy the opposite side (contrarian bet)
+          const dominantSide = prices[0] >= EARLY_TRIGGER_ODDS ? 0 : 1;
+          const outcomeToBuy = dominantSide === 0 ? 1 : 0;
+
+          logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Early contrarian: Side ${dominantSide} at ${prices[dominantSide]}% (>= ${EARLY_TRIGGER_ODDS}%), buying opposite side ${outcomeToBuy} at ${prices[outcomeToBuy]}%`);
+
+          const investmentHuman = BUY_AMOUNT_USDC;
+          const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
+
+          // Check USDC balance
+          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Checking USDC balance...`);
+          const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+          const usdcBalHuman = ethers.formatUnits(usdcBal, decimals);
+          const needHuman = ethers.formatUnits(investment, decimals);
+          logInfo(wallet.address, '💰', `USDC balance=${usdcBalHuman}, need=${needHuman} for buy`);
+          if (usdcBal < investment) {
+            logWarn(wallet.address, '⚠️', `Insufficient USDC balance. Need ${needHuman}, have ${usdcBalHuman}.`);
+            return;
+          }
+
+          // Execute buy with early_contrarian strategy flag
+          await executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, 'early_contrarian');
+          return;
+        } else {
+          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] In early window but max odds ${maxPrice}% < ${EARLY_TRIGGER_ODDS}% trigger - waiting`);
+          return;
+        }
+      }
+
       // Not in last 13 minutes - check age/deadline restrictions
       if (tooNewForBet || nearDeadlineForBet) {
         // Market too new or too close to deadline - skip
         return;
       }
 
-      // Regular buy logic is DISABLED - only using configured buy window strategy
-      logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Not in last ${BUY_WINDOW_MINUTES} minutes - regular buying disabled. Waiting for buy window.`);
+      // Regular buy logic is DISABLED - only using configured strategies (early contrarian + late timing)
+      logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Not in any strategy window - waiting`);
       return;
     } catch (err) {
       logErr(wallet.address, '💥', `Error processing market: ${err && err.message ? err.message : err}`);
