@@ -578,29 +578,111 @@ async function estimateGasFor(contract, wallet, fnName, args) {
 async function runForWallet(wallet, provider) {
   logInfo(wallet.address, '🚀', 'Worker started');
   let cachedContracts = new Map(); // marketAddress -> { market, usdc, erc1155, decimals }
-  let lastApprovalHour = -1; // Track which hour we last pre-approved
+  let inactiveMarketsThisHour = new Set(); // Track inactive markets this hour to avoid re-checking
+  let currentHourForInactive = -1; // Track which hour for inactive markets
   let buyingInProgress = new Set(); // Track markets currently being bought in this tick to prevent duplicates
+  let approvedMarkets = new Set(); // Track markets we've already approved USDC for
+
+  // Pre-approve USDC for active markets (once per market)
+  async function preApproveMarketsIfNeeded(wallet, activeMarkets) {
+    for (const data of activeMarkets) {
+      const marketAddress = ethers.getAddress(data.market.address);
+
+      // Skip if already approved this session
+      if (approvedMarkets.has(marketAddress.toLowerCase())) {
+        continue;
+      }
+
+      try {
+        // Get or create contracts
+        if (!cachedContracts.has(marketAddress)) {
+          const collateralTokenAddress = ethers.getAddress(data.market.collateralToken.address);
+          const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
+          const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
+          const conditionalTokensAddress = await retryRpcCall(async () => await market.conditionalTokens());
+          const erc1155 = new ethers.Contract(ethers.getAddress(conditionalTokensAddress), ERC1155_ABI, wallet);
+          const decimals = Number(await retryRpcCall(async () => await usdc.decimals()));
+
+          cachedContracts.set(marketAddress, { market, usdc, erc1155, decimals });
+        }
+
+        const { usdc, decimals } = cachedContracts.get(marketAddress);
+        const maxApproval = ethers.parseUnits('1000000', decimals); // Large approval
+
+        logInfo(wallet.address, '🔐', `[${marketAddress.substring(0, 8)}...] Pre-approving USDC...`);
+        const currentAllowance = await readAllowance(usdc, wallet.address, marketAddress);
+
+        if (currentAllowance < ethers.parseUnits('100', decimals)) {
+          const approved = await ensureUsdcApproval(wallet, usdc, marketAddress, maxApproval);
+          if (approved) {
+            approvedMarkets.add(marketAddress.toLowerCase());
+            logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] USDC pre-approved`);
+          }
+        } else {
+          approvedMarkets.add(marketAddress.toLowerCase());
+          logInfo(wallet.address, '✓', `[${marketAddress.substring(0, 8)}...] USDC already approved`);
+        }
+      } catch (e) {
+        logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Pre-approval failed: ${e?.message || e}`);
+      }
+    }
+  }
 
   async function tick() {
     // Clear buyingInProgress at start of each tick - it's just for preventing concurrent buys within same tick
     buyingInProgress.clear();
+
+    // Clear inactive markets set every hour
+    const nowHour = new Date().getHours();
+    if (currentHourForInactive !== nowHour) {
+      inactiveMarketsThisHour.clear();
+      currentHourForInactive = nowHour;
+      logInfo(wallet.address, '🔄', `New hour started - cleared inactive markets cache`);
+    }
+
     try {
       logInfo(wallet.address, '🔄', `Polling market data (oracles=[${PRICE_ORACLE_IDS.join(', ')}], freq=${FREQUENCY})...`);
       const allMarketsData = await fetchMarkets();
 
       if (!allMarketsData || allMarketsData.length === 0) {
+        logWarn(wallet.address, '⏸️', `No markets returned from API`);
+        return;
+      }
+
+      // Filter out inactive markets and markets we've already seen as inactive this hour
+      const activeMarkets = [];
+      for (const data of allMarketsData) {
+        if (!data || !data.market || !data.market.address) continue;
+
+        const marketKey = data.market.address.toLowerCase();
+
+        // Skip if we already know it's inactive this hour
+        if (inactiveMarketsThisHour.has(marketKey)) {
+          continue;
+        }
+
+        if (!data.isActive) {
+          inactiveMarketsThisHour.add(marketKey);
+          logInfo(wallet.address, '⏸️', `[${marketKey.substring(0, 8)}...] Market inactive - skipping this hour`);
+          continue;
+        }
+
+        activeMarkets.push(data);
+      }
+
+      if (activeMarkets.length === 0) {
         logWarn(wallet.address, '⏸️', `No active markets found`);
         return;
       }
 
-      logInfo(wallet.address, '📡', `Fetched ${allMarketsData.length} market(s)`);
+      logInfo(wallet.address, '📡', `Found ${activeMarkets.length} active market(s) (skipped ${inactiveMarketsThisHour.size} inactive)`);
+
+      // Pre-approve USDC for all active markets upfront (once per session)
+      await preApproveMarketsIfNeeded(wallet, activeMarkets);
 
       // Process each market with delay between them to avoid rate limits
-      for (let i = 0; i < allMarketsData.length; i++) {
-        const data = allMarketsData[i];
-        if (!data || !data.market || !data.market.address || !data.isActive) {
-          continue; // Skip inactive markets
-        }
+      for (let i = 0; i < activeMarkets.length; i++) {
+        const data = activeMarkets[i];
 
         await processMarket(wallet, provider, data);
 
@@ -814,31 +896,6 @@ async function runForWallet(wallet, provider) {
       }
 
       const { market, usdc, erc1155, decimals } = cachedContracts.get(marketAddress);
-
-      // Pre-approve USDC during first 10 minutes of each hour to save time during buy
-      const now = new Date();
-      const currentHour = now.getHours();
-      const currentMinute = now.getMinutes();
-
-      if (currentMinute < 10 && lastApprovalHour !== currentHour) {
-        logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] First 10 minutes of hour ${currentHour} - pre-approving USDC`);
-        const maxApproval = ethers.parseUnits('1000000', decimals); // Large approval amount
-        try {
-          const currentAllowance = await readAllowance(usdc, wallet.address, marketAddress);
-          if (currentAllowance < ethers.parseUnits('100', decimals)) { // Only approve if allowance is low
-            logInfo(wallet.address, '🔓', `[${marketAddress.substring(0, 8)}...] Pre-approving USDC (current: ${ethers.formatUnits(currentAllowance, decimals)})`);
-            const approved = await ensureUsdcApproval(wallet, usdc, marketAddress, maxApproval);
-            if (approved) {
-              logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Pre-approval successful`);
-            }
-          } else {
-            logInfo(wallet.address, '✓', `[${marketAddress.substring(0, 8)}...] Allowance sufficient (${ethers.formatUnits(currentAllowance, decimals)})`);
-          }
-        } catch (e) {
-          logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Pre-approval failed: ${e?.message || e}`);
-        }
-        lastApprovalHour = currentHour; // Mark hour as done after processing all markets
-      }
 
       // Check if user already holds any position for this market
       const localHoldingThisMarket = getHolding(wallet.address, marketAddress);
