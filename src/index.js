@@ -756,6 +756,56 @@ async function runForWallet(wallet, provider) {
     }
   }
 
+  // Helper function to check if bot should be active based on current time
+  function shouldBeActive() {
+    const now = new Date();
+    const nowMinutes = now.getMinutes();
+
+    // Redemption window: minutes 6-10
+    const inRedemptionWindow = AUTO_REDEEM_ENABLED && nowMinutes >= REDEEM_WINDOW_START && nowMinutes <= REDEEM_WINDOW_END;
+
+    // Early contrarian window: first 30 minutes of each hour (if enabled)
+    const inEarlyWindow = EARLY_STRATEGY_ENABLED && nowMinutes <= EARLY_WINDOW_MINUTES;
+
+    // Last 13 minutes trading window: minutes 47-60
+    const inLateWindow = nowMinutes >= (60 - BUY_WINDOW_MINUTES);
+
+    return inRedemptionWindow || inEarlyWindow || inLateWindow;
+  }
+
+  // Calculate next wake time
+  function getNextWakeTime() {
+    const now = new Date();
+    const nowMinutes = now.getMinutes();
+    const nowSeconds = now.getSeconds();
+
+    let nextWakeMinute;
+
+    // Determine next active window
+    if (AUTO_REDEEM_ENABLED && nowMinutes < REDEEM_WINDOW_START) {
+      nextWakeMinute = REDEEM_WINDOW_START;
+    } else if (EARLY_STRATEGY_ENABLED && nowMinutes <= EARLY_WINDOW_MINUTES) {
+      return null; // Already in early window, stay active
+    } else if (nowMinutes < (60 - BUY_WINDOW_MINUTES)) {
+      nextWakeMinute = 60 - BUY_WINDOW_MINUTES;
+    } else {
+      // Next window is in the next hour
+      if (AUTO_REDEEM_ENABLED) {
+        nextWakeMinute = REDEEM_WINDOW_START + 60;
+      } else if (EARLY_STRATEGY_ENABLED) {
+        nextWakeMinute = 0 + 60;
+      } else {
+        nextWakeMinute = (60 - BUY_WINDOW_MINUTES) + 60;
+      }
+    }
+
+    // Calculate seconds until next wake time
+    const minutesUntilWake = nextWakeMinute - nowMinutes;
+    const secondsUntilWake = (minutesUntilWake * 60) - nowSeconds;
+
+    return secondsUntilWake * 1000; // Convert to milliseconds
+  }
+
   async function tick() {
     // Clear buyingInProgress at start of each tick - it's just for preventing concurrent buys within same tick
     buyingInProgress.clear();
@@ -766,6 +816,15 @@ async function runForWallet(wallet, provider) {
       inactiveMarketsThisHour.clear();
       currentHourForInactive = nowHour;
       logInfo(wallet.address, '🔄', `New hour started - cleared inactive markets cache`);
+    }
+
+    // Check if bot should be active right now
+    if (!shouldBeActive()) {
+      const nextWakeMs = getNextWakeTime();
+      const nextWakeMinutes = Math.floor(nextWakeMs / 60000);
+      const nextWakeSeconds = Math.floor((nextWakeMs % 60000) / 1000);
+      logInfo(wallet.address, '💤', `Bot in sleep mode - not in active trading/redemption window. Next wake in ${nextWakeMinutes}m ${nextWakeSeconds}s`);
+      return;
     }
 
     try {
@@ -1444,9 +1503,25 @@ async function main() {
   console.log(`   TRIGGER_PCT: ${TRIGGER_PCT}%`);
   console.log(`   TRIGGER_BAND: ${TRIGGER_BAND}%`);
   console.log(`   WALLETS: ${PRIVATE_KEYS.length}`);
-  console.log(`   AUTO_REDEEM_ENABLED: ${AUTO_REDEEM_ENABLED}`);
+  console.log(`\n⏰ Active Time Windows:`);
   if (AUTO_REDEEM_ENABLED) {
-    console.log(`   REDEEM_WINDOW: ${REDEEM_WINDOW_START}-${REDEEM_WINDOW_END} minutes of each hour`);
+    console.log(`   💰 Redemption: Minutes ${REDEEM_WINDOW_START}-${REDEEM_WINDOW_END} (claim resolved positions)`);
+  }
+  if (EARLY_STRATEGY_ENABLED) {
+    console.log(`   🌅 Early Trading: Minutes 0-${EARLY_WINDOW_MINUTES} (contrarian buys)`);
+  }
+  console.log(`   🎯 Late Trading: Minutes ${60 - BUY_WINDOW_MINUTES}-60 (last minute strategy)`);
+
+  // Calculate sleep periods
+  const sleepPeriods = [];
+  if (AUTO_REDEEM_ENABLED && REDEEM_WINDOW_END < (EARLY_STRATEGY_ENABLED ? EARLY_WINDOW_MINUTES : (60 - BUY_WINDOW_MINUTES))) {
+    sleepPeriods.push(`${REDEEM_WINDOW_END + 1}-${EARLY_STRATEGY_ENABLED ? EARLY_WINDOW_MINUTES : (60 - BUY_WINDOW_MINUTES - 1)}`);
+  }
+  if (EARLY_STRATEGY_ENABLED && EARLY_WINDOW_MINUTES < (60 - BUY_WINDOW_MINUTES - 1)) {
+    sleepPeriods.push(`${EARLY_WINDOW_MINUTES + 1}-${60 - BUY_WINDOW_MINUTES - 1}`);
+  }
+  if (sleepPeriods.length > 0) {
+    console.log(`   💤 Sleep Mode: Minutes ${sleepPeriods.join(', ')} (saves RPC calls)`);
   }
 
   const provider = new ethers.JsonRpcProvider(RPC_URL);
