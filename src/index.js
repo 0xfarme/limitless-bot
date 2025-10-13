@@ -7,6 +7,7 @@ const path = require('path');
 const MARKET_ABI = require('./abis/Market.json');
 const ERC20_ABI = require('./abis/ERC20.json');
 const ERC1155_ABI = require('./abis/ERC1155.json');
+const CONDITIONAL_TOKENS_ABI = require('./abis/ConditionalTokens.json');
 
 // ========= Config =========
 const RPC_URL = process.env.RPC_URL;
@@ -581,6 +582,104 @@ async function estimateGasFor(contract, wallet, fnName, args) {
   }
 }
 
+// ========= Redemption Logic =========
+async function checkAndRedeemPosition(wallet, marketData, holding, conditionalTokensContract, collateralTokenAddress) {
+  const marketAddress = holding.marketAddress;
+  const marketInfo = marketData.market;
+
+  try {
+    logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Checking if market is resolved for redemption...`);
+
+    // Check if market is resolved via API data
+    if (!marketData.resolved && marketData.isActive) {
+      logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Market not yet resolved, skipping redemption`);
+      return false;
+    }
+
+    if (!marketInfo.conditionIds || marketInfo.conditionIds.length === 0) {
+      logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] No conditionIds found, cannot redeem`);
+      return false;
+    }
+
+    const conditionId = marketInfo.conditionIds[0]; // Use first condition ID
+
+    // Check if condition is resolved by checking if payoutDenominator > 0
+    const payoutDenom = await retryRpcCall(async () => await conditionalTokensContract.payoutDenominator(conditionId));
+
+    if (!payoutDenom || payoutDenom === 0n) {
+      logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Market resolved in API but condition not yet resolved on-chain, waiting...`);
+      return false;
+    }
+
+    logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Market is resolved on-chain! PayoutDenom: ${payoutDenom}`);
+
+    // Get parent collection ID (usually 0x0 for simple markets)
+    const parentCollectionId = '0x0000000000000000000000000000000000000000000000000000000000000000';
+
+    // Index sets: [1, 2] represents both outcomes [outcome 0, outcome 1]
+    // We redeem both to get back winnings
+    const indexSets = [1, 2];
+
+    logInfo(wallet.address, '💰', `[${marketAddress.substring(0, 8)}...] Redeeming position...`);
+    logInfo(wallet.address, '🔧', `Parameters: collateral=${collateralTokenAddress}, conditionId=${conditionId}, indexSets=[${indexSets.join(', ')}]`);
+
+    // Estimate gas for redemption
+    const gasEst = await estimateGasFor(
+      conditionalTokensContract,
+      wallet,
+      'redeemPositions',
+      [collateralTokenAddress, parentCollectionId, conditionId, indexSets]
+    );
+
+    if (!gasEst) {
+      logWarn(wallet.address, '🛑', 'Gas estimate for redeemPositions failed; skipping redemption this tick.');
+      return false;
+    }
+
+    logInfo(wallet.address, '⛽', `Gas estimate redeemPositions: ${gasEst}`);
+    const padded = (gasEst * 120n) / 100n + 10000n;
+    const redeemOv = await txOverrides(wallet.provider, padded);
+
+    logInfo(wallet.address, '📤', `Sending redeemPositions transaction...`);
+    const redeemTx = await conditionalTokensContract.redeemPositions(
+      collateralTokenAddress,
+      parentCollectionId,
+      conditionId,
+      indexSets,
+      redeemOv
+    );
+
+    logInfo(wallet.address, '🧾', `Redemption tx: ${redeemTx.hash}`);
+    logInfo(wallet.address, '⏳', `Waiting for ${CONFIRMATIONS} confirmation(s)...`);
+    const receipt = await redeemTx.wait(CONFIRMATIONS);
+
+    logInfo(wallet.address, '🎉', `[${marketAddress.substring(0, 8)}...] Successfully redeemed position! Block: ${receipt.blockNumber}`);
+
+    // Log redemption trade
+    logTrade({
+      type: 'REDEEM',
+      wallet: wallet.address,
+      marketAddress,
+      marketTitle: marketInfo?.title || 'Unknown',
+      conditionId,
+      txHash: redeemTx.hash,
+      blockNumber: receipt.blockNumber,
+      gasUsed: receipt.gasUsed.toString()
+    });
+
+    // Remove holding after successful redemption
+    removeHolding(wallet.address, marketAddress);
+
+    return true;
+  } catch (err) {
+    logErr(wallet.address, '💥', `[${marketAddress.substring(0, 8)}...] Redemption failed: ${err?.message || err}`);
+    if (err.stack) {
+      console.error(`Stack trace for ${wallet.address}:`, err.stack);
+    }
+    return false;
+  }
+}
+
 async function runForWallet(wallet, provider) {
   logInfo(wallet.address, '🚀', 'Worker started');
   let cachedContracts = new Map(); // marketAddress -> { market, usdc, erc1155, decimals }
@@ -609,7 +708,7 @@ async function runForWallet(wallet, provider) {
           const erc1155 = new ethers.Contract(ethers.getAddress(conditionalTokensAddress), ERC1155_ABI, wallet);
           const decimals = Number(await retryRpcCall(async () => await usdc.decimals()));
 
-          cachedContracts.set(marketAddress, { market, usdc, erc1155, decimals });
+          cachedContracts.set(marketAddress, { market, usdc, erc1155, decimals, conditionalTokensAddress });
         }
 
         const { usdc, decimals } = cachedContracts.get(marketAddress);
@@ -649,6 +748,75 @@ async function runForWallet(wallet, provider) {
     try {
       logInfo(wallet.address, '🔄', `Polling market data (oracles=[${PRICE_ORACLE_IDS.join(', ')}], freq=${FREQUENCY})...`);
       const allMarketsData = await fetchMarkets();
+
+      // Redemption window: Only check for redemptions during minutes 06-10 of each hour
+      // This allows 6 minutes for market settlement after closing at :00
+      const nowMinutes = new Date().getMinutes();
+      const inRedemptionWindow = nowMinutes >= 6 && nowMinutes <= 10;
+
+      if (inRedemptionWindow) {
+        // First, check for positions that need redemption
+        const myHoldings = getAllHoldings(wallet.address);
+        if (myHoldings.length > 0) {
+          logInfo(wallet.address, '🕐', `Redemption window active (minutes 06-10) - checking ${myHoldings.length} position(s)...`);
+
+        for (const holding of myHoldings) {
+          try {
+            // Find the market data for this holding
+            const marketData = allMarketsData.find(m => m.market && m.market.address.toLowerCase() === holding.marketAddress.toLowerCase());
+
+            if (!marketData) {
+              logWarn(wallet.address, '⚠️', `[${holding.marketAddress.substring(0, 8)}...] Market not found in API response, skipping redemption check`);
+              continue;
+            }
+
+            // Get or create conditional tokens contract
+            const marketAddress = ethers.getAddress(holding.marketAddress);
+            if (!cachedContracts.has(marketAddress)) {
+              // Initialize contracts for this market if not cached
+              const collateralTokenAddress = ethers.getAddress(marketData.market.collateralToken.address);
+              const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
+              const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
+              const conditionalTokensAddress = await retryRpcCall(async () => await market.conditionalTokens());
+              const erc1155 = new ethers.Contract(ethers.getAddress(conditionalTokensAddress), ERC1155_ABI, wallet);
+              const decimals = Number(await retryRpcCall(async () => await usdc.decimals()));
+              cachedContracts.set(marketAddress, { market, usdc, erc1155, decimals, conditionalTokensAddress });
+            }
+
+            const { conditionalTokensAddress } = cachedContracts.get(marketAddress);
+            const conditionalTokensContract = new ethers.Contract(
+              conditionalTokensAddress,
+              CONDITIONAL_TOKENS_ABI,
+              wallet
+            );
+
+            const collateralTokenAddress = ethers.getAddress(marketData.market.collateralToken.address);
+
+            // Check and redeem if possible
+            const redeemed = await checkAndRedeemPosition(
+              wallet,
+              marketData,
+              holding,
+              conditionalTokensContract,
+              collateralTokenAddress
+            );
+
+            if (redeemed) {
+              logInfo(wallet.address, '✅', `[${holding.marketAddress.substring(0, 8)}...] Position redeemed successfully`);
+            }
+
+            // Add small delay between redemption checks to avoid rate limits
+            await delay(500);
+          } catch (err) {
+            logErr(wallet.address, '💥', `Error checking redemption for ${holding.marketAddress}:`, err?.message || err);
+          }
+        }
+        } else {
+          logInfo(wallet.address, '📭', `Redemption window active but no positions to check`);
+        }
+      } else {
+        logInfo(wallet.address, '⏸️', `Outside redemption window (current: ${nowMinutes} min, window: 06-10 min) - skipping redemption checks`);
+      }
 
       if (!allMarketsData || allMarketsData.length === 0) {
         logWarn(wallet.address, '⏸️', `No markets returned from API`);
@@ -902,7 +1070,7 @@ async function runForWallet(wallet, provider) {
             logErr(wallet.address, '❌', `[${marketAddress.substring(0, 8)}...] USDC address has no code on this chain`);
             return;
           }
-          cachedContracts.set(marketAddress, { market, usdc, erc1155, decimals });
+          cachedContracts.set(marketAddress, { market, usdc, erc1155, decimals, conditionalTokensAddress });
           logInfo(wallet.address, '🧩', `[${marketAddress.substring(0, 8)}...] Loaded contracts (decimals=${decimals})`);
         } catch (e) {
           logErr(wallet.address, '💥', `[${marketAddress.substring(0, 8)}...] Failed to load contracts: ${e?.message || e}`);
