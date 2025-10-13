@@ -45,6 +45,11 @@ const EARLY_WINDOW_MINUTES = parseInt(process.env.EARLY_WINDOW_MINUTES || '30', 
 const EARLY_TRIGGER_ODDS = parseInt(process.env.EARLY_TRIGGER_ODDS || '70', 10); // Buy opposite side if one side reaches N%
 const EARLY_PROFIT_TARGET_PCT = parseInt(process.env.EARLY_PROFIT_TARGET_PCT || '20', 10); // Sell at N% profit
 
+// ========= Redemption Config =========
+const AUTO_REDEEM_ENABLED = (process.env.AUTO_REDEEM_ENABLED || 'true').toLowerCase() === 'true'; // Enable automatic redemption
+const REDEEM_WINDOW_START = parseInt(process.env.REDEEM_WINDOW_START || '6', 10); // Redemption window start minute (0-59)
+const REDEEM_WINDOW_END = parseInt(process.env.REDEEM_WINDOW_END || '10', 10); // Redemption window end minute (0-59)
+
 if (!RPC_URL) {
   console.error('RPC_URL is required');
   process.exit(1);
@@ -755,16 +760,16 @@ async function runForWallet(wallet, provider) {
       logInfo(wallet.address, '🔄', `Polling market data (oracles=[${PRICE_ORACLE_IDS.join(', ')}], freq=${FREQUENCY})...`);
       const allMarketsData = await fetchMarkets();
 
-      // Redemption window: Only check for redemptions during minutes 06-10 of each hour
-      // This allows 6 minutes for market settlement after closing at :00
+      // Redemption window: Only check for redemptions during configured time window
+      // This allows time for market settlement after closing at :00
       const nowMinutes = new Date().getMinutes();
-      const inRedemptionWindow = nowMinutes >= 6 && nowMinutes <= 10;
+      const inRedemptionWindow = AUTO_REDEEM_ENABLED && nowMinutes >= REDEEM_WINDOW_START && nowMinutes <= REDEEM_WINDOW_END;
 
       if (inRedemptionWindow) {
         // First, check for positions that need redemption
         const myHoldings = getAllHoldings(wallet.address);
         if (myHoldings.length > 0) {
-          logInfo(wallet.address, '🕐', `Redemption window active (minutes 06-10) - checking ${myHoldings.length} position(s)...`);
+          logInfo(wallet.address, '🕐', `Redemption window active (minutes ${REDEEM_WINDOW_START}-${REDEEM_WINDOW_END}) - checking ${myHoldings.length} position(s)...`);
 
         for (const holding of myHoldings) {
           try {
@@ -820,8 +825,13 @@ async function runForWallet(wallet, provider) {
         } else {
           logInfo(wallet.address, '📭', `Redemption window active but no positions to check`);
         }
+      } else if (!AUTO_REDEEM_ENABLED) {
+        // Only log once per hour when redemption is disabled
+        if (nowMinutes === 0) {
+          logInfo(wallet.address, '🔕', `Auto-redemption is DISABLED (AUTO_REDEEM_ENABLED=false)`);
+        }
       } else {
-        logInfo(wallet.address, '⏸️', `Outside redemption window (current: ${nowMinutes} min, window: 06-10 min) - skipping redemption checks`);
+        logInfo(wallet.address, '⏸️', `Outside redemption window (current: ${nowMinutes} min, window: ${REDEEM_WINDOW_START}-${REDEEM_WINDOW_END} min) - skipping redemption checks`);
       }
 
       if (!allMarketsData || allMarketsData.length === 0) {
@@ -1416,6 +1426,10 @@ async function main() {
   console.log(`   TRIGGER_PCT: ${TRIGGER_PCT}%`);
   console.log(`   TRIGGER_BAND: ${TRIGGER_BAND}%`);
   console.log(`   WALLETS: ${PRIVATE_KEYS.length}`);
+  console.log(`   AUTO_REDEEM_ENABLED: ${AUTO_REDEEM_ENABLED}`);
+  if (AUTO_REDEEM_ENABLED) {
+    console.log(`   REDEEM_WINDOW: ${REDEEM_WINDOW_START}-${REDEEM_WINDOW_END} minutes of each hour`);
+  }
 
   const provider = new ethers.JsonRpcProvider(RPC_URL);
 
