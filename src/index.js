@@ -306,20 +306,32 @@ function delay(ms) {
 }
 
 // Retry helper for RPC calls with exponential backoff
-async function retryRpcCall(fn, maxRetries = 3, baseDelay = 1000) {
+async function retryRpcCall(fn, maxRetries = 5, baseDelay = 2000) {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       return await fn();
     } catch (e) {
       const isLastAttempt = attempt === maxRetries - 1;
-      const isRpcError = e?.code === 'CALL_EXCEPTION' || e?.message?.includes('missing revert data') || e?.message?.includes('rate limit');
+      const isRpcError = e?.code === 'CALL_EXCEPTION'
+        || e?.code === 'ECONNRESET'
+        || e?.code === 'ETIMEDOUT'
+        || e?.code === 'ENOTFOUND'
+        || e?.code === 'ECONNREFUSED'
+        || e?.message?.includes('missing revert data')
+        || e?.message?.includes('rate limit')
+        || e?.message?.includes('ECONNRESET')
+        || e?.message?.includes('connection');
 
-      if (isLastAttempt || !isRpcError) {
+      if (isLastAttempt) {
         throw e;
       }
 
+      if (!isRpcError) {
+        throw e; // Don't retry non-RPC errors
+      }
+
       const delayMs = baseDelay * Math.pow(2, attempt);
-      console.warn(`⚠️ RPC call failed (attempt ${attempt + 1}/${maxRetries}), retrying in ${delayMs}ms:`, e?.message || e);
+      console.warn(`⚠️ RPC call failed (attempt ${attempt + 1}/${maxRetries}), retrying in ${delayMs}ms:`, e?.code || e?.message || e);
       await delay(delayMs);
     }
   }
@@ -1062,18 +1074,23 @@ async function runForWallet(wallet, provider) {
 
       if (!cachedContracts.has(marketAddress)) {
         try {
+          logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Loading contracts...`);
+
           // Attach contracts directly to the wallet (signer) for ethers v6 compatibility
           const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
           const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
 
           // Use market.conditionalTokens() to get ERC1155 address with retry
+          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Fetching conditionalTokens address...`);
           const conditionalTokensAddress = await retryRpcCall(async () => await market.conditionalTokens());
           const erc1155 = new ethers.Contract(ethers.getAddress(conditionalTokensAddress), ERC1155_ABI, wallet);
 
           // Get decimals with retry
+          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Fetching decimals...`);
           const decimals = Number(await retryRpcCall(async () => await usdc.decimals()));
 
           // Sanity: verify contracts have code
+          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Verifying contract code...`);
           const [marketHasCode, usdcHasCode] = await Promise.all([
             isContract(provider, marketAddress),
             isContract(provider, collateralTokenAddress)
@@ -1087,9 +1104,10 @@ async function runForWallet(wallet, provider) {
             return;
           }
           cachedContracts.set(marketAddress, { market, usdc, erc1155, decimals, conditionalTokensAddress });
-          logInfo(wallet.address, '🧩', `[${marketAddress.substring(0, 8)}...] Loaded contracts (decimals=${decimals})`);
+          logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Contracts loaded successfully (decimals=${decimals})`);
         } catch (e) {
-          logErr(wallet.address, '💥', `[${marketAddress.substring(0, 8)}...] Failed to load contracts: ${e?.message || e}`);
+          logErr(wallet.address, '💥', `[${marketAddress.substring(0, 8)}...] Failed to load contracts (will retry next tick): ${e?.code || e?.message || e}`);
+          // Don't cache the error - allow retry on next tick
           return;
         }
       }
