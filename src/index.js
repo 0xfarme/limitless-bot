@@ -321,15 +321,15 @@ async function retryRpcCall(fn, maxRetries = 3, baseDelay = 1000) {
 }
 
 async function safeBalanceOf(erc1155, owner, tokenId) {
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
       return await erc1155.balanceOf(owner, tokenId);
     } catch (e) {
-      if (attempt === 2) {
-        console.warn(`⚠️ Failed to read balance after 3 attempts:`, e?.message || e);
+      if (attempt === 4) {
+        console.warn(`⚠️ Failed to read balance after 5 attempts:`, e?.message || e);
         return 0n;
       }
-      await delay(500 * (attempt + 1)); // Exponential backoff: 500ms, 1000ms, 1500ms
+      await delay(1000 * (attempt + 1)); // Exponential backoff: 1s, 2s, 3s, 4s
     }
   }
   return 0n;
@@ -591,17 +591,23 @@ async function checkAndRedeemPosition(wallet, marketData, holding, conditionalTo
     logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Checking if market is resolved for redemption...`);
 
     // Check if market is resolved via API data
-    if (!marketData.resolved && marketData.isActive) {
-      logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Market not yet resolved, skipping redemption`);
+    // Note: API returns status field and isActive flag
+    const isResolved = marketData.resolved === true || marketInfo.status === 'RESOLVED';
+
+    if (!isResolved) {
+      logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Market not yet resolved (status: ${marketInfo.status}, resolved: ${marketData.resolved}), skipping redemption`);
       return false;
     }
 
-    if (!marketInfo.conditionIds || marketInfo.conditionIds.length === 0) {
-      logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] No conditionIds found, cannot redeem`);
+    logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Market is resolved in API (status: ${marketInfo.status})`);
+
+    // Get conditionId from market data (API returns singular conditionId, not plural)
+    const conditionId = marketInfo.conditionId;
+
+    if (!conditionId) {
+      logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] No conditionId found, cannot redeem`);
       return false;
     }
-
-    const conditionId = marketInfo.conditionIds[0]; // Use first condition ID
 
     // Check if condition is resolved by checking if payoutDenominator > 0
     const payoutDenom = await retryRpcCall(async () => await conditionalTokensContract.payoutDenominator(conditionId));
