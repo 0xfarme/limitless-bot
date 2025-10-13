@@ -196,6 +196,33 @@ function getAllHoldings(addr) {
   return st && st.holdings ? st.holdings : [];
 }
 
+// ========= Position Summary Report =========
+function logPositionsSummary(addr) {
+  const holdings = getAllHoldings(addr);
+
+  if (holdings.length === 0) {
+    logInfo(addr, '📋', 'No active positions');
+    return;
+  }
+
+  console.log(`\n📋 ========= ACTIVE POSITIONS (${addr}) =========`);
+  holdings.forEach((holding, idx) => {
+    const shortAddr = holding.marketAddress.substring(0, 8);
+    const costUSDC = holding.cost ? ethers.formatUnits(holding.cost, 6) : 'Unknown';
+    const deadline = holding.marketDeadline ? new Date(holding.marketDeadline).toLocaleString() : 'Unknown';
+
+    console.log(`\n${idx + 1}. Market: ${shortAddr}...`);
+    console.log(`   Title: ${holding.marketTitle || 'Unknown'}`);
+    console.log(`   Outcome: ${holding.outcomeIndex} @ ${holding.entryPrice}%`);
+    console.log(`   Cost: $${costUSDC} USDC`);
+    console.log(`   Strategy: ${holding.strategy || 'default'}`);
+    console.log(`   Buy Time: ${holding.buyTimestamp || 'Unknown'}`);
+    console.log(`   Deadline: ${deadline}`);
+    console.log(`   Buy Tx: ${holding.buyTxHash || 'N/A'}`);
+  });
+  console.log('=============================================\n');
+}
+
 function getCompletedMarkets(addr) {
   const st = userState.get(addr);
   return st && st.completedMarkets ? st.completedMarkets : new Set();
@@ -600,7 +627,7 @@ async function estimateGasFor(contract, wallet, fnName, args) {
 }
 
 // ========= Redemption Logic =========
-async function checkAndRedeemPosition(wallet, marketData, holding, conditionalTokensContract, collateralTokenAddress) {
+async function checkAndRedeemPosition(wallet, marketData, holding, conditionalTokensContract, collateralTokenAddress, usdc, decimals) {
   const marketAddress = holding.marketAddress;
   const marketInfo = marketData.market;
 
@@ -635,6 +662,31 @@ async function checkAndRedeemPosition(wallet, marketData, holding, conditionalTo
     }
 
     logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Market is resolved on-chain! PayoutDenom: ${payoutDenom}`);
+
+    // Check which outcome won by reading payout numerators
+    const payout0 = await retryRpcCall(async () => await conditionalTokensContract.payoutNumerators(conditionId, 0));
+    const payout1 = await retryRpcCall(async () => await conditionalTokensContract.payoutNumerators(conditionId, 1));
+
+    logInfo(wallet.address, '🎲', `[${marketAddress.substring(0, 8)}...] Payouts: Outcome 0 = ${payout0}, Outcome 1 = ${payout1}`);
+
+    // Determine winning outcome (higher payout numerator wins)
+    let winningOutcome = -1;
+    if (payout0 > payout1) {
+      winningOutcome = 0;
+    } else if (payout1 > payout0) {
+      winningOutcome = 1;
+    }
+
+    // Check if we won
+    const ourOutcome = holding.outcomeIndex;
+    const didWeWin = winningOutcome === ourOutcome;
+    const winStatus = didWeWin ? '🎉 WON' : '😢 LOST';
+
+    logInfo(wallet.address, didWeWin ? '🎉' : '😢',
+      `[${marketAddress.substring(0, 8)}...] We held outcome ${ourOutcome}, winning outcome is ${winningOutcome} - ${winStatus}`);
+
+    // Check balance before redemption to estimate winnings
+    const balanceBefore = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
 
     // Get parent collection ID (usually 0x0 for simple markets)
     const parentCollectionId = '0x0000000000000000000000000000000000000000000000000000000000000000';
@@ -678,17 +730,43 @@ async function checkAndRedeemPosition(wallet, marketData, holding, conditionalTo
 
     logInfo(wallet.address, '🎉', `[${marketAddress.substring(0, 8)}...] Successfully redeemed position! Block: ${receipt.blockNumber}`);
 
-    // Log redemption trade
+    // Check balance after redemption to see actual amount received
+    const balanceAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+    const amountRedeemed = balanceAfter - balanceBefore;
+    const amountRedeemedUSDC = parseFloat(ethers.formatUnits(amountRedeemed, decimals));
+    const costUSDC = parseFloat(ethers.formatUnits(holding.cost || 0n, decimals));
+    const pnlUSDC = amountRedeemedUSDC - costUSDC;
+
+    logInfo(wallet.address, '💵',
+      `[${marketAddress.substring(0, 8)}...] Redeemed: $${amountRedeemedUSDC.toFixed(4)} USDC | Cost: $${costUSDC.toFixed(4)} | PnL: ${pnlUSDC >= 0 ? '+' : ''}$${pnlUSDC.toFixed(4)}`);
+
+    // Log redemption trade with full details
     logTrade({
       type: 'REDEEM',
       wallet: wallet.address,
       marketAddress,
       marketTitle: marketInfo?.title || 'Unknown',
+      ourOutcome: ourOutcome,
+      winningOutcome: winningOutcome,
+      result: didWeWin ? 'WON' : 'LOST',
+      costUSDC: costUSDC.toFixed(4),
+      redeemedUSDC: amountRedeemedUSDC.toFixed(4),
+      pnlUSDC: pnlUSDC.toFixed(4),
+      pnlPercent: costUSDC > 0 ? ((pnlUSDC / costUSDC) * 100).toFixed(2) : '0.00',
       conditionId,
+      payout0: payout0.toString(),
+      payout1: payout1.toString(),
       txHash: redeemTx.hash,
       blockNumber: receipt.blockNumber,
       gasUsed: receipt.gasUsed.toString()
     });
+
+    // Update stats
+    if (didWeWin) {
+      updateStats(pnlUSDC);
+    } else {
+      updateStats(pnlUSDC);
+    }
 
     // Remove holding after successful redemption
     removeHolding(wallet.address, marketAddress);
@@ -810,12 +888,15 @@ async function runForWallet(wallet, provider) {
     // Clear buyingInProgress at start of each tick - it's just for preventing concurrent buys within same tick
     buyingInProgress.clear();
 
-    // Clear inactive markets set every hour
+    // Clear inactive markets set every hour and show position summary
     const nowHour = new Date().getHours();
     if (currentHourForInactive !== nowHour) {
       inactiveMarketsThisHour.clear();
       currentHourForInactive = nowHour;
       logInfo(wallet.address, '🔄', `New hour started - cleared inactive markets cache`);
+
+      // Show positions summary at the start of each hour
+      logPositionsSummary(wallet.address);
     }
 
     // Check if bot should be active right now
@@ -865,7 +946,7 @@ async function runForWallet(wallet, provider) {
               cachedContracts.set(marketAddress, { market, usdc, erc1155, decimals, conditionalTokensAddress });
             }
 
-            const { conditionalTokensAddress } = cachedContracts.get(marketAddress);
+            const { conditionalTokensAddress, usdc, decimals } = cachedContracts.get(marketAddress);
             const conditionalTokensContract = new ethers.Contract(
               conditionalTokensAddress,
               CONDITIONAL_TOKENS_ABI,
@@ -880,7 +961,9 @@ async function runForWallet(wallet, provider) {
               marketData,
               holding,
               conditionalTokensContract,
-              collateralTokenAddress
+              collateralTokenAddress,
+              usdc,
+              decimals
             );
 
             if (redeemed) {
@@ -1010,25 +1093,39 @@ async function runForWallet(wallet, provider) {
     logInfo(wallet.address, '✅', `Buy completed in block ${receipt.blockNumber}, gasUsed=${receipt.gasUsed}`);
 
     const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
-    // After buy, record cost basis
+    // After buy, record cost basis with full metadata
     logInfo(wallet.address, '💾', `[${marketAddress.substring(0, 8)}...] Recording position: outcome=${outcomeToBuy}, tokenId=${tokenId}, cost=${investment}, strategy=${strategy}`);
     addHolding(wallet.address, {
       marketAddress,
+      marketTitle: marketInfo?.title || 'Unknown',
       outcomeIndex: outcomeToBuy,
       tokenId,
       amount: investment,
       cost: investment,
-      strategy: strategy // 'default', 'early_contrarian', or other strategies
+      strategy: strategy, // 'default', 'early_contrarian', or other strategies
+      entryPrice: prices[outcomeToBuy] || 'Unknown',
+      buyTimestamp: new Date().toISOString(),
+      marketDeadline: marketInfo?.deadline || null,
+      buyTxHash: buyTx.hash
     });
 
-    // Log buy trade
+    // Log buy trade with detailed information
+    const marketDeadline = marketInfo?.deadline ? new Date(marketInfo.deadline).toISOString() : 'Unknown';
+    const prices = marketInfo?.prices || [];
+
     logTrade({
       type: 'BUY',
       wallet: wallet.address,
       marketAddress,
       marketTitle: marketInfo?.title || 'Unknown',
       outcome: outcomeToBuy,
+      outcomePrice: prices[outcomeToBuy] || 'Unknown',
+      opponentPrice: prices[outcomeToBuy === 0 ? 1 : 0] || 'Unknown',
       investmentUSDC: ethers.formatUnits(investment, decimals),
+      expectedTokens: expectedTokens.toString(),
+      minTokens: minOutcomeTokensToBuy.toString(),
+      strategy: strategy,
+      marketDeadline: marketDeadline,
       txHash: buyTx.hash,
       blockNumber: receipt.blockNumber,
       gasUsed: receipt.gasUsed.toString()
