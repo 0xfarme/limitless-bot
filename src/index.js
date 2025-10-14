@@ -29,6 +29,7 @@ const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim
 const STATE_FILE = process.env.STATE_FILE || path.join('data', 'state.json');
 const TRADES_LOG_FILE = process.env.TRADES_LOG_FILE || path.join('data', 'trades.jsonl');
 const STATS_FILE = process.env.STATS_FILE || path.join('data', 'stats.json');
+const REDEMPTION_LOG_FILE = process.env.REDEMPTION_LOG_FILE || path.join('data', 'redemptions.jsonl');
 
 // ========= Trading Strategy Config =========
 const BUY_WINDOW_MINUTES = parseInt(process.env.BUY_WINDOW_MINUTES || '13', 10); // Last N minutes to buy
@@ -129,6 +130,20 @@ function logTrade(tradeData) {
     fs.appendFileSync(TRADES_LOG_FILE, logEntry);
   } catch (e) {
     console.error('⚠️ Failed to log trade:', e?.message || e);
+  }
+}
+
+// ========= Redemption Logging =========
+function logRedemption(redemptionData) {
+  try {
+    ensureDirSync(path.dirname(REDEMPTION_LOG_FILE));
+    const logEntry = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      ...redemptionData
+    }) + '\n';
+    fs.appendFileSync(REDEMPTION_LOG_FILE, logEntry);
+  } catch (e) {
+    console.error('⚠️ Failed to log redemption:', e?.message || e);
   }
 }
 
@@ -634,30 +649,80 @@ async function checkAndRedeemPosition(wallet, marketData, holding, conditionalTo
   try {
     logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Checking if market is resolved for redemption...`);
 
+    logRedemption({
+      event: 'CHECK_RESOLUTION_START',
+      wallet: wallet.address,
+      marketAddress: marketAddress,
+      marketStatus: marketInfo?.status,
+      marketResolved: marketData.resolved,
+      marketTitle: marketInfo?.title || 'Unknown'
+    });
+
     // Check if market is resolved via API data
     // Note: API returns status field and isActive flag
     const isResolved = marketData.resolved === true || marketInfo.status === 'RESOLVED';
 
     if (!isResolved) {
       logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Market not yet resolved (status: ${marketInfo.status}, resolved: ${marketData.resolved}), skipping redemption`);
+      logRedemption({
+        event: 'MARKET_NOT_RESOLVED',
+        wallet: wallet.address,
+        marketAddress: marketAddress,
+        status: marketInfo.status,
+        resolved: marketData.resolved
+      });
       return false;
     }
 
     logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Market is resolved in API (status: ${marketInfo.status})`);
+
+    logRedemption({
+      event: 'MARKET_RESOLVED_API',
+      wallet: wallet.address,
+      marketAddress: marketAddress,
+      status: marketInfo.status
+    });
 
     // Get conditionId from market data (API returns singular conditionId, not plural)
     const conditionId = marketInfo.conditionId;
 
     if (!conditionId) {
       logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] No conditionId found, cannot redeem`);
+      logRedemption({
+        event: 'NO_CONDITION_ID',
+        wallet: wallet.address,
+        marketAddress: marketAddress,
+        marketInfo: marketInfo
+      });
       return false;
     }
+
+    logRedemption({
+      event: 'CONDITION_ID_FOUND',
+      wallet: wallet.address,
+      marketAddress: marketAddress,
+      conditionId: conditionId
+    });
 
     // Check if condition is resolved by checking if payoutDenominator > 0
     const payoutDenom = await retryRpcCall(async () => await conditionalTokensContract.payoutDenominator(conditionId));
 
+    logRedemption({
+      event: 'PAYOUT_DENOM_CHECK',
+      wallet: wallet.address,
+      marketAddress: marketAddress,
+      conditionId: conditionId,
+      payoutDenominator: payoutDenom ? payoutDenom.toString() : '0'
+    });
+
     if (!payoutDenom || payoutDenom === 0n) {
       logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Market resolved in API but condition not yet resolved on-chain, waiting...`);
+      logRedemption({
+        event: 'CONDITION_NOT_RESOLVED_ONCHAIN',
+        wallet: wallet.address,
+        marketAddress: marketAddress,
+        conditionId: conditionId
+      });
       return false;
     }
 
@@ -768,12 +833,37 @@ async function checkAndRedeemPosition(wallet, marketData, holding, conditionalTo
       updateStats(pnlUSDC);
     }
 
+    // Log successful redemption
+    logRedemption({
+      event: 'REDEMPTION_SUCCESS',
+      wallet: wallet.address,
+      marketAddress: marketAddress,
+      ourOutcome: ourOutcome,
+      winningOutcome: winningOutcome,
+      didWeWin: didWeWin,
+      amountRedeemed: amountRedeemed.toString(),
+      amountRedeemedUSDC: amountRedeemedUSDC.toFixed(4),
+      pnlUSDC: pnlUSDC.toFixed(4),
+      txHash: redeemTx.hash
+    });
+
     // Remove holding after successful redemption
     removeHolding(wallet.address, marketAddress);
+
+    // Mark as completed so we don't try to redeem again
+    markMarketCompleted(wallet.address, marketAddress);
 
     return true;
   } catch (err) {
     logErr(wallet.address, '💥', `[${marketAddress.substring(0, 8)}...] Redemption failed: ${err?.message || err}`);
+    logRedemption({
+      event: 'REDEMPTION_ERROR',
+      wallet: wallet.address,
+      marketAddress: marketAddress,
+      error: err?.message || String(err),
+      errorCode: err?.code,
+      errorStack: err?.stack
+    });
     if (err.stack) {
       console.error(`Stack trace for ${wallet.address}:`, err.stack);
     }
@@ -923,15 +1013,62 @@ async function runForWallet(wallet, provider) {
         if (myHoldings.length > 0) {
           logInfo(wallet.address, '🕐', `Redemption window active (minutes ${REDEEM_WINDOW_START}-${REDEEM_WINDOW_END}) - checking ${myHoldings.length} position(s)...`);
 
+          // Log redemption check start
+          logRedemption({
+            event: 'REDEMPTION_CHECK_START',
+            wallet: wallet.address,
+            holdingsCount: myHoldings.length,
+            holdings: myHoldings.map(h => ({
+              marketAddress: h.marketAddress,
+              outcomeIndex: h.outcomeIndex,
+              cost: h.cost ? h.cost.toString() : null
+            }))
+          });
+
         for (const holding of myHoldings) {
           try {
+            logRedemption({
+              event: 'CHECKING_HOLDING',
+              wallet: wallet.address,
+              marketAddress: holding.marketAddress,
+              outcomeIndex: holding.outcomeIndex
+            });
+
+            // Check if already redeemed/completed
+            const completed = getCompletedMarkets(wallet.address);
+            if (completed.has(holding.marketAddress.toLowerCase())) {
+              logInfo(wallet.address, '✓', `[${holding.marketAddress.substring(0, 8)}...] Already redeemed, skipping`);
+              logRedemption({
+                event: 'ALREADY_REDEEMED',
+                wallet: wallet.address,
+                marketAddress: holding.marketAddress
+              });
+              continue;
+            }
+
             // Find the market data for this holding
             const marketData = allMarketsData.find(m => m.market && m.market.address.toLowerCase() === holding.marketAddress.toLowerCase());
 
             if (!marketData) {
               logWarn(wallet.address, '⚠️', `[${holding.marketAddress.substring(0, 8)}...] Market not found in API response, skipping redemption check`);
+              logRedemption({
+                event: 'MARKET_NOT_FOUND',
+                wallet: wallet.address,
+                marketAddress: holding.marketAddress,
+                reason: 'Market not in allMarketsData from API',
+                availableMarkets: allMarketsData.map(m => m.market?.address || 'unknown')
+              });
               continue;
             }
+
+            logRedemption({
+              event: 'MARKET_FOUND',
+              wallet: wallet.address,
+              marketAddress: holding.marketAddress,
+              marketStatus: marketData.market?.status,
+              isResolved: marketData.resolved,
+              isActive: marketData.isActive
+            });
 
             // Get or create conditional tokens contract
             const marketAddress = ethers.getAddress(holding.marketAddress);
@@ -956,6 +1093,12 @@ async function runForWallet(wallet, provider) {
             const collateralTokenAddress = ethers.getAddress(marketData.market.collateralToken.address);
 
             // Check and redeem if possible
+            logRedemption({
+              event: 'CALLING_REDEEM_FUNCTION',
+              wallet: wallet.address,
+              marketAddress: holding.marketAddress
+            });
+
             const redeemed = await checkAndRedeemPosition(
               wallet,
               marketData,
@@ -966,14 +1109,29 @@ async function runForWallet(wallet, provider) {
               decimals
             );
 
+            logRedemption({
+              event: 'REDEEM_FUNCTION_RETURNED',
+              wallet: wallet.address,
+              marketAddress: holding.marketAddress,
+              redeemed: redeemed
+            });
+
             if (redeemed) {
               logInfo(wallet.address, '✅', `[${holding.marketAddress.substring(0, 8)}...] Position redeemed successfully`);
+            } else {
+              logInfo(wallet.address, '⏭️', `[${holding.marketAddress.substring(0, 8)}...] Position not redeemed (market not ready or already claimed)`);
             }
 
             // Add small delay between redemption checks to avoid rate limits
             await delay(500);
           } catch (err) {
             logErr(wallet.address, '💥', `Error checking redemption for ${holding.marketAddress}:`, err?.message || err);
+            logRedemption({
+              event: 'REDEMPTION_LOOP_ERROR',
+              wallet: wallet.address,
+              marketAddress: holding.marketAddress,
+              error: err?.message || String(err)
+            });
           }
         }
         } else {
