@@ -1046,19 +1046,42 @@ async function runForWallet(wallet, provider) {
               continue;
             }
 
-            // Find the market data for this holding
-            const marketData = allMarketsData.find(m => m.market && m.market.address.toLowerCase() === holding.marketAddress.toLowerCase());
+            // Find the market data for this holding - first check in oracle data
+            let marketData = allMarketsData.find(m => m.market && m.market.address.toLowerCase() === holding.marketAddress.toLowerCase());
 
+            // If not found in oracle data, fetch directly by market address
             if (!marketData) {
-              logWarn(wallet.address, '⚠️', `[${holding.marketAddress.substring(0, 8)}...] Market not found in API response, skipping redemption check`);
+              logInfo(wallet.address, '🔍', `[${holding.marketAddress.substring(0, 8)}...] Market not in oracle data, fetching directly from API...`);
               logRedemption({
-                event: 'MARKET_NOT_FOUND',
+                event: 'FETCHING_MARKET_DIRECTLY',
                 wallet: wallet.address,
                 marketAddress: holding.marketAddress,
-                reason: 'Market not in allMarketsData from API',
-                availableMarkets: allMarketsData.map(m => m.market?.address || 'unknown')
+                reason: 'Market not in allMarketsData from oracle IDs',
+                oracleMarkets: allMarketsData.map(m => m.market?.address || 'unknown')
               });
-              continue;
+
+              try {
+                const url = `https://api.limitless.exchange/markets/${holding.marketAddress}`;
+                const res = await axios.get(url, { timeout: 15000 });
+                marketData = res.data;
+                logInfo(wallet.address, '✅', `[${holding.marketAddress.substring(0, 8)}...] Market data fetched successfully`);
+                logRedemption({
+                  event: 'MARKET_FETCHED_DIRECTLY',
+                  wallet: wallet.address,
+                  marketAddress: holding.marketAddress,
+                  marketStatus: marketData.market?.status,
+                  isResolved: marketData.resolved
+                });
+              } catch (e) {
+                logWarn(wallet.address, '⚠️', `[${holding.marketAddress.substring(0, 8)}...] Failed to fetch market data: ${e?.message || e}, skipping redemption check`);
+                logRedemption({
+                  event: 'MARKET_FETCH_FAILED',
+                  wallet: wallet.address,
+                  marketAddress: holding.marketAddress,
+                  error: e?.message || String(e)
+                });
+                continue;
+              }
             }
 
             logRedemption({
