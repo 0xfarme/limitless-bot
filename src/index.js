@@ -1183,11 +1183,45 @@ async function runForWallet(wallet, provider) {
               isActive: marketData.isActive
             });
 
+            // Validate market data structure
+            if (!marketData || !marketData.market) {
+              logWarn(wallet.address, '⚠️', `[${holding.marketAddress.substring(0, 8)}...] Invalid market data structure, skipping`);
+              logRedemption({
+                event: 'INVALID_MARKET_DATA',
+                wallet: wallet.address,
+                marketAddress: holding.marketAddress,
+                marketData: marketData
+              });
+              continue;
+            }
+
+            // Extract collateral token address - handle different API response formats
+            let collateralTokenAddress;
+            try {
+              if (marketData.market.collateralToken?.address) {
+                collateralTokenAddress = ethers.getAddress(marketData.market.collateralToken.address);
+              } else if (marketData.collateralToken?.address) {
+                collateralTokenAddress = ethers.getAddress(marketData.collateralToken.address);
+              } else {
+                logWarn(wallet.address, '⚠️', `[${holding.marketAddress.substring(0, 8)}...] No collateralToken found in market data, skipping`);
+                logRedemption({
+                  event: 'NO_COLLATERAL_TOKEN',
+                  wallet: wallet.address,
+                  marketAddress: holding.marketAddress,
+                  marketDataKeys: Object.keys(marketData),
+                  marketKeys: Object.keys(marketData.market || {})
+                });
+                continue;
+              }
+            } catch (e) {
+              logWarn(wallet.address, '⚠️', `[${holding.marketAddress.substring(0, 8)}...] Error parsing collateral token: ${e?.message}`);
+              continue;
+            }
+
             // Get or create conditional tokens contract
             const marketAddress = ethers.getAddress(holding.marketAddress);
             if (!cachedContracts.has(marketAddress)) {
               // Initialize contracts for this market if not cached
-              const collateralTokenAddress = ethers.getAddress(marketData.market.collateralToken.address);
               const market = new ethers.Contract(marketAddress, MARKET_ABI, wallet);
               const usdc = new ethers.Contract(collateralTokenAddress, ERC20_ABI, wallet);
               const conditionalTokensAddress = await retryRpcCall(async () => await market.conditionalTokens());
@@ -1202,8 +1236,6 @@ async function runForWallet(wallet, provider) {
               CONDITIONAL_TOKENS_ABI,
               wallet
             );
-
-            const collateralTokenAddress = ethers.getAddress(marketData.market.collateralToken.address);
 
             // Check and redeem if possible
             logRedemption({
