@@ -3,6 +3,7 @@ const axios = require('axios');
 const { ethers } = require('ethers');
 const fs = require('fs');
 const path = require('path');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 const MARKET_ABI = require('./abis/Market.json');
 const ERC20_ABI = require('./abis/ERC20.json');
@@ -50,6 +51,29 @@ const EARLY_PROFIT_TARGET_PCT = parseInt(process.env.EARLY_PROFIT_TARGET_PCT || 
 const AUTO_REDEEM_ENABLED = (process.env.AUTO_REDEEM_ENABLED || 'true').toLowerCase() === 'true'; // Enable automatic redemption
 const REDEEM_WINDOW_START = parseInt(process.env.REDEEM_WINDOW_START || '6', 10); // Redemption window start minute (0-59)
 const REDEEM_WINDOW_END = parseInt(process.env.REDEEM_WINDOW_END || '10', 10); // Redemption window end minute (0-59)
+
+// ========= S3 Upload Config =========
+const S3_UPLOAD_ENABLED = (process.env.S3_UPLOAD_ENABLED || 'false').toLowerCase() === 'true';
+const S3_BUCKET_NAME = process.env.S3_BUCKET_NAME || 'limitless-bot-logs';
+const S3_REGION = process.env.S3_REGION || 'us-east-1';
+const S3_UPLOAD_INTERVAL_MS = parseInt(process.env.S3_UPLOAD_INTERVAL_MS || '60000', 10); // 1 minute default
+
+// Initialize S3 client if upload is enabled
+let s3Client = null;
+if (S3_UPLOAD_ENABLED) {
+  const s3Config = {
+    region: S3_REGION
+  };
+  // Add credentials if provided (otherwise uses AWS CLI credentials or IAM role)
+  if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+    s3Config.credentials = {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+    };
+  }
+  s3Client = new S3Client(s3Config);
+  console.log(`📤 S3 upload enabled: Bucket=${S3_BUCKET_NAME}, Region=${S3_REGION}, Interval=${S3_UPLOAD_INTERVAL_MS}ms`);
+}
 
 if (!RPC_URL) {
   console.error('RPC_URL is required');
@@ -144,6 +168,72 @@ function logRedemption(redemptionData) {
     fs.appendFileSync(REDEMPTION_LOG_FILE, logEntry);
   } catch (e) {
     console.error('⚠️ Failed to log redemption:', e?.message || e);
+  }
+}
+
+// ========= S3 Upload Logic =========
+async function uploadFileToS3(filePath, s3Key) {
+  if (!S3_UPLOAD_ENABLED || !s3Client) return;
+
+  try {
+    // Check if file exists
+    if (!fs.existsSync(filePath)) {
+      return; // File doesn't exist yet, skip
+    }
+
+    const fileContent = fs.readFileSync(filePath);
+    const command = new PutObjectCommand({
+      Bucket: S3_BUCKET_NAME,
+      Key: s3Key,
+      Body: fileContent,
+      ContentType: s3Key.endsWith('.json') ? 'application/json' : 'application/x-ndjson'
+    });
+
+    await s3Client.send(command);
+    console.log(`✅ [S3] Uploaded ${s3Key}`);
+  } catch (e) {
+    console.error(`⚠️ [S3] Failed to upload ${s3Key}:`, e?.message || e);
+  }
+}
+
+async function uploadAllLogsToS3() {
+  if (!S3_UPLOAD_ENABLED || !s3Client) return;
+
+  console.log('📤 [S3] Uploading logs to S3...');
+
+  // Upload all log files
+  await Promise.all([
+    uploadFileToS3(TRADES_LOG_FILE, 'trades.jsonl'),
+    uploadFileToS3(STATS_FILE, 'stats.json'),
+    uploadFileToS3(REDEMPTION_LOG_FILE, 'redemptions.jsonl'),
+    uploadFileToS3(STATE_FILE, 'state.json')
+  ]);
+}
+
+// Schedule periodic S3 uploads
+let s3UploadTimer = null;
+function startS3Upload() {
+  if (!S3_UPLOAD_ENABLED || !s3Client) return;
+
+  console.log(`📤 [S3] Starting periodic uploads every ${S3_UPLOAD_INTERVAL_MS}ms`);
+
+  // Upload immediately on start
+  uploadAllLogsToS3().catch(e => console.error('⚠️ [S3] Initial upload failed:', e?.message || e));
+
+  // Then schedule periodic uploads
+  s3UploadTimer = setInterval(() => {
+    uploadAllLogsToS3().catch(e => console.error('⚠️ [S3] Periodic upload failed:', e?.message || e));
+  }, S3_UPLOAD_INTERVAL_MS);
+}
+
+function stopS3Upload() {
+  if (s3UploadTimer) {
+    clearInterval(s3UploadTimer);
+    s3UploadTimer = null;
+    // Final upload before shutdown
+    if (S3_UPLOAD_ENABLED) {
+      uploadAllLogsToS3().catch(e => console.error('⚠️ [S3] Final upload failed:', e?.message || e));
+    }
   }
 }
 
@@ -1849,10 +1939,17 @@ async function main() {
     timers.push(timer);
   }
 
+  // Start S3 uploads if enabled
+  startS3Upload();
+
   process.on('SIGINT', () => {
     console.log('👋 Shutting down...');
     timers.forEach(t => clearInterval(t));
-    process.exit(0);
+    stopS3Upload();
+    // Give a moment for final S3 upload
+    setTimeout(() => {
+      process.exit(0);
+    }, 1000);
   });
 }
 
