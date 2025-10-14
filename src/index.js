@@ -1409,6 +1409,25 @@ async function runForWallet(wallet, provider) {
 
   // Helper function to execute buy transaction
   async function executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, strategy = 'default') {
+    // First, check if we already have a position in this market via API
+    try {
+      const portfolioData = await fetchPortfolioData(wallet.address);
+      if (portfolioData && portfolioData.amm) {
+        const existingPosition = portfolioData.amm.find(pos =>
+          pos.market.id.toLowerCase() === marketAddress.toLowerCase() &&
+          !pos.market.closed && // Only check open markets
+          (parseFloat(pos.outcomeTokenAmount || 0) > 0 || parseFloat(pos.collateralAmount || 0) > 0)
+        );
+
+        if (existingPosition) {
+          logInfo(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Already have position (${existingPosition.outcomeTokenAmount} tokens, outcome ${existingPosition.outcomeIndex}) - skipping buy to prevent double position`);
+          return;
+        }
+      }
+    } catch (error) {
+      logWarn(wallet.address, '⚠️', `Failed to check existing positions: ${error?.message || error} - proceeding with buy`);
+    }
+
     // Check if USDC allowance is sufficient
     logInfo(wallet.address, '🔐', `Checking USDC allowance for market ${marketAddress}...`);
     let currentAllowance;
