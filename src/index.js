@@ -31,6 +31,7 @@ const STATE_FILE = process.env.STATE_FILE || path.join('data', 'state.json');
 const TRADES_LOG_FILE = process.env.TRADES_LOG_FILE || path.join('data', 'trades.jsonl');
 const STATS_FILE = process.env.STATS_FILE || path.join('data', 'stats.json');
 const REDEMPTION_LOG_FILE = process.env.REDEMPTION_LOG_FILE || path.join('data', 'redemptions.jsonl');
+const PORTFOLIO_SNAPSHOT_FILE = process.env.PORTFOLIO_SNAPSHOT_FILE || path.join('data', 'portfolio-snapshot.json');
 
 // ========= Trading Strategy Config =========
 const BUY_WINDOW_MINUTES = parseInt(process.env.BUY_WINDOW_MINUTES || '13', 10); // Last N minutes to buy
@@ -206,7 +207,8 @@ async function uploadAllLogsToS3() {
     uploadFileToS3(TRADES_LOG_FILE, 'trades.jsonl'),
     uploadFileToS3(STATS_FILE, 'stats.json'),
     uploadFileToS3(REDEMPTION_LOG_FILE, 'redemptions.jsonl'),
-    uploadFileToS3(STATE_FILE, 'state.json')
+    uploadFileToS3(STATE_FILE, 'state.json'),
+    uploadFileToS3(PORTFOLIO_SNAPSHOT_FILE, 'portfolio-snapshot.json')
   ]);
 }
 
@@ -234,6 +236,87 @@ function stopS3Upload() {
     if (S3_UPLOAD_ENABLED) {
       uploadAllLogsToS3().catch(e => console.error('⚠️ [S3] Final upload failed:', e?.message || e));
     }
+  }
+}
+
+// ========= Portfolio API Integration =========
+async function fetchPortfolioData(walletAddress) {
+  try {
+    const url = `https://api.limitless.exchange/portfolio/${walletAddress}/positions`;
+    const response = await axios.get(url, { timeout: 15000 });
+    return response.data;
+  } catch (error) {
+    console.error(`⚠️ Failed to fetch portfolio for ${walletAddress}:`, error?.message || error);
+    return null;
+  }
+}
+
+async function savePortfolioSnapshot(wallets) {
+  try {
+    console.log('📊 [PORTFOLIO] Fetching portfolio snapshots...');
+
+    const snapshots = {};
+    for (const wallet of wallets) {
+      const portfolioData = await fetchPortfolioData(wallet.address);
+      if (portfolioData) {
+        // Calculate totals from API data
+        const ammPositions = portfolioData.amm || [];
+        const totalRealizedPnl = ammPositions.reduce((sum, pos) => sum + parseFloat(pos.realizedPnl || 0), 0);
+        const totalUnrealizedPnl = ammPositions.reduce((sum, pos) => sum + parseFloat(pos.unrealizedPnl || 0), 0);
+        const totalNetPnl = totalRealizedPnl + totalUnrealizedPnl;
+
+        const openPositions = ammPositions.filter(pos =>
+          parseFloat(pos.outcomeTokenAmount || 0) > 0 ||
+          parseFloat(pos.collateralAmount || 0) > 0
+        );
+
+        snapshots[wallet.address] = {
+          timestamp: new Date().toISOString(),
+          wallet: wallet.address,
+          points: portfolioData.points || '0',
+          accumulativePoints: portfolioData.accumulativePoints || '0',
+          summary: {
+            totalPositions: ammPositions.length,
+            openPositions: openPositions.length,
+            closedPositions: ammPositions.length - openPositions.length,
+            totalRealizedPnl: totalRealizedPnl.toFixed(6),
+            totalUnrealizedPnl: totalUnrealizedPnl.toFixed(6),
+            totalNetPnl: totalNetPnl.toFixed(6),
+          },
+          positions: ammPositions.map(pos => ({
+            market: {
+              id: pos.market.id,
+              title: pos.market.title,
+              slug: pos.market.slug,
+              deadline: pos.market.deadline,
+              closed: pos.market.closed,
+            },
+            outcomeIndex: pos.outcomeIndex,
+            outcomeTokenAmount: pos.outcomeTokenAmount,
+            collateralAmount: pos.collateralAmount,
+            realizedPnl: pos.realizedPnl,
+            unrealizedPnl: pos.unrealizedPnl,
+            averageFillPrice: pos.averageFillPrice,
+            totalBuysCost: pos.totalBuysCost,
+            totalSellsCost: pos.totalSellsCost,
+            latestTradePrice: pos.latestTrade?.outcomeTokenPrice || null,
+          }))
+        };
+
+        console.log(`✅ [PORTFOLIO] ${wallet.address}: ${ammPositions.length} positions, Net P&L: $${totalNetPnl.toFixed(2)}`);
+      }
+
+      // Small delay between requests
+      await delay(500);
+    }
+
+    // Save to file
+    ensureDirSync(path.dirname(PORTFOLIO_SNAPSHOT_FILE));
+    fs.writeFileSync(PORTFOLIO_SNAPSHOT_FILE, JSON.stringify(snapshots, null, 2));
+    console.log(`💾 [PORTFOLIO] Snapshot saved to ${PORTFOLIO_SNAPSHOT_FILE}`);
+
+  } catch (error) {
+    console.error('⚠️ [PORTFOLIO] Failed to save snapshot:', error?.message || error);
   }
 }
 
@@ -1973,6 +2056,15 @@ async function main() {
 
   // Start S3 uploads if enabled
   startS3Upload();
+
+  // Initial portfolio snapshot
+  await savePortfolioSnapshot(wallets);
+
+  // Schedule portfolio snapshots every 5 minutes
+  const portfolioTimer = setInterval(async () => {
+    await savePortfolioSnapshot(wallets);
+  }, 5 * 60 * 1000); // 5 minutes
+  timers.push(portfolioTimer);
 
   process.on('SIGINT', () => {
     console.log('👋 Shutting down...');
