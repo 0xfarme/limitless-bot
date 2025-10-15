@@ -1814,8 +1814,20 @@ async function runForWallet(wallet, provider) {
       const positionIds = marketInfo.positionIds || [];
       const collateralTokenAddress = ethers.getAddress(marketInfo.collateralToken.address);
 
-      logInfo(wallet.address, '💹', `[${marketAddress.substring(0, 8)}...] Prices: [${prices.join(', ')}]`);
-      logInfo(wallet.address, '🎫', `[${marketAddress.substring(0, 8)}...] Position IDs: [${positionIds.join(', ')}]`);
+      // Parse market title to extract asset and target price
+      // Format: "$ETH above $3983.88 on Oct 15, 17:00 UTC?"
+      let assetInfo = '';
+      if (marketInfo && marketInfo.title) {
+        const titleMatch = marketInfo.title.match(/\$([A-Z]+)\s+(above|below)\s+\$?([\d,\.]+)/i);
+        if (titleMatch) {
+          const asset = titleMatch[1];
+          const direction = titleMatch[2];
+          const targetPrice = titleMatch[3];
+          assetInfo = ` | 🎯 Target: ${asset} ${direction} $${targetPrice}`;
+        }
+      }
+
+      logInfo(wallet.address, '💹', `[${marketAddress.substring(0, 8)}...] Prediction: YES ${prices[0]}% | NO ${prices[1]}%${assetInfo}`);
 
       // Pre-compute timing guardrails for buying
       const nowMs = Date.now();
