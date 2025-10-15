@@ -1231,7 +1231,7 @@ async function runForWallet(wallet, provider) {
 
     // Always stay active if we have open positions (need to monitor for profit targets)
     if (wallet) {
-      const holdings = getHoldings(wallet.address);
+      const holdings = getAllHoldings(wallet.address);
       if (holdings && holdings.length > 0) {
         return true; // Stay awake to monitor positions
       }
