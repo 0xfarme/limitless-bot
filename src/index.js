@@ -2026,6 +2026,14 @@ async function runForWallet(wallet, provider) {
 
       // Process ALL existing positions for this market
       if (hasAny) {
+        // Log how many holdings we have for this market
+        if (allHoldingsThisMarket.length > 1) {
+          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Found ${allHoldingsThisMarket.length} holdings for this market (multiple strategies)`);
+          allHoldingsThisMarket.forEach((h, idx) => {
+            logInfo(wallet.address, '📋', `  [${idx+1}] Strategy: ${h.strategy || 'default'}, TokenId: ${h.tokenId?.toString().substring(0, 20)}..., Cost: ${h.cost ? ethers.formatUnits(h.cost, decimals) : 'unknown'} USDC`);
+          });
+        }
+
         // Determine which outcome is held, then ensure we have cost basis
         let outcomeIndex = null;
         let tokenId = null;
@@ -2034,7 +2042,13 @@ async function runForWallet(wallet, provider) {
         if (bal1 > 0n) { outcomeIndex = 1; tokenId = pid1; tokenBalance = bal1; }
 
         // Find matching holding from local state (match by tokenId)
+        // IMPORTANT: If multiple holdings share same tokenId (multiple strategies on same outcome),
+        // this will only process the FIRST one!
         let holding = allHoldingsThisMarket.find(h => h.tokenId === tokenId);
+
+        if (holding) {
+          logInfo(wallet.address, '🎯', `[${marketAddress.substring(0, 8)}...] Processing holding: Strategy=${holding.strategy || 'default'}, TokenId match found`);
+        }
 
         // Initialize cost basis from env if missing
         if (!holding || holding.tokenId !== tokenId) {
@@ -2172,6 +2186,9 @@ async function runForWallet(wallet, provider) {
 
         // Check if we already took profits on this position (for partial sells)
         const alreadyTookProfit = holding?.profitTaken === true;
+
+        // Debug logging for sell decision
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Sell check: calcSellFailed=${calcSellFailed}, pnlAbs=${pnlAbs > 0n ? '+' : '-'}, pnlPct=${pnlPct.toFixed(2)}%, profitTarget=${profitTarget}%, alreadyTookProfit=${alreadyTookProfit}, strategy=${strategyType}`);
 
         // Only attempt profit-taking if calcSellAmount succeeded (market is active)
         if (!calcSellFailed && pnlAbs > 0n && pnlPct >= profitTarget && !alreadyTookProfit) {
