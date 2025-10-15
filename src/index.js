@@ -2345,7 +2345,7 @@ async function main() {
   console.log('🚀 Starting Limitless bot on Base...');
   console.log(`📋 Configuration:`);
   console.log(`   MODE: ${SIMULATION_MODE ? '🎭 SIMULATION' : '💰 LIVE TRADING'}`);
-  console.log(`   RPC_URL: ${RPC_URL}`);
+  console.log(`   RPC_URLS: ${RPC_URLS.length} endpoint(s) configured`);
   console.log(`   CHAIN_ID: ${CHAIN_ID}`);
   console.log(`   PRICE_ORACLE_IDS: [${PRICE_ORACLE_IDS.join(', ')}] (${PRICE_ORACLE_IDS.length} market(s))`);
   console.log(`   FREQUENCY: ${FREQUENCY}`);
