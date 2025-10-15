@@ -1193,9 +1193,17 @@ async function runForWallet(wallet, provider) {
   }
 
   // Helper function to check if bot should be active based on current time
-  function shouldBeActive() {
+  function shouldBeActive(wallet) {
     const now = new Date();
     const nowMinutes = now.getMinutes();
+
+    // Always stay active if we have open positions (need to monitor for profit targets)
+    if (wallet) {
+      const holdings = getHoldings(wallet.address);
+      if (holdings && holdings.length > 0) {
+        return true; // Stay awake to monitor positions
+      }
+    }
 
     // Redemption window: minutes 6-10
     const inRedemptionWindow = AUTO_REDEEM_ENABLED && nowMinutes >= REDEEM_WINDOW_START && nowMinutes <= REDEEM_WINDOW_END;
@@ -1244,7 +1252,7 @@ async function runForWallet(wallet, provider) {
 
   async function tick() {
     // Check if bot should be active right now - do this FIRST to avoid unnecessary work during sleep
-    if (!shouldBeActive()) {
+    if (!shouldBeActive(wallet)) {
       const nextWakeMs = getNextWakeTime();
       const nextWakeMinutes = Math.floor(nextWakeMs / 60000);
       const nextWakeSeconds = Math.floor((nextWakeMs % 60000) / 1000);
