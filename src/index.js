@@ -167,10 +167,7 @@ if (S3_UPLOAD_ENABLED) {
   console.log(`📤 S3 upload enabled: Bucket=${S3_BUCKET_NAME}, Region=${S3_REGION}, Interval=${S3_UPLOAD_INTERVAL_MS}ms`);
 }
 
-if (!RPC_URL) {
-  console.error('RPC_URL is required');
-  process.exit(1);
-}
+// RPC_URLS validation is already done at lines 14-19
 if (PRICE_ORACLE_IDS.length === 0) {
   console.error('PRICE_ORACLE_ID is required (comma separated for multiple markets)');
   process.exit(1);
