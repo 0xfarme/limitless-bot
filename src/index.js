@@ -2544,11 +2544,17 @@ async function runForWallet(wallet, provider) {
 
         // After late window buy, check if we should place moonshot contrarian bet
         if (MOONSHOT_ENABLED && inMoonshotWindow) {
-          const moonshotStrategy = 'moonshot';
-          const moonshotHolding = getHolding(wallet.address, marketAddress, moonshotStrategy);
+          // Check if we have ANY existing position on this market (any strategy)
+          const allHoldingsForMarket = getHoldingsForMarket(wallet.address, marketAddress);
 
-          if (!moonshotHolding) {
-            // Buy the opposite side of what we just bought
+          if (allHoldingsForMarket.length > 1) {
+            // We already have at least 2 positions (the one we just bought + another)
+            // Don't add moonshot - we already have exposure
+            const existingStrategies = allHoldingsForMarket.map(h => h.strategy || 'default').join(', ');
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - already have ${allHoldingsForMarket.length} positions (${existingStrategies})`);
+          } else {
+            // Only have 1 position (the one we just bought) - safe to add moonshot
+            const moonshotStrategy = 'moonshot';
             const moonshotOutcome = outcomeToBuy === 0 ? 1 : 0;
             const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
 
@@ -2561,8 +2567,6 @@ async function runForWallet(wallet, provider) {
             } else {
               logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need ${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
             }
-          } else {
-            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot position already exists - skipping`);
           }
         }
 
