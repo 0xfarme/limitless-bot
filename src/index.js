@@ -16,7 +16,31 @@ const CHAIN_ID = parseInt(process.env.CHAIN_ID || '8453', 10);
 const PRICE_ORACLE_IDS = (process.env.PRICE_ORACLE_ID || '').split(',').map(s => s.trim()).filter(Boolean);
 const FREQUENCY = process.env.FREQUENCY || 'hourly';
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
+
+// Universal buy amount (fallback if strategy-specific not set)
 const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 5; // human units
+
+// Per-strategy buy amounts (overrides BUY_AMOUNT_USDC if set)
+const EARLY_BUY_AMOUNT_USDC = process.env.EARLY_BUY_AMOUNT_USDC ? Number(process.env.EARLY_BUY_AMOUNT_USDC) : null;
+const LATE_BUY_AMOUNT_USDC = process.env.LATE_BUY_AMOUNT_USDC ? Number(process.env.LATE_BUY_AMOUNT_USDC) : null;
+
+// Helper function to get buy amount for a strategy
+function getBuyAmountForStrategy(strategy) {
+  // Normalize strategy name
+  const isEarly = strategy && strategy.includes('early');
+
+  // Check strategy-specific amount first
+  if (isEarly && EARLY_BUY_AMOUNT_USDC !== null) {
+    return EARLY_BUY_AMOUNT_USDC;
+  }
+  if (!isEarly && LATE_BUY_AMOUNT_USDC !== null) {
+    return LATE_BUY_AMOUNT_USDC;
+  }
+
+  // Fall back to universal amount
+  return BUY_AMOUNT_USDC;
+}
+
 const TARGET_PROFIT_PCT = process.env.TARGET_PROFIT_PCT ? Number(process.env.TARGET_PROFIT_PCT) : 20; // 20%
 const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 100; // 1%
 const GAS_PRICE_GWEI = process.env.GAS_PRICE_GWEI ? String(process.env.GAS_PRICE_GWEI) : '0.005';
@@ -2045,10 +2069,11 @@ async function runForWallet(wallet, provider) {
 
         // Buy the side that is in odds range
         const outcomeToBuy = prices[0] >= MIN_ODDS && prices[0] <= MAX_ODDS ? 0 : 1;
-        logInfo(wallet.address, '🎯', `[${marketAddress.substring(0, 8)}...] Last ${BUY_WINDOW_MINUTES}min strategy: Buying outcome ${outcomeToBuy} at ${prices[outcomeToBuy]}%`);
+        const lateStrategy = 'default';
+        const investmentHuman = getBuyAmountForStrategy(lateStrategy);
+        logInfo(wallet.address, '🎯', `[${marketAddress.substring(0, 8)}...] Last ${BUY_WINDOW_MINUTES}min strategy: Buying outcome ${outcomeToBuy} at ${prices[outcomeToBuy]}% with $${investmentHuman} USDC`);
 
         // Continue to buy logic below with this outcome
-        const investmentHuman = BUY_AMOUNT_USDC;
         const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
 
         // Check USDC balance sufficient for bet
@@ -2077,9 +2102,10 @@ async function runForWallet(wallet, provider) {
           const dominantSide = prices[0] >= EARLY_TRIGGER_ODDS ? 0 : 1;
           const outcomeToBuy = dominantSide === 0 ? 1 : 0;
 
-          logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Early contrarian: Side ${dominantSide} at ${prices[dominantSide]}% (>= ${EARLY_TRIGGER_ODDS}%), buying opposite side ${outcomeToBuy} at ${prices[outcomeToBuy]}%`);
+          const earlyStrategy = 'early_contrarian';
+          const investmentHuman = getBuyAmountForStrategy(earlyStrategy);
+          logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Early contrarian: Side ${dominantSide} at ${prices[dominantSide]}% (>= ${EARLY_TRIGGER_ODDS}%), buying opposite side ${outcomeToBuy} at ${prices[outcomeToBuy]}% with $${investmentHuman} USDC`);
 
-          const investmentHuman = BUY_AMOUNT_USDC;
           const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
 
           // Check USDC balance
@@ -2141,7 +2167,20 @@ async function main() {
   console.log(`   PRICE_ORACLE_IDS: [${PRICE_ORACLE_IDS.join(', ')}] (${PRICE_ORACLE_IDS.length} market(s))`);
   console.log(`   FREQUENCY: ${FREQUENCY}`);
   console.log(`   POLL_INTERVAL_MS: ${POLL_INTERVAL_MS}`);
-  console.log(`   BUY_AMOUNT_USDC: ${BUY_AMOUNT_USDC}`);
+
+  // Show buy amounts (universal and per-strategy)
+  if (EARLY_BUY_AMOUNT_USDC !== null || LATE_BUY_AMOUNT_USDC !== null) {
+    console.log(`   BUY_AMOUNT_USDC: ${BUY_AMOUNT_USDC} (default)`);
+    if (EARLY_BUY_AMOUNT_USDC !== null) {
+      console.log(`   EARLY_BUY_AMOUNT_USDC: ${EARLY_BUY_AMOUNT_USDC} (overrides default for early strategy)`);
+    }
+    if (LATE_BUY_AMOUNT_USDC !== null) {
+      console.log(`   LATE_BUY_AMOUNT_USDC: ${LATE_BUY_AMOUNT_USDC} (overrides default for late strategy)`);
+    }
+  } else {
+    console.log(`   BUY_AMOUNT_USDC: ${BUY_AMOUNT_USDC} (all strategies)`);
+  }
+
   console.log(`   TARGET_PROFIT_PCT: ${TARGET_PROFIT_PCT}%`);
   console.log(`   SLIPPAGE_BPS: ${SLIPPAGE_BPS}`);
   console.log(`   STRATEGY_MODE: ${STRATEGY_MODE}`);

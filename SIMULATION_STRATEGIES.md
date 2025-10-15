@@ -260,6 +260,80 @@ SIMULATE_STRATEGIES=early
 
 This allows true A/B testing of strategy timing!
 
+## Per-Strategy Buy Amounts
+
+You can allocate different capital to each strategy using per-strategy buy amounts:
+
+```env
+# Universal amount (fallback)
+BUY_AMOUNT_USDC=5
+
+# Override for specific strategies
+EARLY_BUY_AMOUNT_USDC=3      # Lower risk for early contrarian
+LATE_BUY_AMOUNT_USDC=10      # Higher confidence in late window
+```
+
+### Examples:
+
+#### Conservative Early, Aggressive Late
+```env
+BUY_AMOUNT_USDC=5           # Default
+EARLY_BUY_AMOUNT_USDC=2     # Small bets early
+LATE_BUY_AMOUNT_USDC=15     # Big bets late
+```
+
+**Result:**
+- Early contrarian: $2 USDC per trade
+- Late window: $15 USDC per trade
+
+#### Test Early Small, Run Late Normal
+```env
+BUY_AMOUNT_USDC=10          # Default for late
+EARLY_BUY_AMOUNT_USDC=1     # Test with $1
+SIMULATE_STRATEGIES=early   # Simulate early
+```
+
+**Result:**
+- Early: $1 USDC simulated trades
+- Late: $10 USDC live trades
+
+#### Balanced Approach
+```env
+BUY_AMOUNT_USDC=5           # Default
+EARLY_BUY_AMOUNT_USDC=5     # Same as default
+LATE_BUY_AMOUNT_USDC=5      # Same as default
+```
+
+**Result:**
+- All strategies: $5 USDC per trade
+
+### Strategy-Specific Amount Priority
+
+1. **Strategy-specific amount** (EARLY_BUY_AMOUNT_USDC or LATE_BUY_AMOUNT_USDC)
+2. **Universal amount** (BUY_AMOUNT_USDC)
+
+If no strategy-specific amount is set, the universal amount is used.
+
+### Startup Display
+
+Bot shows which amounts are active:
+
+```
+📋 Configuration:
+   BUY_AMOUNT_USDC: 5 (default)
+   EARLY_BUY_AMOUNT_USDC: 3 (overrides default for early strategy)
+   LATE_BUY_AMOUNT_USDC: 10 (overrides default for late strategy)
+```
+
+### Logging
+
+Trade logs show the amount used:
+
+```
+🎯 Last 13min strategy: Buying outcome 0 at 85% with $10 USDC
+🔄 Early contrarian: Buying opposite side 1 at 25% with $3 USDC
+```
+
 ---
 
 **Ready to test strategies risk-free? Set `SIMULATE_STRATEGIES` and let the bot run!** 🚀
