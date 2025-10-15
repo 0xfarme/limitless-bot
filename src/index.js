@@ -11,7 +11,12 @@ const ERC1155_ABI = require('./abis/ERC1155.json');
 const CONDITIONAL_TOKENS_ABI = require('./abis/ConditionalTokens.json');
 
 // ========= Config =========
-const RPC_URL = process.env.RPC_URL;
+// Support multiple RPC URLs (comma-separated) for automatic fallback
+const RPC_URLS = (process.env.RPC_URL || process.env.RPC_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
+if (RPC_URLS.length === 0) {
+  console.error('❌ ERROR: No RPC_URL configured. Please set RPC_URL in .env file.');
+  process.exit(1);
+}
 const CHAIN_ID = parseInt(process.env.CHAIN_ID || '8453', 10);
 const PRICE_ORACLE_IDS = (process.env.PRICE_ORACLE_ID || '').split(',').map(s => s.trim()).filter(Boolean);
 const FREQUENCY = process.env.FREQUENCY || 'hourly';
@@ -2355,20 +2360,48 @@ async function main() {
     console.log(`   💤 Sleep Mode: Minutes ${sleepPeriods.join(', ')} (saves RPC calls)`);
   }
 
-  const provider = new ethers.JsonRpcProvider(RPC_URL);
+  // Try each RPC URL until one works
+  console.log(`\n🔌 Connecting to RPC...`);
+  console.log(`   Available RPCs: ${RPC_URLS.length}`);
 
-  // Verify connected chain
-  try {
-    const net = await provider.getNetwork();
-    logInfo('GLOBAL', '🌐', `Connected to chainId=${net.chainId} (${net.name || 'unknown'})`);
-    if (Number(net.chainId) !== CHAIN_ID) {
-      logErr('GLOBAL', '❌', `Wrong network. Expected chainId=${CHAIN_ID} but connected to ${net.chainId}. Update RPC_URL/CHAIN_ID.`);
-      process.exit(1);
+  let provider = null;
+  let workingRpcUrl = null;
+
+  for (let i = 0; i < RPC_URLS.length; i++) {
+    const rpcUrl = RPC_URLS[i];
+    console.log(`   [${i + 1}/${RPC_URLS.length}] Trying: ${rpcUrl.substring(0, 50)}...`);
+
+    try {
+      const testProvider = new ethers.JsonRpcProvider(rpcUrl);
+      const net = await testProvider.getNetwork();
+
+      if (Number(net.chainId) !== CHAIN_ID) {
+        console.log(`   ❌ Wrong network (chainId=${net.chainId}, expected ${CHAIN_ID})`);
+        continue;
+      }
+
+      // Success!
+      provider = testProvider;
+      workingRpcUrl = rpcUrl;
+      logInfo('GLOBAL', '✅', `Connected to chainId=${net.chainId} (${net.name || 'unknown'})`);
+      console.log(`   🎯 Using RPC [${i + 1}]: ${rpcUrl.substring(0, 50)}...`);
+      break;
+    } catch (e) {
+      console.log(`   ❌ Failed: ${e.message}`);
+      if (i === RPC_URLS.length - 1) {
+        logErr('GLOBAL', '💥', 'All RPC URLs failed. Please check your RPC_URL configuration.', e && e.message ? e.message : e);
+        process.exit(1);
+      }
     }
-  } catch (e) {
-    logErr('GLOBAL', '💥', 'Failed to fetch network from RPC_URL', e && e.message ? e.message : e);
+  }
+
+  if (!provider) {
+    logErr('GLOBAL', '💥', 'Failed to connect to any RPC URL');
     process.exit(1);
   }
+
+  // Store backup RPCs for runtime fallback
+  const backupRpcUrls = RPC_URLS.filter(url => url !== workingRpcUrl);
 
   const wallets = PRIVATE_KEYS.map(pkRaw => {
     const pk = pkRaw.startsWith('0x') ? pkRaw : '0x' + pkRaw;
