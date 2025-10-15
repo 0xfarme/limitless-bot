@@ -120,13 +120,7 @@ async function uploadLogsToS3() {
 
 ### Step 2: Create Dashboard Repo
 
-**Repository**: https://github.com/0xfarme/limitless-dashboard
-
 ```bash
-# Clone the dashboard repository
-git clone https://github.com/0xfarme/limitless-dashboard.git
-cd limitless-dashboard
-
 # Repository structure
 limitless-dashboard/
 ├── src/

@@ -93,17 +93,14 @@ You should see:
 
 ### 6. Setup Dashboard
 
-**Clone the dashboard repo:**
+Install and run the dashboard:
 ```bash
-git clone https://github.com/0xfarme/limitless-dashboard.git
-cd limitless-dashboard
+# Dashboard is in a separate repository
 npm install
 npm run dev
 ```
 
 Open http://localhost:5173 - you should see your live dashboard!
-
-**Dashboard Repository**: https://github.com/0xfarme/limitless-dashboard
 
 ## What You'll See
 
