@@ -1945,7 +1945,7 @@ async function runForWallet(wallet, provider) {
         }
 
         // Determine profit target based on strategy
-        const strategyType = localHoldingThisMarket.strategy || 'default';
+        const strategyType = holding?.strategy || 'default';
         const profitTarget = strategyType === 'early_contrarian' ? EARLY_PROFIT_TARGET_PCT : TARGET_PROFIT_PCT;
 
         // Hold positions during last 13 minutes if using last-minute strategy - don't take profits early
