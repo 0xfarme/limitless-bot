@@ -907,6 +907,63 @@ async function checkAndRedeemPosition(wallet, marketData, holding, conditionalTo
     logInfo(wallet.address, didWeWin ? '🎉' : '😢',
       `[${marketAddress.substring(0, 8)}...] We held outcome ${ourOutcome}, winning outcome is ${winningOutcome} - ${winStatus}`);
 
+    // CRITICAL: Check if we actually still hold the position tokens before attempting redemption
+    // Get position IDs from market data
+    const positionIds = marketInfo.positionIds || [];
+    if (!positionIds || positionIds.length < 2) {
+      logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] No positionIds in market data, cannot verify token balance`);
+      logRedemption({
+        event: 'NO_POSITION_IDS',
+        wallet: wallet.address,
+        marketAddress: marketAddress,
+        marketInfo: marketInfo
+      });
+      return false;
+    }
+
+    // Get ERC1155 contract (ConditionalTokens)
+    const erc1155 = new ethers.Contract(
+      conditionalTokensContract.target,
+      ERC1155_ABI,
+      wallet
+    );
+
+    const pid0 = BigInt(positionIds[0]);
+    const pid1 = BigInt(positionIds[1]);
+    const bal0 = await safeBalanceOf(erc1155, wallet.address, pid0);
+    const bal1 = await safeBalanceOf(erc1155, wallet.address, pid1);
+
+    logInfo(wallet.address, '🎟️', `[${marketAddress.substring(0, 8)}...] Token balances: pid0=${pid0} (${bal0}) | pid1=${pid1} (${bal1})`);
+    logRedemption({
+      event: 'TOKEN_BALANCE_CHECK',
+      wallet: wallet.address,
+      marketAddress: marketAddress,
+      pid0: pid0.toString(),
+      pid1: pid1.toString(),
+      bal0: bal0.toString(),
+      bal1: bal1.toString()
+    });
+
+    // Check if we have ANY tokens to redeem
+    const hasTokens = (bal0 > 0n) || (bal1 > 0n);
+    if (!hasTokens) {
+      logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] No tokens found on-chain - position was likely already sold or redeemed. Removing from local state.`);
+      logRedemption({
+        event: 'NO_TOKENS_FOUND',
+        wallet: wallet.address,
+        marketAddress: marketAddress,
+        reason: 'Position already sold/redeemed'
+      });
+
+      // Remove holding from local state since it's already closed
+      removeHolding(wallet.address, marketAddress);
+      markMarketCompleted(wallet.address, marketAddress);
+
+      return false;
+    }
+
+    logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Tokens confirmed on-chain, proceeding with redemption`);
+
     // Check balance before redemption to estimate winnings
     const balanceBefore = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
 
