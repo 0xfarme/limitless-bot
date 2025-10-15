@@ -76,6 +76,12 @@ const EARLY_WINDOW_MINUTES = parseInt(process.env.EARLY_WINDOW_MINUTES || '30', 
 const EARLY_TRIGGER_ODDS = parseInt(process.env.EARLY_TRIGGER_ODDS || '70', 10); // Buy opposite side if one side reaches N%
 const EARLY_PROFIT_TARGET_PCT = parseInt(process.env.EARLY_PROFIT_TARGET_PCT || '20', 10); // Sell at N% profit
 
+// ========= Moonshot Strategy Config =========
+const MOONSHOT_ENABLED = (process.env.MOONSHOT_ENABLED || 'true').toLowerCase() === 'true'; // Enable moonshot strategy
+const MOONSHOT_WINDOW_MINUTES = parseInt(process.env.MOONSHOT_WINDOW_MINUTES || '2', 10); // Moonshot triggers in last N minutes
+const MOONSHOT_AMOUNT_USDC = parseFloat(process.env.MOONSHOT_AMOUNT_USDC || '1'); // Amount to invest in moonshot
+const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_PCT || '100', 10); // Sell at N% profit
+
 // ========= Partial Sell Config =========
 const PARTIAL_SELL_ENABLED = (process.env.PARTIAL_SELL_ENABLED || 'true').toLowerCase() === 'true'; // Enable partial sells at profit target
 const PARTIAL_SELL_PCT = parseInt(process.env.PARTIAL_SELL_PCT || '90', 10); // Sell N% of position at profit target (keep rest riding)
@@ -1915,6 +1921,7 @@ async function runForWallet(wallet, provider) {
       let inLastTwoMinutes = false;
       let inLastThreeMinutes = false;
       let inEarlyWindow = false;
+      let inMoonshotWindow = false;
 
       if (marketInfo.createdAt) {
         const createdMs = new Date(marketInfo.createdAt).getTime();
@@ -1956,6 +1963,12 @@ async function runForWallet(wallet, provider) {
           if (remainingMs <= BUY_WINDOW_MINUTES * 60 * 1000 && remainingMs > 0) {
             inLastThirteenMinutes = true;
             logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last ${BUY_WINDOW_MINUTES} minutes (${remMin}m remaining) - can buy if ${MIN_ODDS}-${MAX_ODDS}%`);
+          }
+
+          // Check if in moonshot window
+          inMoonshotWindow = remainingMs <= MOONSHOT_WINDOW_MINUTES * 60 * 1000 && remainingMs > 0;
+          if (inMoonshotWindow && MOONSHOT_ENABLED) {
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] In moonshot window (last ${MOONSHOT_WINDOW_MINUTES} minutes) - contrarian bets enabled`);
           }
 
           if (remainingMs < 5 * 60 * 1000) {
@@ -2176,7 +2189,12 @@ async function runForWallet(wallet, provider) {
 
         // Determine profit target based on strategy
         const strategyType = holding?.strategy || 'default';
-        const profitTarget = strategyType === 'early_contrarian' ? EARLY_PROFIT_TARGET_PCT : TARGET_PROFIT_PCT;
+        let profitTarget = TARGET_PROFIT_PCT; // Default for 'default' strategy
+        if (strategyType === 'early_contrarian') {
+          profitTarget = EARLY_PROFIT_TARGET_PCT;
+        } else if (strategyType === 'moonshot') {
+          profitTarget = MOONSHOT_PROFIT_TARGET_PCT;
+        }
 
         // Hold positions during last 13 minutes if using last-minute strategy - don't take profits early
         if (inLastThirteenMinutes && strategyType === 'default') {
@@ -2370,6 +2388,31 @@ async function runForWallet(wallet, provider) {
 
         // Check allowance and execute buy (same as normal flow)
         await executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155);
+
+        // After late window buy, check if we should place moonshot contrarian bet
+        if (MOONSHOT_ENABLED && inMoonshotWindow) {
+          const moonshotStrategy = 'moonshot';
+          const moonshotHolding = getHolding(wallet.address, marketAddress, moonshotStrategy);
+
+          if (!moonshotHolding) {
+            // Buy the opposite side of what we just bought
+            const moonshotOutcome = outcomeToBuy === 0 ? 1 : 0;
+            const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
+
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot! Bought side ${outcomeToBuy}, now buying opposite side ${moonshotOutcome} at ${prices[moonshotOutcome]}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
+
+            // Check USDC balance for moonshot
+            const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+            if (usdcBalAfter >= moonshotInvestment) {
+              await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy);
+            } else {
+              logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need ${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
+            }
+          } else {
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot position already exists - skipping`);
+          }
+        }
+
         return;
       }
 
@@ -2496,6 +2539,9 @@ async function main() {
     console.log(`   🌅 Early Trading: Minutes 0-${EARLY_WINDOW_MINUTES} (contrarian buys)`);
   }
   console.log(`   🎯 Late Trading: Minutes ${60 - BUY_WINDOW_MINUTES}-60 (last minute strategy)`);
+  if (MOONSHOT_ENABLED) {
+    console.log(`   🌙 Moonshot: Last ${MOONSHOT_WINDOW_MINUTES} minutes ($${MOONSHOT_AMOUNT_USDC} contrarian bet on opposite side)`);
+  }
 
   // Calculate sleep periods
   const sleepPeriods = [];
