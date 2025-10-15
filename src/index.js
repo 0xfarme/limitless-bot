@@ -1976,7 +1976,13 @@ async function runForWallet(wallet, provider) {
         const valueHuman = fmtUnitsPrec(positionValue, decimals, 4);
         const costHuman = fmtUnitsPrec(cost, decimals, 4);
         const pnlAbsHuman = fmtUnitsPrec(pnlAbs >= 0n ? pnlAbs : -pnlAbs, decimals, 4);
-        logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] Position: value=${valueHuman} cost=${costHuman} PnL=${pnlPct.toFixed(2)}% ${signEmoji}${pnlAbsHuman} USDC`);
+
+        // Get current price and entry price
+        const currentPrice = prices[outcomeIndex] || 'N/A';
+        const entryPrice = holding.entryPrice || 'N/A';
+        const strategyLabel = (holding.strategy || 'default').toUpperCase();
+
+        logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] [${strategyLabel}] Position Side ${outcomeIndex}: Entry ${entryPrice}% → Now ${currentPrice}% | Value=${valueHuman} Cost=${costHuman} | PnL=${pnlPct.toFixed(2)}% ${signEmoji}${pnlAbsHuman} USDC`);
 
         // Stop loss: sell if our position's odds drop below threshold in last 2 minutes
         if (inLastThreeMinutes) {
