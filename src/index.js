@@ -1324,15 +1324,29 @@ async function runForWallet(wallet, provider) {
 
   async function tick() {
     // Check if bot should be active right now - do this FIRST to avoid unnecessary work during sleep
-    const isActive = shouldBeActive(wallet);
     const nowMinutes = new Date().getMinutes();
     const holdings = getAllHoldings(wallet.address);
+    const isActive = shouldBeActive(wallet);
+
+    // Enhanced redemption window logging
+    const inRedemptionWindow = AUTO_REDEEM_ENABLED && nowMinutes >= REDEEM_WINDOW_START && nowMinutes <= REDEEM_WINDOW_END;
+    if (inRedemptionWindow && holdings.length > 0) {
+      logInfo(wallet.address, '🔔', `REDEMPTION ALERT: In redemption window (minute ${nowMinutes}) with ${holdings.length} position(s) - isActive=${isActive}`);
+      holdings.forEach(h => {
+        logInfo(wallet.address, '📋', `  - Position: ${h.marketAddress.substring(0, 8)}... outcome=${h.outcomeIndex} cost=${h.cost} strategy=${h.strategy || 'default'}`);
+      });
+    }
 
     if (!isActive) {
       const nextWakeMs = getNextWakeTime();
       const nextWakeMinutes = Math.floor(nextWakeMs / 60000);
       const nextWakeSeconds = Math.floor((nextWakeMs % 60000) / 1000);
       logInfo(wallet.address, '💤', `Bot in sleep mode (minute ${nowMinutes}, ${holdings.length} positions) - Next wake in ${nextWakeMinutes}m ${nextWakeSeconds}s`);
+
+      // Critical warning if we have positions but bot is sleeping during redemption window
+      if (inRedemptionWindow && holdings.length > 0) {
+        logWarn(wallet.address, '⚠️', `WARNING: Bot is sleeping during redemption window with ${holdings.length} positions! This should not happen!`);
+      }
       return;
     }
 
@@ -1359,11 +1373,16 @@ async function runForWallet(wallet, provider) {
       const nowMinutes = new Date().getMinutes();
       const inRedemptionWindow = AUTO_REDEEM_ENABLED && nowMinutes >= REDEEM_WINDOW_START && nowMinutes <= REDEEM_WINDOW_END;
 
+      // Log redemption window status every tick during the window
+      if (AUTO_REDEEM_ENABLED && nowMinutes >= REDEEM_WINDOW_START && nowMinutes <= REDEEM_WINDOW_END) {
+        logInfo(wallet.address, '🕐', `Currently in REDEMPTION WINDOW (minute ${nowMinutes}, window: ${REDEEM_WINDOW_START}-${REDEEM_WINDOW_END})`);
+      }
+
       if (inRedemptionWindow) {
         // Check for positions that need redemption using local state
         const myHoldings = getAllHoldings(wallet.address);
         if (myHoldings.length > 0) {
-          logInfo(wallet.address, '🕐', `Redemption window active (minutes ${REDEEM_WINDOW_START}-${REDEEM_WINDOW_END}) - checking ${myHoldings.length} position(s)...`);
+          logInfo(wallet.address, '💰', `Redemption window active - checking ${myHoldings.length} position(s)...`);
 
           // Log redemption check start
           logRedemption({
@@ -1528,7 +1547,13 @@ async function runForWallet(wallet, provider) {
               if (redeemed) {
                 logInfo(wallet.address, '✅', `[${holding.marketAddress.substring(0, 8)}...] Position redeemed successfully`);
               } else {
-                logInfo(wallet.address, '⏭️', `[${holding.marketAddress.substring(0, 8)}...] Position not redeemed (market not ready or already claimed)`);
+                logInfo(wallet.address, '⏭️', `[${holding.marketAddress.substring(0, 8)}...] Position not redeemed - Check redemptions.jsonl for details`);
+                logRedemption({
+                  event: 'REDEMPTION_SKIPPED_SUMMARY',
+                  wallet: wallet.address,
+                  marketAddress: holding.marketAddress,
+                  reason: 'Check previous redemption log entries for details (market not resolved, already claimed, or no tokens)'
+                });
               }
 
               // Add small delay between redemption checks to avoid rate limits
