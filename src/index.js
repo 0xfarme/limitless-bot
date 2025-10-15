@@ -2049,33 +2049,64 @@ async function runForWallet(wallet, provider) {
         // positionValue = (balance / tokensNeededForCost) * initialInvestment
         const cost = holding.cost; // initial investment in collateral units
         let tokensNeededForCost;
+        let calcSellFailed = false;
+
         try {
           tokensNeededForCost = await market.calcSellAmount(cost, outcomeIndex);
         } catch (e) {
-          logErr(wallet.address, '💥', 'calcSellAmount(cost) failed for value calc', e && e.message ? e.message : e);
-          return;
-        }
-        if (tokensNeededForCost === 0n) {
-          logWarn(wallet.address, '⚠️', 'calcSellAmount returned 0 for cost; skipping PnL calc this tick.');
-          return;
-        }
-        const positionValue = (tokenBalance * cost) / tokensNeededForCost; // floor
-        const pnlAbs = positionValue - cost; // signed
-        const pnlPct = cost > 0n ? Number((pnlAbs * 10000n) / cost) / 100 : 0;
-        const signEmoji = pnlAbs >= 0n ? '🔺' : '🔻';
-        const valueHuman = fmtUnitsPrec(positionValue, decimals, 4);
-        const costHuman = fmtUnitsPrec(cost, decimals, 4);
-        const pnlAbsHuman = fmtUnitsPrec(pnlAbs >= 0n ? pnlAbs : -pnlAbs, decimals, 4);
+          calcSellFailed = true;
+          const errorMsg = e?.reason || e?.message || String(e);
 
-        // Get current price and entry price
-        const currentPrice = prices[outcomeIndex] || 'N/A';
-        const entryPrice = holding.entryPrice || 'N/A';
-        const strategyLabel = (holding.strategy || 'default').toUpperCase();
+          // Check if market is likely closed/expired
+          if (errorMsg.includes('subtraction overflow') || errorMsg.includes('insufficient liquidity')) {
+            logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] calcSellAmount failed (likely market closed/expired): ${errorMsg.substring(0, 100)}`);
+            logInfo(wallet.address, '💡', `[${marketAddress.substring(0, 8)}...] Position may need redemption - check during redemption window`);
+          } else {
+            logErr(wallet.address, '💥', `[${marketAddress.substring(0, 8)}...] calcSellAmount failed: ${errorMsg.substring(0, 100)}`);
+          }
 
-        logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] [${strategyLabel}] Position Side ${outcomeIndex}: Entry ${entryPrice}% → Now ${currentPrice}% | Value=${valueHuman} Cost=${costHuman} | PnL=${pnlPct.toFixed(2)}% ${signEmoji}${pnlAbsHuman} USDC`);
+          // Don't return - continue processing to check if market needs redemption
+          // But we can't calculate PnL, so skip position value display
+        }
+
+        if (!calcSellFailed && tokensNeededForCost === 0n) {
+          logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] calcSellAmount returned 0 - market may be closed or have no liquidity`);
+          calcSellFailed = true;
+        }
+
+        // Only calculate PnL if calcSellAmount succeeded
+        let positionValue = 0n;
+        let pnlAbs = 0n;
+        let pnlPct = 0;
+
+        if (!calcSellFailed) {
+          positionValue = (tokenBalance * cost) / tokensNeededForCost; // floor
+          pnlAbs = positionValue - cost; // signed
+          pnlPct = cost > 0n ? Number((pnlAbs * 10000n) / cost) / 100 : 0;
+          const signEmoji = pnlAbs >= 0n ? '🔺' : '🔻';
+          const valueHuman = fmtUnitsPrec(positionValue, decimals, 4);
+          const costHuman = fmtUnitsPrec(cost, decimals, 4);
+          const pnlAbsHuman = fmtUnitsPrec(pnlAbs >= 0n ? pnlAbs : -pnlAbs, decimals, 4);
+
+          // Get current price and entry price
+          const currentPrice = prices[outcomeIndex] || 'N/A';
+          const entryPrice = holding.entryPrice || 'N/A';
+          const strategyLabel = (holding.strategy || 'default').toUpperCase();
+
+          logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] [${strategyLabel}] Position Side ${outcomeIndex}: Entry ${entryPrice}% → Now ${currentPrice}% | Value=${valueHuman} Cost=${costHuman} | PnL=${pnlPct.toFixed(2)}% ${signEmoji}${pnlAbsHuman} USDC`);
+        } else {
+          // Can't calculate PnL, just show basic position info
+          const currentPrice = prices[outcomeIndex] || 'N/A';
+          const entryPrice = holding.entryPrice || 'N/A';
+          const strategyLabel = (holding.strategy || 'default').toUpperCase();
+          const costHuman = fmtUnitsPrec(cost, decimals, 4);
+
+          logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] [${strategyLabel}] Position Side ${outcomeIndex}: Entry ${entryPrice}% → Now ${currentPrice}% | Balance=${tokenBalance.toString()} tokens | Cost=${costHuman} USDC (PnL unavailable - market may be closed)`);
+        }
 
         // Stop loss: sell if our position's odds drop below threshold in last 2 minutes
-        if (inLastThreeMinutes) {
+        // Skip if calcSellAmount failed (market likely closed)
+        if (inLastThreeMinutes && !calcSellFailed) {
           const ourPositionPrice = prices[outcomeIndex];
 
           if (ourPositionPrice < STOP_LOSS_ODDS_THRESHOLD) {
@@ -2142,7 +2173,8 @@ async function runForWallet(wallet, provider) {
         // Check if we already took profits on this position (for partial sells)
         const alreadyTookProfit = holding?.profitTaken === true;
 
-        if (pnlAbs > 0n && pnlPct >= profitTarget && !alreadyTookProfit) {
+        // Only attempt profit-taking if calcSellAmount succeeded (market is active)
+        if (!calcSellFailed && pnlAbs > 0n && pnlPct >= profitTarget && !alreadyTookProfit) {
           // Determine if this is a partial or full sell
           const isPartialSell = PARTIAL_SELL_ENABLED;
           const sellPercentage = isPartialSell ? PARTIAL_SELL_PCT : 100;
