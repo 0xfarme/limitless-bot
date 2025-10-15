@@ -382,23 +382,51 @@ function updateStats(pnlUSDC) {
 function addHolding(addr, holding) {
   const prev = userState.get(addr) || { holdings: [], completedMarkets: new Set() };
   const holdings = prev.holdings || [];
-  // Remove any existing holding for same market before adding new one
-  const filtered = holdings.filter(h => h.marketAddress.toLowerCase() !== holding.marketAddress.toLowerCase());
+  // Remove any existing holding for same market+strategy before adding new one
+  const strategy = holding.strategy || 'default';
+  const filtered = holdings.filter(h => {
+    const isSameMarket = h.marketAddress.toLowerCase() === holding.marketAddress.toLowerCase();
+    const isSameStrategy = (h.strategy || 'default') === strategy;
+    return !(isSameMarket && isSameStrategy);
+  });
   filtered.push(holding);
   userState.set(addr, { ...prev, holdings: filtered });
   scheduleSave();
 }
-function removeHolding(addr, marketAddress) {
+function removeHolding(addr, marketAddress, strategy = null) {
   const prev = userState.get(addr) || { holdings: [], completedMarkets: new Set() };
   const holdings = prev.holdings || [];
-  const filtered = holdings.filter(h => h.marketAddress.toLowerCase() !== marketAddress.toLowerCase());
+  const filtered = holdings.filter(h => {
+    const isSameMarket = h.marketAddress.toLowerCase() === marketAddress.toLowerCase();
+    if (!strategy) {
+      // If no strategy specified, remove all holdings for this market
+      return !isSameMarket;
+    }
+    // Remove only holdings for this market+strategy combination
+    const isSameStrategy = (h.strategy || 'default') === strategy;
+    return !(isSameMarket && isSameStrategy);
+  });
   userState.set(addr, { ...prev, holdings: filtered });
   scheduleSave();
 }
-function getHolding(addr, marketAddress) {
+function getHolding(addr, marketAddress, strategy = null) {
   const st = userState.get(addr);
   if (!st || !st.holdings) return null;
-  return st.holdings.find(h => h.marketAddress.toLowerCase() === marketAddress.toLowerCase()) || null;
+  if (!strategy) {
+    // If no strategy specified, return any holding for this market
+    return st.holdings.find(h => h.marketAddress.toLowerCase() === marketAddress.toLowerCase()) || null;
+  }
+  // Return holding for specific market+strategy combination
+  return st.holdings.find(h => {
+    const isSameMarket = h.marketAddress.toLowerCase() === marketAddress.toLowerCase();
+    const isSameStrategy = (h.strategy || 'default') === strategy;
+    return isSameMarket && isSameStrategy;
+  }) || null;
+}
+function getHoldingsForMarket(addr, marketAddress) {
+  const st = userState.get(addr);
+  if (!st || !st.holdings) return [];
+  return st.holdings.filter(h => h.marketAddress.toLowerCase() === marketAddress.toLowerCase());
 }
 function getAllHoldings(addr) {
   const st = userState.get(addr);
@@ -1845,8 +1873,8 @@ async function runForWallet(wallet, provider) {
 
       const { market, usdc, erc1155, decimals } = cachedContracts.get(marketAddress);
 
-      // Check if user already holds any position for this market
-      const localHoldingThisMarket = getHolding(wallet.address, marketAddress);
+      // Check ALL positions for this market (could have multiple strategies)
+      const allHoldingsThisMarket = getHoldingsForMarket(wallet.address, marketAddress);
       const pid0 = positionIds[0] ? BigInt(positionIds[0]) : null;
       const pid1 = positionIds[1] ? BigInt(positionIds[1]) : null;
 
@@ -1859,7 +1887,10 @@ async function runForWallet(wallet, provider) {
       }
       logInfo(wallet.address, '🎟️', `[${marketAddress.substring(0, 8)}...] Balances: pid0=${pid0 ?? 'null'} (${bal0}) | pid1=${pid1 ?? 'null'} (${bal1})`);
       const hasOnchain = (bal0 > 0n) || (bal1 > 0n);
-      const hasAny = hasOnchain || !!localHoldingThisMarket;
+      const hasLocalHoldings = allHoldingsThisMarket.length > 0;
+      const hasAny = hasOnchain || hasLocalHoldings;
+
+      // Process ALL existing positions for this market
       if (hasAny) {
         // Determine which outcome is held, then ensure we have cost basis
         let outcomeIndex = null;
@@ -2064,12 +2095,11 @@ async function runForWallet(wallet, provider) {
           logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] Not profitable yet: PnL=${pnlPct.toFixed(2)}% < ${profitTarget}% (${strategyType} strategy)`);
         }
 
-        // Already holding; do not buy more
-        logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Already holding a position. Skipping buy.`);
-        return;
+        // Don't return here - continue to check if other strategies can buy
+        // The strategy-specific buy checks below will handle whether to buy
       }
 
-      // Not holding any position -> maybe buy per strategy
+      // Check if we should buy with any strategy (independent of existing positions)
       if (!Array.isArray(prices) || prices.length < 2) {
         logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Prices unavailable; skipping.`);
         return;
@@ -2101,6 +2131,14 @@ async function runForWallet(wallet, provider) {
 
       // NEW LOGIC: Check if we should use last 13 minutes strategy
       if (inLastThirteenMinutes) {
+        // Check if late strategy already has a position
+        const lateStrategy = 'default';
+        const lateHolding = getHolding(wallet.address, marketAddress, lateStrategy);
+        if (lateHolding) {
+          logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Late window strategy already has a position - skipping buy`);
+          return;
+        }
+
         // Check if in last 2 minutes - don't buy
         if (inLastTwoMinutes) {
           logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] In last 2 minutes - not buying`);
@@ -2122,7 +2160,6 @@ async function runForWallet(wallet, provider) {
 
         // Buy the side that is in odds range
         const outcomeToBuy = prices[0] >= MIN_ODDS && prices[0] <= MAX_ODDS ? 0 : 1;
-        const lateStrategy = 'default';
         const investmentHuman = getBuyAmountForStrategy(lateStrategy);
         logInfo(wallet.address, '🎯', `[${marketAddress.substring(0, 8)}...] Last ${BUY_WINDOW_MINUTES}min strategy: Buying outcome ${outcomeToBuy} at ${prices[outcomeToBuy]}% with $${investmentHuman} USDC`);
 
@@ -2147,6 +2184,14 @@ async function runForWallet(wallet, provider) {
 
       // Early contrarian strategy: Buy opposite side if one side reaches 70%+ in first 30 minutes
       if (inEarlyWindow && !tooNewForBet && !nearDeadlineForBet) {
+        // Check if early strategy already has a position
+        const earlyStrategy = 'early_contrarian';
+        const earlyHolding = getHolding(wallet.address, marketAddress, earlyStrategy);
+        if (earlyHolding) {
+          logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Early contrarian strategy already has a position - skipping buy`);
+          return;
+        }
+
         // Check if either side has reached the trigger threshold
         const maxPrice = Math.max(...prices);
 
@@ -2155,7 +2200,6 @@ async function runForWallet(wallet, provider) {
           const dominantSide = prices[0] >= EARLY_TRIGGER_ODDS ? 0 : 1;
           const outcomeToBuy = dominantSide === 0 ? 1 : 0;
 
-          const earlyStrategy = 'early_contrarian';
           const investmentHuman = getBuyAmountForStrategy(earlyStrategy);
           logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Early contrarian: Side ${dominantSide} at ${prices[dominantSide]}% (>= ${EARLY_TRIGGER_ODDS}%), buying opposite side ${outcomeToBuy} at ${prices[outcomeToBuy]}% with $${investmentHuman} USDC`);
 
