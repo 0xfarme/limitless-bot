@@ -2207,6 +2207,72 @@ async function runForWallet(wallet, provider) {
           return;
         }
 
+        // Early contrarian strategy: Force sell at minute 45 to clear for late strategy
+        if (strategyType === 'early_contrarian') {
+          const now = new Date();
+          const currentMinute = now.getMinutes();
+
+          // At minute 45: Force sell if profitable, keep if losing
+          if (currentMinute === 45) {
+            if (!calcSellFailed && pnlAbs > 0n) {
+              // In profit - force sell entire position
+              logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] Minute 45 - Force selling early_contrarian position (PnL=${pnlPct.toFixed(2)}%) to clear for late strategy`);
+
+              const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
+              if (!approvedOk) {
+                logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping force sell this tick.');
+                return;
+              }
+
+              // Sell entire position
+              const maxOutcomeTokensToSell = tokenBalance;
+              const returnAmountForSell = positionValue > 0n ? positionValue - (positionValue / 100n) : 0n;
+
+              logInfo(wallet.address, '🧮', `Force sell 100%: maxTokens=${maxOutcomeTokensToSell}, returnAmount=${returnAmountForSell}`);
+
+              const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
+              if (!gasEst) {
+                logWarn(wallet.address, '🛑', 'Gas estimate sell failed; skipping force sell this tick.');
+                return;
+              }
+
+              const padded = (gasEst * 120n) / 100n + 10000n;
+              const sellOv = await txOverrides(wallet.provider, padded);
+              const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
+              logInfo(wallet.address, '🧾', `Force sell tx: ${tx.hash}`);
+              const receipt = await tx.wait(CONFIRMATIONS);
+
+              const pnlUSDC = parseFloat(ethers.formatUnits(positionValue - cost, decimals));
+              logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Early contrarian force sold at minute 45. PnL=${pnlPct.toFixed(2)}%`);
+
+              logTrade({
+                type: 'SELL_EARLY_FORCE',
+                wallet: wallet.address,
+                marketAddress,
+                marketTitle: marketInfo?.title || 'Unknown',
+                outcome: outcomeIndex,
+                costUSDC: ethers.formatUnits(cost, decimals),
+                returnUSDC: ethers.formatUnits(positionValue, decimals),
+                pnlUSDC: pnlUSDC.toFixed(4),
+                pnlPercent: pnlPct.toFixed(2),
+                reason: `Minute 45 force sell - clearing for late strategy`,
+                txHash: tx.hash,
+                blockNumber: receipt.blockNumber,
+                gasUsed: receipt.gasUsed.toString()
+              });
+              updateStats(pnlUSDC);
+
+              removeHolding(wallet.address, marketAddress, 'early_contrarian');
+              logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed early_contrarian holding after force sell`);
+              return;
+            } else if (pnlAbs <= 0n) {
+              // In loss - keep position, let it ride for potential recovery
+              logInfo(wallet.address, '📉', `[${marketAddress.substring(0, 8)}...] Minute 45 - Early contrarian in loss (PnL=${pnlPct.toFixed(2)}%) - keeping position to ride out`);
+              return;
+            }
+          }
+        }
+
         // Check if we already took profits on this position (for partial sells)
         const alreadyTookProfit = holding?.profitTaken === true;
 
@@ -2215,10 +2281,33 @@ async function runForWallet(wallet, provider) {
 
         // Only attempt profit-taking if calcSellAmount succeeded (market is active)
         if (!calcSellFailed && pnlAbs > 0n && pnlPct >= profitTarget && !alreadyTookProfit) {
-          // Determine if this is a partial or full sell
-          const isPartialSell = PARTIAL_SELL_ENABLED;
-          const sellPercentage = isPartialSell ? PARTIAL_SELL_PCT : 100;
-          const keepPercentage = 100 - sellPercentage;
+          // Special handling for early_contrarian: Lock in 30% profit, let rest ride
+          let sellPercentage = 100;
+          let keepPercentage = 0;
+
+          if (strategyType === 'early_contrarian') {
+            // Calculate how much to sell to lock in exactly 30% profit
+            // If we're at 160% profit, we want to sell enough so that remaining = cost + 30% of cost
+            // Remaining value = cost * 1.30
+            // Sell value = current value - remaining value
+            const targetRemainingValue = cost + (cost * 30n) / 100n; // cost * 1.30
+
+            if (positionValue > targetRemainingValue) {
+              // Calculate what % to sell to leave targetRemainingValue
+              sellPercentage = Number((positionValue - targetRemainingValue) * 100n / positionValue);
+              keepPercentage = 100 - sellPercentage;
+              logInfo(wallet.address, '🔒', `[${marketAddress.substring(0, 8)}...] Early contrarian at ${pnlPct.toFixed(2)}% profit - selling ${sellPercentage.toFixed(1)}% to lock in 30% profit, keeping ${keepPercentage.toFixed(1)}% riding`);
+            } else {
+              // Already below or at 30% profit target, sell everything
+              sellPercentage = 100;
+              keepPercentage = 0;
+            }
+          } else {
+            // Other strategies: Use partial sell configuration
+            const isPartialSell = PARTIAL_SELL_ENABLED;
+            sellPercentage = isPartialSell ? PARTIAL_SELL_PCT : 100;
+            keepPercentage = 100 - sellPercentage;
+          }
 
           logInfo(wallet.address, '🎯', `Profit target reached! PnL=${pnlPct.toFixed(2)}% >= ${profitTarget}% (${strategyType} strategy). Initiating ${sellPercentage}% sell (keeping ${keepPercentage}% riding)...`);
 
@@ -2280,12 +2369,12 @@ async function runForWallet(wallet, provider) {
           });
           updateStats(pnlUSDC);
 
-          if (isPartialSell) {
-            // Update holding to reflect remaining position
+          if (keepPercentage > 0) {
+            // Partial sell - update holding to reflect remaining position
             const remainingTokens = tokenBalance - tokensToSell;
             const remainingCost = cost - partialCost;
 
-            logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Keeping ${keepPercentage}% position (${remainingTokens} tokens, cost=${ethers.formatUnits(remainingCost, decimals)} USDC) - letting it ride!`);
+            logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Keeping ${keepPercentage.toFixed(1)}% position (${remainingTokens} tokens, cost=${ethers.formatUnits(remainingCost, decimals)} USDC) - letting it ride!`);
 
             // Update the holding with remaining amounts
             const updatedHolding = {
