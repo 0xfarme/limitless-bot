@@ -1097,6 +1097,15 @@ async function runForWallet(wallet, provider) {
   }
 
   async function tick() {
+    // Check if bot should be active right now - do this FIRST to avoid unnecessary work during sleep
+    if (!shouldBeActive()) {
+      const nextWakeMs = getNextWakeTime();
+      const nextWakeMinutes = Math.floor(nextWakeMs / 60000);
+      const nextWakeSeconds = Math.floor((nextWakeMs % 60000) / 1000);
+      logInfo(wallet.address, '💤', `Bot in sleep mode - not in active trading/redemption window. Next wake in ${nextWakeMinutes}m ${nextWakeSeconds}s`);
+      return;
+    }
+
     // Clear buyingInProgress at start of each tick - it's just for preventing concurrent buys within same tick
     buyingInProgress.clear();
 
@@ -1107,17 +1116,8 @@ async function runForWallet(wallet, provider) {
       currentHourForInactive = nowHour;
       logInfo(wallet.address, '🔄', `New hour started - cleared inactive markets cache`);
 
-      // Show positions summary at the start of each hour
+      // Show positions summary at the start of each hour (only during active periods)
       logPositionsSummary(wallet.address);
-    }
-
-    // Check if bot should be active right now
-    if (!shouldBeActive()) {
-      const nextWakeMs = getNextWakeTime();
-      const nextWakeMinutes = Math.floor(nextWakeMs / 60000);
-      const nextWakeSeconds = Math.floor((nextWakeMs % 60000) / 1000);
-      logInfo(wallet.address, '💤', `Bot in sleep mode - not in active trading/redemption window. Next wake in ${nextWakeMinutes}m ${nextWakeSeconds}s`);
-      return;
     }
 
     try {
