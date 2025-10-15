@@ -2544,18 +2544,26 @@ async function runForWallet(wallet, provider) {
 
         // After late window buy, check if we should place moonshot contrarian bet
         if (MOONSHOT_ENABLED && inMoonshotWindow) {
-          // Check if we have ANY existing position on this market (any strategy)
-          const allHoldingsForMarket = getHoldingsForMarket(wallet.address, marketAddress);
+          // Moonshot is always the opposite side of what we just bought
+          const moonshotOutcome = outcomeToBuy === 0 ? 1 : 0;
 
-          if (allHoldingsForMarket.length > 1) {
-            // We already have at least 2 positions (the one we just bought + another)
-            // Don't add moonshot - we already have exposure
-            const existingStrategies = allHoldingsForMarket.map(h => h.strategy || 'default').join(', ');
-            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - already have ${allHoldingsForMarket.length} positions (${existingStrategies})`);
+          // Check if we already have a position on the opposite side from early contrarian
+          const allHoldingsForMarket = getHoldingsForMarket(wallet.address, marketAddress);
+          const oppositePositionExists = allHoldingsForMarket.some(h =>
+            h.outcomeIndex === moonshotOutcome && h.strategy !== 'default'
+          );
+
+          if (oppositePositionExists) {
+            // Already have opposite side covered (e.g., early contrarian on NO)
+            // Just ride that position instead of opening new moonshot
+            const existingPosition = allHoldingsForMarket.find(h =>
+              h.outcomeIndex === moonshotOutcome && h.strategy !== 'default'
+            );
+            const existingStrategy = existingPosition?.strategy || 'unknown';
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - already have opposite side covered by ${existingStrategy} (riding that position)`);
           } else {
-            // Only have 1 position (the one we just bought) - safe to add moonshot
+            // No opposite position exists - place moonshot bet
             const moonshotStrategy = 'moonshot';
-            const moonshotOutcome = outcomeToBuy === 0 ? 1 : 0;
             const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
 
             logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot! Bought side ${outcomeToBuy}, now buying opposite side ${moonshotOutcome} at ${prices[moonshotOutcome]}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
