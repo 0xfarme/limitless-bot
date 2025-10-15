@@ -1899,8 +1899,10 @@ async function runForWallet(wallet, provider) {
         if (bal0 > 0n) { outcomeIndex = 0; tokenId = pid0; tokenBalance = bal0; }
         if (bal1 > 0n) { outcomeIndex = 1; tokenId = pid1; tokenBalance = bal1; }
 
+        // Find matching holding from local state (match by tokenId)
+        let holding = allHoldingsThisMarket.find(h => h.tokenId === tokenId);
+
         // Initialize cost basis from env if missing
-        let holding = localHoldingThisMarket;
         if (!holding || holding.tokenId !== tokenId) {
           const assumedCost = ethers.parseUnits(BUY_AMOUNT_USDC.toString(), decimals);
           holding = { marketAddress, outcomeIndex, tokenId, amount: tokenBalance, cost: assumedCost };
