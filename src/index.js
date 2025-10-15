@@ -53,7 +53,27 @@ const REDEEM_WINDOW_START = parseInt(process.env.REDEEM_WINDOW_START || '6', 10)
 const REDEEM_WINDOW_END = parseInt(process.env.REDEEM_WINDOW_END || '10', 10); // Redemption window end minute (0-59)
 
 // ========= Simulation Mode Config =========
-const SIMULATION_MODE = (process.env.SIMULATION_MODE || 'false').toLowerCase() === 'true'; // Enable simulation mode (no real transactions)
+// Global simulation mode - set to 'true' to simulate ALL strategies
+const SIMULATION_MODE = (process.env.SIMULATION_MODE || 'false').toLowerCase() === 'true';
+
+// Per-strategy simulation flags - allows mixing live and simulated strategies
+// Format: 'all', 'none', 'early', 'late', or combinations like 'early,late'
+const SIMULATE_STRATEGIES = (process.env.SIMULATE_STRATEGIES || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+
+// Helper function to check if a strategy should be simulated
+function shouldSimulateStrategy(strategy) {
+  // Global simulation mode overrides everything
+  if (SIMULATION_MODE) return true;
+
+  // Check if 'all' is in the list
+  if (SIMULATE_STRATEGIES.includes('all')) return true;
+
+  // Check if this specific strategy is in the list
+  // Normalize strategy names: 'early_contrarian' -> 'early', 'default' -> 'late'
+  const normalizedStrategy = strategy.includes('early') ? 'early' : 'late';
+  return SIMULATE_STRATEGIES.includes(normalizedStrategy);
+}
+
 const SIM_DATA_DIR = path.join('simulation');
 const SIM_STATE_FILE = path.join(SIM_DATA_DIR, 'sim-state.json');
 const SIM_TRADES_LOG_FILE = path.join(SIM_DATA_DIR, 'sim-trades.jsonl');
@@ -136,33 +156,41 @@ const botStats = {
 };
 
 // ========= Simulation Mode Helpers =========
-function getStateFile() {
-  return SIMULATION_MODE ? SIM_STATE_FILE : STATE_FILE;
+function getStateFile(strategy = null) {
+  // If strategy provided, check if that specific strategy is simulated
+  const isSimulated = strategy ? shouldSimulateStrategy(strategy) : SIMULATION_MODE;
+  return isSimulated ? SIM_STATE_FILE : STATE_FILE;
 }
-function getTradesLogFile() {
-  return SIMULATION_MODE ? SIM_TRADES_LOG_FILE : TRADES_LOG_FILE;
+function getTradesLogFile(strategy = null) {
+  const isSimulated = strategy ? shouldSimulateStrategy(strategy) : SIMULATION_MODE;
+  return isSimulated ? SIM_TRADES_LOG_FILE : TRADES_LOG_FILE;
 }
-function getStatsFile() {
-  return SIMULATION_MODE ? SIM_STATS_FILE : STATS_FILE;
+function getStatsFile(strategy = null) {
+  const isSimulated = strategy ? shouldSimulateStrategy(strategy) : SIMULATION_MODE;
+  return isSimulated ? SIM_STATS_FILE : STATS_FILE;
 }
-function getRedemptionLogFile() {
-  return SIMULATION_MODE ? SIM_REDEMPTION_LOG_FILE : REDEMPTION_LOG_FILE;
+function getRedemptionLogFile(strategy = null) {
+  const isSimulated = strategy ? shouldSimulateStrategy(strategy) : SIMULATION_MODE;
+  return isSimulated ? SIM_REDEMPTION_LOG_FILE : REDEMPTION_LOG_FILE;
 }
 
 // ========= Logging helpers with emojis =========
-function logInfo(addr, emoji, msg) {
+function logInfo(addr, emoji, msg, strategy = null) {
   const timestamp = new Date().toISOString();
-  const prefix = SIMULATION_MODE ? '[SIM]' : '';
+  const isSimulated = strategy ? shouldSimulateStrategy(strategy) : SIMULATION_MODE;
+  const prefix = isSimulated ? '[SIM]' : '';
   console.log(`${timestamp} ${emoji} ${prefix} [${addr}] ${msg}`);
 }
-function logWarn(addr, emoji, msg) {
+function logWarn(addr, emoji, msg, strategy = null) {
   const timestamp = new Date().toISOString();
-  const prefix = SIMULATION_MODE ? '[SIM]' : '';
+  const isSimulated = strategy ? shouldSimulateStrategy(strategy) : SIMULATION_MODE;
+  const prefix = isSimulated ? '[SIM]' : '';
   console.warn(`${timestamp} ${emoji} ${prefix} [${addr}] ${msg}`);
 }
-function logErr(addr, emoji, msg, err) {
+function logErr(addr, emoji, msg, err, strategy = null) {
   const timestamp = new Date().toISOString();
-  const prefix = SIMULATION_MODE ? '[SIM]' : '';
+  const isSimulated = strategy ? shouldSimulateStrategy(strategy) : SIMULATION_MODE;
+  const prefix = isSimulated ? '[SIM]' : '';
   const base = `${timestamp} ${emoji} ${prefix} [${addr}] ${msg}`;
   if (err) console.error(base, err);
   else console.error(base);
@@ -171,11 +199,13 @@ function logErr(addr, emoji, msg, err) {
 // ========= Trade Logging =========
 function logTrade(tradeData) {
   try {
-    const logFile = getTradesLogFile();
+    const strategy = tradeData.strategy || null;
+    const isSimulated = strategy ? shouldSimulateStrategy(strategy) : SIMULATION_MODE;
+    const logFile = getTradesLogFile(strategy);
     ensureDirSync(path.dirname(logFile));
     const logEntry = JSON.stringify({
       timestamp: new Date().toISOString(),
-      simulation: SIMULATION_MODE,
+      simulation: isSimulated,
       ...tradeData
     }) + '\n';
     fs.appendFileSync(logFile, logEntry);
@@ -1474,8 +1504,11 @@ async function runForWallet(wallet, provider) {
 
   // Helper function to execute buy transaction
   async function executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, strategy = 'default') {
+    // Check if THIS STRATEGY should be simulated
+    const isSimulated = shouldSimulateStrategy(strategy);
+
     // First, check if we already have a position in this market via API (skip in simulation mode)
-    if (!SIMULATION_MODE) {
+    if (!isSimulated) {
       try {
         const portfolioData = await fetchPortfolioData(wallet.address);
         if (portfolioData && portfolioData.amm) {
@@ -1496,14 +1529,14 @@ async function runForWallet(wallet, provider) {
     }
 
     // Compute minOutcomeTokensToBuy via calcBuyAmount and slippage
-    logInfo(wallet.address, '🧮', `[${marketAddress.substring(0, 8)}...] Calculating expected tokens for investment=${investment}...`);
+    logInfo(wallet.address, '🧮', `[${marketAddress.substring(0, 8)}...] Calculating expected tokens for investment=${investment}...`, strategy);
     const expectedTokens = await retryRpcCall(async () => await market.calcBuyAmount(investment, outcomeToBuy));
     const minOutcomeTokensToBuy = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
-    logInfo(wallet.address, '🛒', `${SIMULATION_MODE ? '[SIMULATED] ' : ''}Buying outcome=${outcomeToBuy} invest=${investment} expectedTokens=${expectedTokens} minTokens=${minOutcomeTokensToBuy} slippage=${SLIPPAGE_BPS}bps`);
+    logInfo(wallet.address, '🛒', `${isSimulated ? `[SIMULATED ${strategy.toUpperCase()}] ` : ''}Buying outcome=${outcomeToBuy} invest=${investment} expectedTokens=${expectedTokens} minTokens=${minOutcomeTokensToBuy} slippage=${SLIPPAGE_BPS}bps`, strategy);
 
     // SIMULATION MODE: Skip actual transaction execution
-    if (SIMULATION_MODE) {
-      logInfo(wallet.address, '🎭', `[SIMULATED BUY] Skipping real transaction - recording simulated position`);
+    if (isSimulated) {
+      logInfo(wallet.address, '🎭', `[SIMULATED ${strategy.toUpperCase()} BUY] Skipping real transaction - recording simulated position`, strategy);
 
       // Create a simulated transaction hash
       const simTxHash = `0xsim${Date.now().toString(16)}${Math.random().toString(16).substring(2, 10)}`;
@@ -2115,6 +2148,19 @@ async function main() {
   console.log(`   TRIGGER_PCT: ${TRIGGER_PCT}%`);
   console.log(`   TRIGGER_BAND: ${TRIGGER_BAND}%`);
   console.log(`   WALLETS: ${PRIVATE_KEYS.length}`);
+
+  // Show strategy-specific simulation status
+  if (SIMULATE_STRATEGIES.length > 0 && !SIMULATION_MODE) {
+    console.log(`\n🎭 Per-Strategy Simulation:`);
+    console.log(`   Simulated Strategies: ${SIMULATE_STRATEGIES.join(', ').toUpperCase()}`);
+    if (EARLY_STRATEGY_ENABLED) {
+      const earlyMode = shouldSimulateStrategy('early_contrarian') ? '🎭 SIMULATED' : '💰 LIVE';
+      console.log(`   Early Contrarian: ${earlyMode}`);
+    }
+    const lateMode = shouldSimulateStrategy('default') ? '🎭 SIMULATED' : '💰 LIVE';
+    console.log(`   Late Window: ${lateMode}`);
+  }
+
   console.log(`\n⏰ Active Time Windows:`);
   if (AUTO_REDEEM_ENABLED) {
     console.log(`   💰 Redemption: Minutes ${REDEEM_WINDOW_START}-${REDEEM_WINDOW_END} (claim resolved positions)`);
