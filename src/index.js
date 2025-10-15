@@ -1324,11 +1324,15 @@ async function runForWallet(wallet, provider) {
 
   async function tick() {
     // Check if bot should be active right now - do this FIRST to avoid unnecessary work during sleep
-    if (!shouldBeActive(wallet)) {
+    const isActive = shouldBeActive(wallet);
+    const nowMinutes = new Date().getMinutes();
+    const holdings = getAllHoldings(wallet.address);
+
+    if (!isActive) {
       const nextWakeMs = getNextWakeTime();
       const nextWakeMinutes = Math.floor(nextWakeMs / 60000);
       const nextWakeSeconds = Math.floor((nextWakeMs % 60000) / 1000);
-      logInfo(wallet.address, '💤', `Bot in sleep mode - not in active trading/redemption window. Next wake in ${nextWakeMinutes}m ${nextWakeSeconds}s`);
+      logInfo(wallet.address, '💤', `Bot in sleep mode (minute ${nowMinutes}, ${holdings.length} positions) - Next wake in ${nextWakeMinutes}m ${nextWakeSeconds}s`);
       return;
     }
 
