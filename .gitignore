@@ -1,0 +1,6 @@
+node_modules/
+.env
+data/
+simulation/
+*.log
+.DS_Store

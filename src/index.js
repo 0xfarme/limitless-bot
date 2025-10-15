@@ -52,6 +52,14 @@ const AUTO_REDEEM_ENABLED = (process.env.AUTO_REDEEM_ENABLED || 'true').toLowerC
 const REDEEM_WINDOW_START = parseInt(process.env.REDEEM_WINDOW_START || '6', 10); // Redemption window start minute (0-59)
 const REDEEM_WINDOW_END = parseInt(process.env.REDEEM_WINDOW_END || '10', 10); // Redemption window end minute (0-59)
 
+// ========= Simulation Mode Config =========
+const SIMULATION_MODE = (process.env.SIMULATION_MODE || 'false').toLowerCase() === 'true'; // Enable simulation mode (no real transactions)
+const SIM_DATA_DIR = path.join('simulation');
+const SIM_STATE_FILE = path.join(SIM_DATA_DIR, 'sim-state.json');
+const SIM_TRADES_LOG_FILE = path.join(SIM_DATA_DIR, 'sim-trades.jsonl');
+const SIM_STATS_FILE = path.join(SIM_DATA_DIR, 'sim-stats.json');
+const SIM_REDEMPTION_LOG_FILE = path.join(SIM_DATA_DIR, 'sim-redemptions.jsonl');
+
 // ========= S3 Upload Config =========
 const S3_UPLOAD_ENABLED = (process.env.S3_UPLOAD_ENABLED || 'false').toLowerCase() === 'true';
 const S3_BUCKET_NAME = process.env.S3_BUCKET_NAME || 'limitless-bot-logs';
@@ -127,18 +135,35 @@ const botStats = {
   lastUpdated: Date.now()
 };
 
+// ========= Simulation Mode Helpers =========
+function getStateFile() {
+  return SIMULATION_MODE ? SIM_STATE_FILE : STATE_FILE;
+}
+function getTradesLogFile() {
+  return SIMULATION_MODE ? SIM_TRADES_LOG_FILE : TRADES_LOG_FILE;
+}
+function getStatsFile() {
+  return SIMULATION_MODE ? SIM_STATS_FILE : STATS_FILE;
+}
+function getRedemptionLogFile() {
+  return SIMULATION_MODE ? SIM_REDEMPTION_LOG_FILE : REDEMPTION_LOG_FILE;
+}
+
 // ========= Logging helpers with emojis =========
 function logInfo(addr, emoji, msg) {
   const timestamp = new Date().toISOString();
-  console.log(`${timestamp} ${emoji} [${addr}] ${msg}`);
+  const prefix = SIMULATION_MODE ? '[SIM]' : '';
+  console.log(`${timestamp} ${emoji} ${prefix} [${addr}] ${msg}`);
 }
 function logWarn(addr, emoji, msg) {
   const timestamp = new Date().toISOString();
-  console.warn(`${timestamp} ${emoji} [${addr}] ${msg}`);
+  const prefix = SIMULATION_MODE ? '[SIM]' : '';
+  console.warn(`${timestamp} ${emoji} ${prefix} [${addr}] ${msg}`);
 }
 function logErr(addr, emoji, msg, err) {
   const timestamp = new Date().toISOString();
-  const base = `${timestamp} ${emoji} [${addr}] ${msg}`;
+  const prefix = SIMULATION_MODE ? '[SIM]' : '';
+  const base = `${timestamp} ${emoji} ${prefix} [${addr}] ${msg}`;
   if (err) console.error(base, err);
   else console.error(base);
 }
@@ -146,12 +171,14 @@ function logErr(addr, emoji, msg, err) {
 // ========= Trade Logging =========
 function logTrade(tradeData) {
   try {
-    ensureDirSync(path.dirname(TRADES_LOG_FILE));
+    const logFile = getTradesLogFile();
+    ensureDirSync(path.dirname(logFile));
     const logEntry = JSON.stringify({
       timestamp: new Date().toISOString(),
+      simulation: SIMULATION_MODE,
       ...tradeData
     }) + '\n';
-    fs.appendFileSync(TRADES_LOG_FILE, logEntry);
+    fs.appendFileSync(logFile, logEntry);
   } catch (e) {
     console.error('⚠️ Failed to log trade:', e?.message || e);
   }
@@ -160,12 +187,14 @@ function logTrade(tradeData) {
 // ========= Redemption Logging =========
 function logRedemption(redemptionData) {
   try {
-    ensureDirSync(path.dirname(REDEMPTION_LOG_FILE));
+    const logFile = getRedemptionLogFile();
+    ensureDirSync(path.dirname(logFile));
     const logEntry = JSON.stringify({
       timestamp: new Date().toISOString(),
+      simulation: SIMULATION_MODE,
       ...redemptionData
     }) + '\n';
-    fs.appendFileSync(REDEMPTION_LOG_FILE, logEntry);
+    fs.appendFileSync(logFile, logEntry);
   } catch (e) {
     console.error('⚠️ Failed to log redemption:', e?.message || e);
   }
@@ -266,14 +295,16 @@ function updateStats(pnlUSDC) {
 
   // Save stats to file
   try {
-    ensureDirSync(path.dirname(STATS_FILE));
+    const statsFile = getStatsFile();
+    ensureDirSync(path.dirname(statsFile));
     const statsData = {
       ...botStats,
+      simulation: SIMULATION_MODE,
       netProfitUSDC: botStats.totalProfitUSDC - botStats.totalLossUSDC,
       winRate: botStats.totalTrades > 0 ? ((botStats.profitableTrades / botStats.totalTrades) * 100).toFixed(2) + '%' : '0%',
       uptimeHours: ((Date.now() - botStats.startTime) / (1000 * 60 * 60)).toFixed(2)
     };
-    fs.writeFileSync(STATS_FILE, JSON.stringify(statsData, null, 2));
+    fs.writeFileSync(statsFile, JSON.stringify(statsData, null, 2));
 
     // Log summary to console
     console.log('\n📊 ========= BOT STATISTICS =========');
@@ -413,10 +444,12 @@ function scheduleSave() {
   if (saveTimer) return;
   saveTimer = setTimeout(async () => {
     try {
-      ensureDirSync(path.dirname(STATE_FILE));
+      const stateFile = getStateFile();
+      ensureDirSync(path.dirname(stateFile));
       const data = serializeState();
-      fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2));
-      console.log(`💾 [STATE] Saved to ${STATE_FILE}`);
+      fs.writeFileSync(stateFile, JSON.stringify(data, null, 2));
+      const prefix = SIMULATION_MODE ? '[SIM]' : '';
+      console.log(`💾 ${prefix} [STATE] Saved to ${stateFile}`);
     } catch (e) {
       console.warn('⚠️ [STATE] Failed to save state:', e && e.message ? e.message : e);
     } finally {
@@ -427,10 +460,12 @@ function scheduleSave() {
 
 function loadStateSync() {
   try {
-    if (!fs.existsSync(STATE_FILE)) return new Map();
-    const raw = fs.readFileSync(STATE_FILE, 'utf8');
+    const stateFile = getStateFile();
+    if (!fs.existsSync(stateFile)) return new Map();
+    const raw = fs.readFileSync(stateFile, 'utf8');
     const obj = JSON.parse(raw);
-    console.log(`📂 [STATE] Loaded from ${STATE_FILE}`);
+    const prefix = SIMULATION_MODE ? '[SIM]' : '';
+    console.log(`📂 ${prefix} [STATE] Loaded from ${stateFile}`);
     return deserializeState(obj);
   } catch (e) {
     console.warn('⚠️ [STATE] Failed to load state:', e && e.message ? e.message : e);
@@ -1382,25 +1417,89 @@ async function runForWallet(wallet, provider) {
 
   // Helper function to execute buy transaction
   async function executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, strategy = 'default') {
-    // First, check if we already have a position in this market via API
-    try {
-      const portfolioData = await fetchPortfolioData(wallet.address);
-      if (portfolioData && portfolioData.amm) {
-        const existingPosition = portfolioData.amm.find(pos =>
-          pos.market.id.toLowerCase() === marketAddress.toLowerCase() &&
-          !pos.market.closed && // Only check open markets
-          (parseFloat(pos.outcomeTokenAmount || 0) > 0 || parseFloat(pos.collateralAmount || 0) > 0)
-        );
+    // First, check if we already have a position in this market via API (skip in simulation mode)
+    if (!SIMULATION_MODE) {
+      try {
+        const portfolioData = await fetchPortfolioData(wallet.address);
+        if (portfolioData && portfolioData.amm) {
+          const existingPosition = portfolioData.amm.find(pos =>
+            pos.market.id.toLowerCase() === marketAddress.toLowerCase() &&
+            !pos.market.closed && // Only check open markets
+            (parseFloat(pos.outcomeTokenAmount || 0) > 0 || parseFloat(pos.collateralAmount || 0) > 0)
+          );
 
-        if (existingPosition) {
-          logInfo(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Already have position (${existingPosition.outcomeTokenAmount} tokens, outcome ${existingPosition.outcomeIndex}) - skipping buy to prevent double position`);
-          return;
+          if (existingPosition) {
+            logInfo(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Already have position (${existingPosition.outcomeTokenAmount} tokens, outcome ${existingPosition.outcomeIndex}) - skipping buy to prevent double position`);
+            return;
+          }
         }
+      } catch (error) {
+        logWarn(wallet.address, '⚠️', `Failed to check existing positions: ${error?.message || error} - proceeding with buy`);
       }
-    } catch (error) {
-      logWarn(wallet.address, '⚠️', `Failed to check existing positions: ${error?.message || error} - proceeding with buy`);
     }
 
+    // Compute minOutcomeTokensToBuy via calcBuyAmount and slippage
+    logInfo(wallet.address, '🧮', `[${marketAddress.substring(0, 8)}...] Calculating expected tokens for investment=${investment}...`);
+    const expectedTokens = await retryRpcCall(async () => await market.calcBuyAmount(investment, outcomeToBuy));
+    const minOutcomeTokensToBuy = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
+    logInfo(wallet.address, '🛒', `${SIMULATION_MODE ? '[SIMULATED] ' : ''}Buying outcome=${outcomeToBuy} invest=${investment} expectedTokens=${expectedTokens} minTokens=${minOutcomeTokensToBuy} slippage=${SLIPPAGE_BPS}bps`);
+
+    // SIMULATION MODE: Skip actual transaction execution
+    if (SIMULATION_MODE) {
+      logInfo(wallet.address, '🎭', `[SIMULATED BUY] Skipping real transaction - recording simulated position`);
+
+      // Create a simulated transaction hash
+      const simTxHash = `0xsim${Date.now().toString(16)}${Math.random().toString(16).substring(2, 10)}`;
+      const simBlockNumber = Math.floor(Date.now() / 1000); // Use timestamp as block number
+
+      const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
+      const receipt = { blockNumber: simBlockNumber, gasUsed: 100000n, hash: simTxHash };
+      const buyTx = { hash: simTxHash };
+
+      logInfo(wallet.address, '✅', `[SIMULATED] Buy completed - simulated tx: ${buyTx.hash}`);
+
+      // Record the simulated position (same logic as real buy)
+      logInfo(wallet.address, '💾', `[${marketAddress.substring(0, 8)}...] Recording simulated position: outcome=${outcomeToBuy}, tokenId=${tokenId}, cost=${investment}, strategy=${strategy}`);
+      addHolding(wallet.address, {
+        marketAddress,
+        marketTitle: marketInfo?.title || 'Unknown',
+        outcomeIndex: outcomeToBuy,
+        tokenId,
+        amount: investment,
+        cost: investment,
+        strategy: strategy,
+        entryPrice: prices[outcomeToBuy] || 'Unknown',
+        buyTimestamp: new Date().toISOString(),
+        marketDeadline: marketInfo?.deadline || null,
+        buyTxHash: buyTx.hash
+      });
+
+      // Log simulated buy trade
+      const marketDeadline = marketInfo?.deadline ? new Date(marketInfo.deadline).toISOString() : 'Unknown';
+      const prices = marketInfo?.prices || [];
+
+      logTrade({
+        type: 'BUY',
+        wallet: wallet.address,
+        marketAddress,
+        marketTitle: marketInfo?.title || 'Unknown',
+        outcome: outcomeToBuy,
+        outcomePrice: prices[outcomeToBuy] || 'Unknown',
+        opponentPrice: prices[outcomeToBuy === 0 ? 1 : 0] || 'Unknown',
+        investmentUSDC: ethers.formatUnits(investment, decimals),
+        expectedTokens: expectedTokens.toString(),
+        minTokens: minOutcomeTokensToBuy.toString(),
+        strategy: strategy,
+        marketDeadline: marketDeadline,
+        txHash: buyTx.hash,
+        blockNumber: receipt.blockNumber,
+        gasUsed: receipt.gasUsed.toString()
+      });
+
+      return; // Exit early - no real transaction
+    }
+
+    // REAL MODE: Execute actual transactions
     // Check if USDC allowance is sufficient
     logInfo(wallet.address, '🔐', `Checking USDC allowance for market ${marketAddress}...`);
     let currentAllowance;
@@ -1423,12 +1522,6 @@ async function runForWallet(wallet, provider) {
     } else {
       logInfo(wallet.address, '✅', `Allowance already sufficient (pre-approved), proceeding to buy`);
     }
-
-    // Compute minOutcomeTokensToBuy via calcBuyAmount and slippage
-    logInfo(wallet.address, '🧮', `[${marketAddress.substring(0, 8)}...] Calculating expected tokens for investment=${investment}...`);
-    const expectedTokens = await retryRpcCall(async () => await market.calcBuyAmount(investment, outcomeToBuy));
-    const minOutcomeTokensToBuy = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
-    logInfo(wallet.address, '🛒', `Buying outcome=${outcomeToBuy} invest=${investment} expectedTokens=${expectedTokens} minTokens=${minOutcomeTokensToBuy} slippage=${SLIPPAGE_BPS}bps`);
 
     // Estimate gas then buy
     logInfo(wallet.address, '⚡', `Estimating gas for buy transaction...`);
@@ -1942,8 +2035,17 @@ async function runForWallet(wallet, provider) {
 }
 
 async function main() {
+  if (SIMULATION_MODE) {
+    console.log('🎭 ========================================');
+    console.log('🎭   SIMULATION MODE ACTIVE');
+    console.log('🎭   NO REAL TRANSACTIONS WILL BE MADE');
+    console.log('🎭   Logs saved to: simulation/');
+    console.log('🎭 ========================================\n');
+  }
+
   console.log('🚀 Starting Limitless bot on Base...');
   console.log(`📋 Configuration:`);
+  console.log(`   MODE: ${SIMULATION_MODE ? '🎭 SIMULATION' : '💰 LIVE TRADING'}`);
   console.log(`   RPC_URL: ${RPC_URL}`);
   console.log(`   CHAIN_ID: ${CHAIN_ID}`);
   console.log(`   PRICE_ORACLE_IDS: [${PRICE_ORACLE_IDS.join(', ')}] (${PRICE_ORACLE_IDS.length} market(s))`);
