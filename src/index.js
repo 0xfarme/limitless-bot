@@ -1181,99 +1181,130 @@ async function runForWallet(wallet, provider) {
       const inRedemptionWindow = AUTO_REDEEM_ENABLED && nowMinutes >= REDEEM_WINDOW_START && nowMinutes <= REDEEM_WINDOW_END;
 
       if (inRedemptionWindow) {
-        // Use Portfolio API to get accurate position data
-        logInfo(wallet.address, '🕐', `Redemption window active (minutes ${REDEEM_WINDOW_START}-${REDEEM_WINDOW_END}) - fetching positions from API...`);
-
-        const portfolioData = await fetchPortfolioData(wallet.address);
-        if (!portfolioData || !portfolioData.amm) {
-          logWarn(wallet.address, '⚠️', 'Failed to fetch portfolio data for redemption');
-          logRedemption({
-            event: 'PORTFOLIO_FETCH_FAILED',
-            wallet: wallet.address,
-            error: 'No portfolio data returned'
-          });
-        } else {
-          // Filter for closed positions with remaining tokens
-          const positionsToRedeem = portfolioData.amm.filter(pos => {
-            const hasTokens = parseFloat(pos.outcomeTokenAmount || 0) > 0 || parseFloat(pos.collateralAmount || 0) > 0;
-            return pos.market.closed && hasTokens;
-          });
-
-          logInfo(wallet.address, '📋', `Found ${positionsToRedeem.length} closed position(s) to redeem`);
+        // Check for positions that need redemption using local state
+        const myHoldings = getAllHoldings(wallet.address);
+        if (myHoldings.length > 0) {
+          logInfo(wallet.address, '🕐', `Redemption window active (minutes ${REDEEM_WINDOW_START}-${REDEEM_WINDOW_END}) - checking ${myHoldings.length} position(s)...`);
 
           // Log redemption check start
           logRedemption({
-            event: 'REDEMPTION_CHECK_START_FROM_API',
+            event: 'REDEMPTION_CHECK_START',
             wallet: wallet.address,
-            totalPositions: portfolioData.amm.length,
-            closedPositions: portfolioData.amm.filter(p => p.market.closed).length,
-            positionsToRedeem: positionsToRedeem.length,
-            positions: positionsToRedeem.map(p => ({
-              marketAddress: p.market.id,
-              title: p.market.title,
-              outcomeIndex: p.outcomeIndex,
-              outcomeTokenAmount: p.outcomeTokenAmount,
-              collateralAmount: p.collateralAmount
+            holdingsCount: myHoldings.length,
+            holdings: myHoldings.map(h => ({
+              marketAddress: h.marketAddress,
+              outcomeIndex: h.outcomeIndex,
+              cost: h.cost ? h.cost.toString() : null
             }))
           });
 
-          for (const apiPosition of positionsToRedeem) {
+          for (const holding of myHoldings) {
             try {
-              const marketAddress = apiPosition.market.id;
+              const marketAddress = holding.marketAddress;
 
               logRedemption({
-                event: 'CHECKING_POSITION_FROM_API',
+                event: 'CHECKING_HOLDING',
                 wallet: wallet.address,
-                marketAddress: marketAddress,
-                title: apiPosition.market.title,
-                outcomeIndex: apiPosition.outcomeIndex,
-                outcomeTokenAmount: apiPosition.outcomeTokenAmount,
-                collateralAmount: apiPosition.collateralAmount
+                marketAddress: holding.marketAddress,
+                outcomeIndex: holding.outcomeIndex
               });
 
               // Check if already redeemed/completed
               const completed = getCompletedMarkets(wallet.address);
-              if (completed.has(marketAddress.toLowerCase())) {
-                logInfo(wallet.address, '✓', `[${marketAddress.substring(0, 8)}...] Already redeemed, skipping`);
+              if (completed.has(holding.marketAddress.toLowerCase())) {
+                logInfo(wallet.address, '✓', `[${holding.marketAddress.substring(0, 8)}...] Already redeemed, skipping`);
                 logRedemption({
                   event: 'ALREADY_REDEEMED',
                   wallet: wallet.address,
-                  marketAddress: marketAddress
+                  marketAddress: holding.marketAddress
                 });
                 continue;
               }
 
-              logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ${apiPosition.market.title}`);
+              // Find the market data for this holding - first check in oracle data
+              let marketData = allMarketsData.find(m => m.market && m.market.address.toLowerCase() === holding.marketAddress.toLowerCase());
 
-              // Build market data from API position (matches expected structure)
-              const marketData = {
-                market: {
-                  id: marketAddress,
-                  address: marketAddress,
-                  title: apiPosition.market.title,
-                  conditionId: apiPosition.market.conditionId,
-                  collateralToken: apiPosition.market.collateralToken,
-                  status: 'RESOLVED', // Closed means resolved
-                  closed: true,
-                  deadline: apiPosition.market.deadline
-                },
-                resolved: true, // If market is closed, it's resolved
-                isActive: false
-              };
+              // If not found in oracle data, fetch directly by market address
+              if (!marketData) {
+                logInfo(wallet.address, '🔍', `[${holding.marketAddress.substring(0, 8)}...] Market not in oracle data, fetching directly from API...`);
+                logRedemption({
+                  event: 'FETCHING_MARKET_DIRECTLY',
+                  wallet: wallet.address,
+                  marketAddress: holding.marketAddress,
+                  reason: 'Market not in allMarketsData from oracle IDs',
+                  oracleMarkets: allMarketsData.map(m => m.market?.address || 'unknown')
+                });
+
+                try {
+                  const url = `https://api.limitless.exchange/markets/${holding.marketAddress}`;
+                  const res = await axios.get(url, { timeout: 15000 });
+                  marketData = res.data;
+                  logInfo(wallet.address, '✅', `[${holding.marketAddress.substring(0, 8)}...] Market data fetched successfully`);
+                  logRedemption({
+                    event: 'MARKET_FETCHED_DIRECTLY',
+                    wallet: wallet.address,
+                    marketAddress: holding.marketAddress,
+                    marketStatus: marketData.market?.status,
+                    isResolved: marketData.resolved
+                  });
+                } catch (e) {
+                  logWarn(wallet.address, '⚠️', `[${holding.marketAddress.substring(0, 8)}...] Failed to fetch market data: ${e?.message || e}, skipping redemption check`);
+                  logRedemption({
+                    event: 'MARKET_FETCH_FAILED',
+                    wallet: wallet.address,
+                    marketAddress: holding.marketAddress,
+                    error: e?.message || String(e)
+                  });
+                  continue;
+                }
+              }
 
               logRedemption({
-                event: 'USING_API_MARKET_DATA',
+                event: 'MARKET_FOUND',
                 wallet: wallet.address,
-                marketAddress: marketAddress,
-                conditionId: apiPosition.market.conditionId,
-                collateralToken: apiPosition.market.collateralToken.address
+                marketAddress: holding.marketAddress,
+                marketStatus: marketData.market?.status,
+                isResolved: marketData.resolved,
+                isActive: marketData.isActive
               });
 
-              // Extract collateral token address from API data
-              const collateralTokenAddress = ethers.getAddress(apiPosition.market.collateralToken.address);
+              // Validate market data structure
+              if (!marketData || !marketData.market) {
+                logWarn(wallet.address, '⚠️', `[${holding.marketAddress.substring(0, 8)}...] Invalid market data structure, skipping`);
+                logRedemption({
+                  event: 'INVALID_MARKET_DATA',
+                  wallet: wallet.address,
+                  marketAddress: holding.marketAddress,
+                  marketData: marketData
+                });
+                continue;
+              }
+
+              // Extract collateral token address - handle different API response formats
+              let collateralTokenAddress;
+              try {
+                if (marketData.market.collateralToken?.address) {
+                  collateralTokenAddress = ethers.getAddress(marketData.market.collateralToken.address);
+                } else if (marketData.collateralToken?.address) {
+                  collateralTokenAddress = ethers.getAddress(marketData.collateralToken.address);
+                } else {
+                  logWarn(wallet.address, '⚠️', `[${holding.marketAddress.substring(0, 8)}...] No collateralToken found in market data, skipping`);
+                  logRedemption({
+                    event: 'NO_COLLATERAL_TOKEN',
+                    wallet: wallet.address,
+                    marketAddress: holding.marketAddress,
+                    marketDataKeys: Object.keys(marketData),
+                    marketKeys: Object.keys(marketData.market || {})
+                  });
+                  continue;
+                }
+              } catch (e) {
+                logWarn(wallet.address, '⚠️', `[${holding.marketAddress.substring(0, 8)}...] Error parsing collateral token: ${e?.message}`);
+                continue;
+              }
 
               // Get or create conditional tokens contract
-              const marketAddressChecksummed = ethers.getAddress(marketAddress);
+              const marketAddressChecksummed = ethers.getAddress(holding.marketAddress);
               if (!cachedContracts.has(marketAddressChecksummed)) {
                 // Initialize contracts for this market if not cached
                 const market = new ethers.Contract(marketAddressChecksummed, MARKET_ABI, wallet);
@@ -1291,20 +1322,11 @@ async function runForWallet(wallet, provider) {
                 wallet
               );
 
-              // Build holding object from API data for redemption function
-              const holding = {
-                marketAddress: marketAddress,
-                outcomeIndex: apiPosition.outcomeIndex,
-                tokenId: null, // Not needed for redemption
-                amount: apiPosition.outcomeTokenAmount,
-                cost: apiPosition.totalBuysCost
-              };
-
               // Check and redeem if possible
               logRedemption({
                 event: 'CALLING_REDEEM_FUNCTION',
                 wallet: wallet.address,
-                marketAddress: marketAddress
+                marketAddress: holding.marketAddress
               });
 
               const redeemed = await checkAndRedeemPosition(
@@ -1320,28 +1342,30 @@ async function runForWallet(wallet, provider) {
               logRedemption({
                 event: 'REDEEM_FUNCTION_RETURNED',
                 wallet: wallet.address,
-                marketAddress: marketAddress,
+                marketAddress: holding.marketAddress,
                 redeemed: redeemed
               });
 
               if (redeemed) {
-                logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Position redeemed successfully`);
+                logInfo(wallet.address, '✅', `[${holding.marketAddress.substring(0, 8)}...] Position redeemed successfully`);
               } else {
-                logInfo(wallet.address, '⏭️', `[${marketAddress.substring(0, 8)}...] Position not redeemed (market not ready or already claimed)`);
+                logInfo(wallet.address, '⏭️', `[${holding.marketAddress.substring(0, 8)}...] Position not redeemed (market not ready or already claimed)`);
               }
 
               // Add small delay between redemption checks to avoid rate limits
               await delay(500);
             } catch (err) {
-              logErr(wallet.address, '💥', `Error checking redemption for ${apiPosition?.market?.id || 'unknown'}:`, err?.message || err);
+              logErr(wallet.address, '💥', `Error checking redemption for ${holding.marketAddress}:`, err?.message || err);
               logRedemption({
                 event: 'REDEMPTION_LOOP_ERROR',
                 wallet: wallet.address,
-                marketAddress: apiPosition?.market?.id,
+                marketAddress: holding.marketAddress,
                 error: err?.message || String(err)
               });
             }
           }
+        } else {
+          logInfo(wallet.address, '📭', `Redemption window active but no positions to check`);
         }
       } else if (!AUTO_REDEEM_ENABLED) {
         // Only log once per hour when redemption is disabled
