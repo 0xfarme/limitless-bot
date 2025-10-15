@@ -543,15 +543,29 @@ async function fetchMarkets() {
 }
 
 async function readAllowance(usdc, owner, spender) {
-  // Try with retry and fallback
-  for (let attempt = 0; attempt < 3; attempt++) {
+  // Try with retry and fallback - RPC nodes can be flaky
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      return await usdc.allowance(owner, spender);
+      // Add timeout to the call
+      const allowancePromise = usdc.allowance(owner, spender);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Allowance read timeout')), 10000)
+      );
+      return await Promise.race([allowancePromise, timeoutPromise]);
     } catch (e) {
-      if (attempt < 2) {
-        await delay(1000 * (attempt + 1));
+      const errMsg = e?.message || String(e);
+      const isCallException = errMsg.includes('CALL_EXCEPTION') || errMsg.includes('missing revert data');
+      const isTimeout = errMsg.includes('timeout');
+
+      if (attempt < 4) {
+        // Exponential backoff with jitter for RPC issues
+        const baseDelay = isCallException || isTimeout ? 2000 : 1000;
+        const backoff = baseDelay * Math.pow(1.5, attempt);
+        const jitter = Math.random() * 500;
+        await delay(backoff + jitter);
         continue;
       }
+
       // Last attempt: try staticCall fallback
       try {
         const fn = usdc.getFunction ? usdc.getFunction('allowance') : null;
@@ -559,10 +573,13 @@ async function readAllowance(usdc, owner, spender) {
           return await fn.staticCall(owner, spender);
         }
       } catch (_) {}
-      throw e;
+
+      // If all retries fail, log warning and return 0 (will trigger approval flow)
+      console.warn(`⚠️ All allowance read attempts failed: ${errMsg.substring(0, 100)}. Assuming 0 allowance.`);
+      return 0n;
     }
   }
-  return 0n; // Fallback
+  return 0n; // Final fallback
 }
 
 function pickOutcome(prices) {
