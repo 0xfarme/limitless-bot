@@ -108,6 +108,37 @@ const SIM_TRADES_LOG_FILE = path.join(SIM_DATA_DIR, 'sim-trades.jsonl');
 const SIM_STATS_FILE = path.join(SIM_DATA_DIR, 'sim-stats.json');
 const SIM_REDEMPTION_LOG_FILE = path.join(SIM_DATA_DIR, 'sim-redemptions.jsonl');
 
+// ========= Transaction Lock (Prevent Nonce Conflicts) =========
+// Track pending transactions per wallet to prevent nonce conflicts
+const pendingTransactions = new Map(); // walletAddress -> Promise
+
+// Serialize transactions for a wallet to prevent nonce conflicts
+async function withTransactionLock(walletAddress, transactionFn) {
+  // Wait for any pending transaction to complete first
+  const pending = pendingTransactions.get(walletAddress);
+  if (pending) {
+    try {
+      await pending;
+    } catch (e) {
+      // Ignore errors from previous transaction, proceed with current one
+    }
+  }
+
+  // Execute this transaction and store the promise
+  const promise = transactionFn();
+  pendingTransactions.set(walletAddress, promise);
+
+  try {
+    const result = await promise;
+    return result;
+  } finally {
+    // Clean up after transaction completes
+    if (pendingTransactions.get(walletAddress) === promise) {
+      pendingTransactions.delete(walletAddress);
+    }
+  }
+}
+
 // ========= S3 Upload Config =========
 const S3_UPLOAD_ENABLED = (process.env.S3_UPLOAD_ENABLED || 'false').toLowerCase() === 'true';
 const S3_BUCKET_NAME = process.env.S3_BUCKET_NAME || 'limitless-bot-logs';
@@ -722,107 +753,111 @@ function pickOutcome(prices) {
 }
 
 async function ensureUsdcApproval(wallet, usdc, marketAddress, needed) {
-  // Always require a confirmed allowance read before buying
-  let current;
-  try {
-    logInfo(wallet.address, '🔎', `Checking USDC allowance to market ${marketAddress} ...`);
-    current = await readAllowance(usdc, wallet.address, marketAddress);
-  } catch (e) {
-    logWarn(wallet.address, '⚠️', `Allowance read failed. Will try to approve, then re-check. Details: ${(e && e.message) ? e.message : e}`);
-    current = 0n;
-  }
-  if (current >= needed) return true;
-  logInfo(wallet.address, '🔓', `Approving USDC ${needed} to ${marketAddress} ...`);
-  // Some tokens require setting to 0 before non-zero
-  if (current > 0n) {
+  return withTransactionLock(wallet.address, async () => {
+    // Always require a confirmed allowance read before buying
+    let current;
     try {
-      const gasEst0 = await estimateGasFor(usdc, wallet, 'approve', [marketAddress, 0n]);
-      if (!gasEst0) { logWarn(wallet.address, '🛑', 'Gas estimate approve(0) failed; skipping approval.'); return false; }
-      const pad0 = (gasEst0 * 120n) / 100n + 10000n;
-      const ov0 = await txOverrides(wallet.provider, pad0);
-      const tx0 = await usdc.approve(marketAddress, 0n, ov0);
-      logInfo(wallet.address, '🧾', `approve(0) tx: ${tx0.hash}`);
-      await tx0.wait(CONFIRMATIONS);
+      logInfo(wallet.address, '🔎', `Checking USDC allowance to market ${marketAddress} ...`);
+      current = await readAllowance(usdc, wallet.address, marketAddress);
     } catch (e) {
-      logErr(wallet.address, '💥', 'approve(0) failed', (e && e.message) ? e.message : e);
-      return false;
+      logWarn(wallet.address, '⚠️', `Allowance read failed. Will try to approve, then re-check. Details: ${(e && e.message) ? e.message : e}`);
+      current = 0n;
     }
-  }
-  try {
-    const gasEst1 = await estimateGasFor(usdc, wallet, 'approve', [marketAddress, needed]);
-    if (!gasEst1) { logWarn(wallet.address, '🛑', 'Gas estimate approve failed; skipping approval.'); return false; }
-    const pad1 = (gasEst1 * 120n) / 100n + 10000n;
-    const ov1 = await txOverrides(wallet.provider, pad1);
-    const tx = await usdc.approve(marketAddress, needed, ov1);
-    logInfo(wallet.address, '🧾', `approve tx: ${tx.hash}`);
-    await tx.wait(CONFIRMATIONS);
-  } catch (e) {
-    // Fallback: try increaseAllowance if approve fails (some tokens prefer increasing)
-    logWarn(wallet.address, '⚠️', `approve failed, trying increaseAllowance. Details: ${(e && e.message) ? e.message : e}`);
+    if (current >= needed) return true;
+    logInfo(wallet.address, '🔓', `Approving USDC ${needed} to ${marketAddress} ...`);
+    // Some tokens require setting to 0 before non-zero
+    if (current > 0n) {
+      try {
+        const gasEst0 = await estimateGasFor(usdc, wallet, 'approve', [marketAddress, 0n]);
+        if (!gasEst0) { logWarn(wallet.address, '🛑', 'Gas estimate approve(0) failed; skipping approval.'); return false; }
+        const pad0 = (gasEst0 * 120n) / 100n + 10000n;
+        const ov0 = await txOverrides(wallet.provider, pad0);
+        const tx0 = await usdc.approve(marketAddress, 0n, ov0);
+        logInfo(wallet.address, '🧾', `approve(0) tx: ${tx0.hash}`);
+        await tx0.wait(CONFIRMATIONS);
+      } catch (e) {
+        logErr(wallet.address, '💥', 'approve(0) failed', (e && e.message) ? e.message : e);
+        return false;
+      }
+    }
     try {
-      const gasEst2 = await estimateGasFor(usdc, wallet, 'increaseAllowance', [marketAddress, needed]);
-      if (!gasEst2) { logWarn(wallet.address, '🛑', 'Gas estimate increaseAllowance failed; skipping approval.'); return false; }
-      const pad2 = (gasEst2 * 120n) / 100n + 10000n;
-      const ov2 = await txOverrides(wallet.provider, pad2);
-      const tx2 = await usdc.increaseAllowance(marketAddress, needed, ov2);
-      logInfo(wallet.address, '🧾', `increaseAllowance tx: ${tx2.hash}`);
-      await tx2.wait(CONFIRMATIONS);
-    } catch (e2) {
-      logErr(wallet.address, '💥', 'increaseAllowance also failed', (e2 && e2.message) ? e2.message : e2);
+      const gasEst1 = await estimateGasFor(usdc, wallet, 'approve', [marketAddress, needed]);
+      if (!gasEst1) { logWarn(wallet.address, '🛑', 'Gas estimate approve failed; skipping approval.'); return false; }
+      const pad1 = (gasEst1 * 120n) / 100n + 10000n;
+      const ov1 = await txOverrides(wallet.provider, pad1);
+      const tx = await usdc.approve(marketAddress, needed, ov1);
+      logInfo(wallet.address, '🧾', `approve tx: ${tx.hash}`);
+      await tx.wait(CONFIRMATIONS);
+    } catch (e) {
+      // Fallback: try increaseAllowance if approve fails (some tokens prefer increasing)
+      logWarn(wallet.address, '⚠️', `approve failed, trying increaseAllowance. Details: ${(e && e.message) ? e.message : e}`);
+      try {
+        const gasEst2 = await estimateGasFor(usdc, wallet, 'increaseAllowance', [marketAddress, needed]);
+        if (!gasEst2) { logWarn(wallet.address, '🛑', 'Gas estimate increaseAllowance failed; skipping approval.'); return false; }
+        const pad2 = (gasEst2 * 120n) / 100n + 10000n;
+        const ov2 = await txOverrides(wallet.provider, pad2);
+        const tx2 = await usdc.increaseAllowance(marketAddress, needed, ov2);
+        logInfo(wallet.address, '🧾', `increaseAllowance tx: ${tx2.hash}`);
+        await tx2.wait(CONFIRMATIONS);
+      } catch (e2) {
+        logErr(wallet.address, '💥', 'increaseAllowance also failed', (e2 && e2.message) ? e2.message : e2);
+        return false;
+      }
+    }
+    // Re-check allowance to confirm
+    try {
+      const after = await readAllowance(usdc, wallet.address, marketAddress);
+      const ok = after >= needed;
+      logInfo(wallet.address, ok ? '✅' : '⚠️', `Allowance after approve: ${after.toString()} (need ${needed.toString()})`);
+      return ok;
+    } catch (e) {
+      logWarn(wallet.address, '⚠️', `Allowance re-check failed. Skipping buy this tick. Details: ${(e && e.message) ? e.message : e}`);
       return false;
     }
-  }
-  // Re-check allowance to confirm
-  try {
-    const after = await readAllowance(usdc, wallet.address, marketAddress);
-    const ok = after >= needed;
-    logInfo(wallet.address, ok ? '✅' : '⚠️', `Allowance after approve: ${after.toString()} (need ${needed.toString()})`);
-    return ok;
-  } catch (e) {
-    logWarn(wallet.address, '⚠️', `Allowance re-check failed. Skipping buy this tick. Details: ${(e && e.message) ? e.message : e}`);
-    return false;
-  }
+  });
 }
 
 async function ensureErc1155Approval(wallet, erc1155, operator) {
-  // Try to read approval state up to 3 times
-  for (let i = 0; i < 3; i++) {
-    try {
-      logInfo(wallet.address, '🔎', `Checking ERC1155 isApprovedForAll(${wallet.address}, ${operator}) ...`);
-      const approved = await erc1155.isApprovedForAll(wallet.address, operator);
-      if (approved) return true; // already approved
-      break; // definite false -> proceed to approve
-    } catch (e) {
-      logWarn(wallet.address, '⚠️', `isApprovedForAll read failed (attempt ${i + 1}/3): ${(e && e.message) ? e.message : e}`);
-      await delay(400);
+  return withTransactionLock(wallet.address, async () => {
+    // Try to read approval state up to 3 times
+    for (let i = 0; i < 3; i++) {
+      try {
+        logInfo(wallet.address, '🔎', `Checking ERC1155 isApprovedForAll(${wallet.address}, ${operator}) ...`);
+        const approved = await erc1155.isApprovedForAll(wallet.address, operator);
+        if (approved) return true; // already approved
+        break; // definite false -> proceed to approve
+      } catch (e) {
+        logWarn(wallet.address, '⚠️', `isApprovedForAll read failed (attempt ${i + 1}/3): ${(e && e.message) ? e.message : e}`);
+        await delay(400);
+      }
     }
-  }
-  // Estimate gas for setApprovalForAll; if estimate fails, skip
-  const gasEst = await estimateGasFor(erc1155, wallet, 'setApprovalForAll', [operator, true]);
-  if (!gasEst) {
-    logWarn(wallet.address, '🛑', 'Gas estimate setApprovalForAll failed; skipping approval this tick.');
-    return false;
-  }
-  logInfo(wallet.address, '⛽', `Gas estimate setApprovalForAll: ${gasEst}`);
-  const padded = (gasEst * 120n) / 100n + 10000n;
-  try {
-    logInfo(wallet.address, '🔓', `Setting ERC1155 setApprovalForAll(${operator}, true) ...`);
-    const ov = await txOverrides(wallet.provider, padded);
-    const tx = await erc1155.setApprovalForAll(operator, true, ov);
-    logInfo(wallet.address, '🧾', `setApprovalForAll tx: ${tx.hash}`);
-    await tx.wait(CONFIRMATIONS);
-  } catch (e) {
-    logWarn(wallet.address, '🛑', `setApprovalForAll send failed; skipping approval this tick. Details: ${(e && e.message) ? e.message : e}`);
-    return false;
-  }
-  // Confirm state once after tx
-  try {
-    const ok = await erc1155.isApprovedForAll(wallet.address, operator);
-    return !!ok;
-  } catch (_) {
-    // Best-effort
-    return true;
-  }
+    // Estimate gas for setApprovalForAll; if estimate fails, skip
+    const gasEst = await estimateGasFor(erc1155, wallet, 'setApprovalForAll', [operator, true]);
+    if (!gasEst) {
+      logWarn(wallet.address, '🛑', 'Gas estimate setApprovalForAll failed; skipping approval this tick.');
+      return false;
+    }
+    logInfo(wallet.address, '⛽', `Gas estimate setApprovalForAll: ${gasEst}`);
+    const padded = (gasEst * 120n) / 100n + 10000n;
+    try {
+      logInfo(wallet.address, '🔓', `Setting ERC1155 setApprovalForAll(${operator}, true) ...`);
+      const ov = await txOverrides(wallet.provider, padded);
+      const tx = await erc1155.setApprovalForAll(operator, true, ov);
+      logInfo(wallet.address, '🧾', `setApprovalForAll tx: ${tx.hash}`);
+      await tx.wait(CONFIRMATIONS);
+    } catch (e) {
+      logWarn(wallet.address, '🛑', `setApprovalForAll send failed; skipping approval this tick. Details: ${(e && e.message) ? e.message : e}`);
+      return false;
+    }
+    // Confirm state once after tx
+    try {
+      const ok = await erc1155.isApprovedForAll(wallet.address, operator);
+      return !!ok;
+    } catch (_) {
+      // Best-effort
+      return true;
+    }
+  });
 }
 
 async function estimateReturnForSellAll(market, outcomeIndex, tokenBalance, collateralDecimals) {
