@@ -2181,8 +2181,13 @@ async function runForWallet(wallet, provider) {
             });
             updateStats(pnlUSDC);
 
-            removeHolding(wallet.address, marketAddress);
-            markMarketCompleted(wallet.address, marketAddress);
+            // Remove only this strategy's holding, not all holdings for this market
+            const strategyToRemove = holding?.strategy || 'default';
+            removeHolding(wallet.address, marketAddress, strategyToRemove);
+
+            // Don't mark market as completed - other strategies may still want to trade it
+            // markMarketCompleted(wallet.address, marketAddress);
+            logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed ${strategyToRemove} holding after stop loss`);
             return;
           }
         }
@@ -2291,10 +2296,14 @@ async function runForWallet(wallet, provider) {
             };
             addHolding(wallet.address, updatedHolding);
           } else {
-            // Full sell - remove holding and mark completed
-            removeHolding(wallet.address, marketAddress);
-            markMarketCompleted(wallet.address, marketAddress);
-            logInfo(wallet.address, '🧭', `[${marketAddress.substring(0, 8)}...] Market completed, won't re-enter`);
+            // Full sell - remove only this strategy's holding, not all holdings for this market
+            const strategyToRemove = holding?.strategy || 'default';
+            removeHolding(wallet.address, marketAddress, strategyToRemove);
+
+            // Don't mark market as completed - other strategies may still want to trade it
+            // Only this specific strategy won't re-enter
+            // markMarketCompleted(wallet.address, marketAddress);
+            logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed ${strategyToRemove} holding after profit sell`);
           }
           return;
         } else if (alreadyTookProfit) {
@@ -2314,14 +2323,10 @@ async function runForWallet(wallet, provider) {
         return;
       }
 
-      // Do not re-enter a market once completed (bought & sold) in this run
-      const completed = getCompletedMarkets(wallet.address);
-      if (completed.has(marketAddress.toLowerCase())) {
-        logInfo(wallet.address, '🧭', `[${marketAddress.substring(0, 8)}...] Previously completed; skipping buy.`);
-        return;
-      }
+      // NOTE: We do NOT check global "completed" status here because strategies are independent
+      // Each strategy checks its own holding status before buying
 
-      // Prevent duplicate buys - check if buy is in progress or if we ever bought this market
+      // Prevent duplicate buys - check if buy is in progress for this market
       const marketKey = marketAddress.toLowerCase();
       if (buyingInProgress.has(marketKey)) {
         logInfo(wallet.address, '🔒', `[${marketAddress.substring(0, 8)}...] Buy already in progress for this market; skipping.`);
