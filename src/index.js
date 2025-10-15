@@ -1433,7 +1433,63 @@ async function runForWallet(wallet, provider) {
                 try {
                   const url = `https://api.limitless.exchange/markets/${holding.marketAddress}`;
                   const res = await axios.get(url, { timeout: 15000 });
-                  marketData = res.data;
+                  const rawData = res.data;
+
+                  // Normalize structure - handle different API response formats
+                  // 1. Oracle markets: { market: { address: "0x..." }, isActive: true, resolved: false }
+                  // 2. Group markets: { markets: [{...}], status: "RESOLVED" } (multi-outcome)
+                  // 3. Single market by address might return either format
+
+                  if (rawData.market && rawData.market.address) {
+                    // Already in correct format (oracle market)
+                    marketData = rawData;
+                  } else if (rawData.markets && Array.isArray(rawData.markets)) {
+                    // Group market - need to find which sub-market matches our holding
+                    // Group markets return array of markets, we need the one matching our address
+                    const specificMarket = rawData.markets.find(m =>
+                      m.address?.toLowerCase() === holding.marketAddress.toLowerCase()
+                    );
+
+                    if (specificMarket) {
+                      // Wrap in expected structure
+                      marketData = {
+                        market: specificMarket,
+                        resolved: specificMarket.status === 'RESOLVED',
+                        isActive: !specificMarket.expired
+                      };
+                    } else {
+                      // The market address might be the group address, not an individual market
+                      // In this case, we can't determine which sub-market to redeem
+                      logWarn(wallet.address, '⚠️', `[${holding.marketAddress.substring(0, 8)}...] Group market detected but can't determine specific sub-market. Manual redemption may be needed.`);
+                      logRedemption({
+                        event: 'GROUP_MARKET_UNSUPPORTED',
+                        wallet: wallet.address,
+                        marketAddress: holding.marketAddress,
+                        groupMarketId: rawData.id,
+                        subMarketsCount: rawData.markets.length,
+                        reason: 'Bot trades oracle markets, this is a group market (multi-outcome)'
+                      });
+                      continue;
+                    }
+                  } else if (rawData.address || rawData.conditionId) {
+                    // Direct market object - wrap it
+                    marketData = {
+                      market: rawData,
+                      resolved: rawData.status === 'RESOLVED',
+                      isActive: !rawData.expired
+                    };
+                  } else {
+                    // Unknown structure
+                    logWarn(wallet.address, '⚠️', `[${holding.marketAddress.substring(0, 8)}...] Unknown market data structure from API`);
+                    logRedemption({
+                      event: 'UNKNOWN_MARKET_STRUCTURE',
+                      wallet: wallet.address,
+                      marketAddress: holding.marketAddress,
+                      dataKeys: Object.keys(rawData).slice(0, 10)
+                    });
+                    continue;
+                  }
+
                   logInfo(wallet.address, '✅', `[${holding.marketAddress.substring(0, 8)}...] Market data fetched successfully`);
                   logRedemption({
                     event: 'MARKET_FETCHED_DIRECTLY',
