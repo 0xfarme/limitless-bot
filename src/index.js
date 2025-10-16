@@ -2285,12 +2285,12 @@ async function runForWallet(wallet, provider) {
         // Debug logging for sell decision
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Sell check: calcSellFailed=${calcSellFailed}, pnlAbs=${pnlAbs > 0n ? '+' : '-'}, pnlPct=${pnlPct.toFixed(2)}%, profitTarget=${profitTarget}%, alreadyTookProfit=${alreadyTookProfit}, strategy=${strategyType}`);
 
-        // Trailing stop for early_contrarian: Track peak profit throughout, but only sell after minute 45
+        // Trailing stop for early_contrarian: Active anytime throughout the position lifecycle
         const now = new Date();
         const currentMinute = now.getMinutes();
 
         if (strategyType === 'early_contrarian' && !calcSellFailed && pnlPct >= profitTarget) {
-          // Always update peak profit when current profit is higher (track throughout minutes 10-45)
+          // Always update peak profit when current profit is higher
           const currentPeakPnl = holding?.peakPnlPct || 0;
           if (pnlPct > currentPeakPnl) {
             // New peak reached - update holding
@@ -2305,21 +2305,10 @@ async function runForWallet(wallet, provider) {
             return;
           }
 
-          // Check trailing stop - but only SELL after minute 45
+          // Check trailing stop - active ANYTIME during position
           const trailingStopThreshold = 30;
           const dropFromPeak = currentPeakPnl - pnlPct;
 
-          if (currentMinute < 45) {
-            // Before minute 45 - just log, don't sell
-            if (dropFromPeak >= trailingStopThreshold) {
-              logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Trailing stop would trigger (Peak=${currentPeakPnl.toFixed(2)}%, Current=${pnlPct.toFixed(2)}%, Drop=${dropFromPeak.toFixed(2)}%), but holding until minute 45`);
-            } else {
-              logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] Early contrarian holding: Peak=${currentPeakPnl.toFixed(2)}%, Current=${pnlPct.toFixed(2)}%, Drop=${dropFromPeak.toFixed(2)}% (< ${trailingStopThreshold}% stop)`);
-            }
-            return;
-          }
-
-          // After minute 45 - check if trailing stop triggered
           if (dropFromPeak >= trailingStopThreshold) {
             // Trailing stop triggered - sell entire position
             logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Trailing stop triggered! Peak=${currentPeakPnl.toFixed(2)}%, Current=${pnlPct.toFixed(2)}%, Drop=${dropFromPeak.toFixed(2)}% (>= ${trailingStopThreshold}%)`);
@@ -2574,8 +2563,8 @@ async function runForWallet(wallet, provider) {
           );
 
           if (oppositePositionExists) {
-            // Already have opposite side covered (e.g., early contrarian on NO)
-            // Just ride that position instead of opening new moonshot
+            // Already have opposite side covered (e.g., early contrarian on NO in loss)
+            // Minute 45 checkpoint keeps losing positions, so we ride them instead of moonshot
             const existingPosition = allHoldingsForMarket.find(h =>
               h.outcomeIndex === moonshotOutcome && h.strategy !== 'default'
             );
