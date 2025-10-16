@@ -79,6 +79,7 @@ const EARLY_PROFIT_TARGET_PCT = parseInt(process.env.EARLY_PROFIT_TARGET_PCT || 
 // ========= Moonshot Strategy Config =========
 const MOONSHOT_ENABLED = (process.env.MOONSHOT_ENABLED || 'true').toLowerCase() === 'true'; // Enable moonshot strategy
 const MOONSHOT_WINDOW_MINUTES = parseInt(process.env.MOONSHOT_WINDOW_MINUTES || '2', 10); // Moonshot triggers in last N minutes
+const MOONSHOT_MAX_ODDS = parseInt(process.env.MOONSHOT_MAX_ODDS || '10', 10); // Only buy if opposite side <= N%
 const MOONSHOT_AMOUNT_USDC = parseFloat(process.env.MOONSHOT_AMOUNT_USDC || '1'); // Amount to invest in moonshot
 const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_PCT || '100', 10); // Sell at N% profit
 
@@ -2581,18 +2582,25 @@ async function runForWallet(wallet, provider) {
             const existingStrategy = existingPosition?.strategy || 'unknown';
             logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - already have opposite side covered by ${existingStrategy} (riding that position)`);
           } else {
-            // No opposite position exists - place moonshot bet
-            const moonshotStrategy = 'moonshot';
-            const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
+            // Check if opposite side odds are below configured threshold (true moonshot)
+            const moonshotOdds = prices[moonshotOutcome];
 
-            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot! Bought side ${outcomeToBuy}, now buying opposite side ${moonshotOutcome} at ${prices[moonshotOutcome]}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
-
-            // Check USDC balance for moonshot
-            const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
-            if (usdcBalAfter >= moonshotInvestment) {
-              await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy);
+            if (moonshotOdds > MOONSHOT_MAX_ODDS) {
+              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - opposite side at ${moonshotOdds}% (> ${MOONSHOT_MAX_ODDS}% threshold). Not a true moonshot.`);
             } else {
-              logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need ${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
+              // No opposite position exists and odds qualify - place moonshot bet
+              const moonshotStrategy = 'moonshot';
+              const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
+
+              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot! Bought side ${outcomeToBuy}, now buying opposite side ${moonshotOutcome} at ${moonshotOdds}% with $${MOONSHOT_AMOUNT_USDC} USDC (true moonshot <= ${MOONSHOT_MAX_ODDS}%)`);
+
+              // Check USDC balance for moonshot
+              const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+              if (usdcBalAfter >= moonshotInvestment) {
+                await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy);
+              } else {
+                logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need ${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
+              }
             }
           }
         }
