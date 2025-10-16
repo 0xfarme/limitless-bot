@@ -1923,17 +1923,22 @@ async function runForWallet(wallet, provider) {
       let inEarlyWindow = false;
       let inMoonshotWindow = false;
 
+      // Early contrarian strategy window check - based on MINUTE OF THE HOUR
+      const currentMinuteOfHour = new Date().getMinutes();
+      const EARLY_WINDOW_START = 10; // Start at minute 10
+      const EARLY_WINDOW_END = 30;   // End at minute 30
+
+      if (EARLY_STRATEGY_ENABLED && currentMinuteOfHour >= EARLY_WINDOW_START && currentMinuteOfHour <= EARLY_WINDOW_END) {
+        inEarlyWindow = true;
+        logInfo(wallet.address, '🌅', `[${marketAddress.substring(0, 8)}...] In early window (minute ${currentMinuteOfHour}, window: ${EARLY_WINDOW_START}-${EARLY_WINDOW_END}) - contrarian strategy active`);
+      }
+
+      // Check market age for "too new" restriction
       if (marketInfo.createdAt) {
         const createdMs = new Date(marketInfo.createdAt).getTime();
         if (!Number.isNaN(createdMs)) {
           const ageMs = nowMs - createdMs;
           const ageMin = Math.max(0, Math.floor(ageMs / 60000));
-
-          // Check if in early contrarian strategy window (first 30 minutes)
-          if (EARLY_STRATEGY_ENABLED && ageMs <= EARLY_WINDOW_MINUTES * 60 * 1000) {
-            inEarlyWindow = true;
-            logInfo(wallet.address, '🌅', `[${marketAddress.substring(0, 8)}...] In early window (${ageMin}m old, <= ${EARLY_WINDOW_MINUTES}m) - contrarian strategy active`);
-          }
 
           if (ageMs < MIN_MARKET_AGE_MINUTES * 60 * 1000) {
             tooNewForBet = true;
