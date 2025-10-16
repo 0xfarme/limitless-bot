@@ -2285,83 +2285,90 @@ async function runForWallet(wallet, provider) {
         // Debug logging for sell decision
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Sell check: calcSellFailed=${calcSellFailed}, pnlAbs=${pnlAbs > 0n ? '+' : '-'}, pnlPct=${pnlPct.toFixed(2)}%, profitTarget=${profitTarget}%, alreadyTookProfit=${alreadyTookProfit}, strategy=${strategyType}`);
 
-        // Trailing stop for early_contrarian: Active anytime throughout the position lifecycle
+        // Trailing stop for early_contrarian: Active ONLY between minutes 10-45
         const now = new Date();
         const currentMinute = now.getMinutes();
 
         if (strategyType === 'early_contrarian' && !calcSellFailed && pnlPct >= profitTarget) {
-          // Always update peak profit when current profit is higher
-          const currentPeakPnl = holding?.peakPnlPct || 0;
-          if (pnlPct > currentPeakPnl) {
-            // New peak reached - update holding
-            const updatedHolding = {
-              ...holding,
-              peakPnlPct: pnlPct
-            };
-            addHolding(wallet.address, updatedHolding);
-            logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] Early contrarian new peak profit: ${pnlPct.toFixed(2)}% (was ${currentPeakPnl.toFixed(2)}%)`);
+          // Only track/trigger trailing stop before minute 45
+          if (currentMinute < 45) {
+            // Always update peak profit when current profit is higher
+            const currentPeakPnl = holding?.peakPnlPct || 0;
+            if (pnlPct > currentPeakPnl) {
+              // New peak reached - update holding
+              const updatedHolding = {
+                ...holding,
+                peakPnlPct: pnlPct
+              };
+              addHolding(wallet.address, updatedHolding);
+              logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] Early contrarian new peak profit: ${pnlPct.toFixed(2)}% (was ${currentPeakPnl.toFixed(2)}%)`);
 
-            // Don't sell - let it keep climbing
-            return;
-          }
-
-          // Check trailing stop - active ANYTIME during position
-          const trailingStopThreshold = 30;
-          const dropFromPeak = currentPeakPnl - pnlPct;
-
-          if (dropFromPeak >= trailingStopThreshold) {
-            // Trailing stop triggered - sell entire position
-            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Trailing stop triggered! Peak=${currentPeakPnl.toFixed(2)}%, Current=${pnlPct.toFixed(2)}%, Drop=${dropFromPeak.toFixed(2)}% (>= ${trailingStopThreshold}%)`);
-
-            const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
-            if (!approvedOk) {
-              logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping trailing stop sell this tick.');
+              // Don't sell - let it keep climbing
               return;
             }
 
-            // Sell entire position
-            const maxOutcomeTokensToSell = tokenBalance;
-            const returnAmountForSell = positionValue > 0n ? positionValue - (positionValue / 100n) : 0n;
+            // Check trailing stop - active between minutes 10-45
+            const trailingStopThreshold = 30;
+            const dropFromPeak = currentPeakPnl - pnlPct;
 
-            const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
-            if (!gasEst) {
-              logWarn(wallet.address, '🛑', 'Gas estimate sell failed; skipping trailing stop sell this tick.');
+            if (dropFromPeak >= trailingStopThreshold) {
+              // Trailing stop triggered - sell entire position
+              logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Trailing stop triggered! Peak=${currentPeakPnl.toFixed(2)}%, Current=${pnlPct.toFixed(2)}%, Drop=${dropFromPeak.toFixed(2)}% (>= ${trailingStopThreshold}%)`);
+
+              const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
+              if (!approvedOk) {
+                logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping trailing stop sell this tick.');
+                return;
+              }
+
+              // Sell entire position
+              const maxOutcomeTokensToSell = tokenBalance;
+              const returnAmountForSell = positionValue > 0n ? positionValue - (positionValue / 100n) : 0n;
+
+              const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
+              if (!gasEst) {
+                logWarn(wallet.address, '🛑', 'Gas estimate sell failed; skipping trailing stop sell this tick.');
+                return;
+              }
+
+              const padded = (gasEst * 120n) / 100n + 10000n;
+              const sellOv = await txOverrides(wallet.provider, padded);
+              const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
+              logInfo(wallet.address, '🧾', `Trailing stop sell tx: ${tx.hash}`);
+              const receipt = await tx.wait(CONFIRMATIONS);
+
+              const pnlUSDC = parseFloat(ethers.formatUnits(positionValue - cost, decimals));
+              logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Early contrarian sold on trailing stop. Peak=${currentPeakPnl.toFixed(2)}%, Exit=${pnlPct.toFixed(2)}%`);
+
+              logTrade({
+                type: 'SELL_TRAILING_STOP',
+                wallet: wallet.address,
+                marketAddress,
+                marketTitle: marketInfo?.title || 'Unknown',
+                outcome: outcomeIndex,
+                costUSDC: ethers.formatUnits(cost, decimals),
+                returnUSDC: ethers.formatUnits(positionValue, decimals),
+                pnlUSDC: pnlUSDC.toFixed(4),
+                pnlPercent: pnlPct.toFixed(2),
+                peakPnlPercent: currentPeakPnl.toFixed(2),
+                reason: `Trailing stop: Peak ${currentPeakPnl.toFixed(2)}% → ${pnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}%)`,
+                txHash: tx.hash,
+                blockNumber: receipt.blockNumber,
+                gasUsed: receipt.gasUsed.toString()
+              });
+              updateStats(pnlUSDC);
+
+              removeHolding(wallet.address, marketAddress, 'early_contrarian');
+              logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed early_contrarian holding after trailing stop`);
+              return;
+            } else {
+              // Still within trailing stop range - hold
+              logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] Early contrarian holding: Peak=${currentPeakPnl.toFixed(2)}%, Current=${pnlPct.toFixed(2)}%, Drop=${dropFromPeak.toFixed(2)}% (< ${trailingStopThreshold}% stop)`);
               return;
             }
-
-            const padded = (gasEst * 120n) / 100n + 10000n;
-            const sellOv = await txOverrides(wallet.provider, padded);
-            const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
-            logInfo(wallet.address, '🧾', `Trailing stop sell tx: ${tx.hash}`);
-            const receipt = await tx.wait(CONFIRMATIONS);
-
-            const pnlUSDC = parseFloat(ethers.formatUnits(positionValue - cost, decimals));
-            logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Early contrarian sold on trailing stop. Peak=${currentPeakPnl.toFixed(2)}%, Exit=${pnlPct.toFixed(2)}%`);
-
-            logTrade({
-              type: 'SELL_TRAILING_STOP',
-              wallet: wallet.address,
-              marketAddress,
-              marketTitle: marketInfo?.title || 'Unknown',
-              outcome: outcomeIndex,
-              costUSDC: ethers.formatUnits(cost, decimals),
-              returnUSDC: ethers.formatUnits(positionValue, decimals),
-              pnlUSDC: pnlUSDC.toFixed(4),
-              pnlPercent: pnlPct.toFixed(2),
-              peakPnlPercent: currentPeakPnl.toFixed(2),
-              reason: `Trailing stop: Peak ${currentPeakPnl.toFixed(2)}% → ${pnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}%)`,
-              txHash: tx.hash,
-              blockNumber: receipt.blockNumber,
-              gasUsed: receipt.gasUsed.toString()
-            });
-            updateStats(pnlUSDC);
-
-            removeHolding(wallet.address, marketAddress, 'early_contrarian');
-            logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed early_contrarian holding after trailing stop`);
-            return;
           } else {
-            // Still within trailing stop range - hold
-            logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] Early contrarian holding: Peak=${currentPeakPnl.toFixed(2)}%, Current=${pnlPct.toFixed(2)}%, Drop=${dropFromPeak.toFixed(2)}% (< ${trailingStopThreshold}% stop)`);
+            // After minute 45 - no trailing stop, position rides to end if in loss
+            logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] After minute 45 - early contrarian position riding to end (no more sells)`);
             return;
           }
         }
