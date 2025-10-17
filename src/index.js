@@ -2852,8 +2852,22 @@ async function runForWallet(wallet, provider) {
       }
 
       // Independent Moonshot Strategy: Can trigger even if late window doesn't buy
-      // Moonshot ignores MIN_MARKET_AGE_MINUTES - only cares about last 2 minutes
-      if (MOONSHOT_ENABLED && inMoonshotWindow && !nearDeadlineForBet) {
+      // Moonshot ignores MIN_MARKET_AGE_MINUTES and nearDeadlineForBet - only cares about MOONSHOT_WINDOW_MINUTES
+      // Works in last N minutes based on MOONSHOT_WINDOW_MINUTES parameter
+      if (MOONSHOT_ENABLED && inMoonshotWindow) {
+        // Safety check: Don't buy in final 30 seconds to ensure transaction can complete
+        if (marketInfo.deadline) {
+          const deadlineMs = new Date(marketInfo.deadline).getTime();
+          const nowMs = Date.now();
+          const remainingMs = deadlineMs - nowMs;
+          const remainingSec = Math.floor(remainingMs / 1000);
+
+          if (remainingMs < 30 * 1000) {
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot window active but only ${remainingSec}s remaining - too close to deadline for safe transaction`);
+            return;
+          }
+        }
+
         // Check if we already have a moonshot position
         const moonshotHolding = getHolding(wallet.address, marketAddress, 'moonshot');
         if (moonshotHolding) {
