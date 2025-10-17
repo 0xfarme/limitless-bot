@@ -2307,7 +2307,7 @@ async function runForWallet(wallet, provider) {
         // Hold positions during last 13 minutes if using last-minute strategy - don't take profits early
         if (inLastThirteenMinutes && strategyType === 'default') {
           logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Holding position until market closes (last 13min strategy)`);
-          return;
+          // Don't return - other strategies may want to trade
         }
 
         // Contrarian strategies: Force sell at minute 45 to clear for late strategy
@@ -2369,12 +2369,14 @@ async function runForWallet(wallet, provider) {
 
               removeHolding(wallet.address, marketAddress, strategyType);
               logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed ${strategyType} holding after force sell`);
-              return;
+              // Don't return - other strategies (like late window) may want to trade
+              // Fall through to buy logic below
             } else if (pnlAbs <= 0n) {
               // In loss - keep position, let it ride for potential recovery
               const displayName = strategyType === 'early_contrarian' ? 'Early contrarian' : 'Late contrarian';
               logInfo(wallet.address, '📉', `[${marketAddress.substring(0, 8)}...] Minute 45 - ${displayName} in loss (PnL=${pnlPct.toFixed(2)}%) - keeping position to ride out`);
-              return;
+              // Don't return - other strategies (like late window) may want to trade
+              // Fall through to buy logic below
             }
           }
         }
@@ -2616,6 +2618,8 @@ async function runForWallet(wallet, provider) {
       // Mark as buying NOW to prevent race conditions
       buyingInProgress.add(marketKey);
 
+      // Use try/finally to ensure buyingInProgress is always cleared
+      try {
       // Additional guardrails for betting:
       const positionIdsValid = Array.isArray(positionIds) && positionIds.length >= 2 && positionIds[0] && positionIds[1];
       if (!positionIdsValid) {
@@ -2894,6 +2898,10 @@ async function runForWallet(wallet, provider) {
       // Regular buy logic is DISABLED - only using configured strategies (early contrarian + late timing)
       logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Not in any strategy window - waiting`);
       return;
+      } finally {
+        // Always clear the buyingInProgress lock, even if buy failed or returned early
+        buyingInProgress.delete(marketKey);
+      }
     } catch (err) {
       logErr(wallet.address, '💥', `Error processing market: ${err && err.message ? err.message : err}`);
       if (err.stack) {
