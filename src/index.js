@@ -2002,7 +2002,7 @@ async function runForWallet(wallet, provider) {
           // Check if in last N minutes - stop loss active
           if (remainingMs <= STOP_LOSS_MINUTES * 60 * 1000 && remainingMs > 0) {
             inLastThreeMinutes = true;
-            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last ${STOP_LOSS_MINUTES} minutes (${remMin}m remaining) - stop loss active if below ${STOP_LOSS_ODDS_THRESHOLD}%`);
+            logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] In last ${STOP_LOSS_MINUTES} minutes (${remMin}m remaining) - stop loss active if PnL below ${STOP_LOSS_PNL_PCT}%`);
           }
 
           // Check if in buy window
