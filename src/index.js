@@ -33,12 +33,17 @@ const LATE_BUY_AMOUNT_USDC = process.env.LATE_BUY_AMOUNT_USDC ? Number(process.e
 function getBuyAmountForStrategy(strategy) {
   // Normalize strategy name
   const isEarly = strategy && strategy.includes('early');
+  const isMoonshot = strategy && strategy.includes('moonshot');
+  const isLate = strategy && (strategy === 'default' || strategy.includes('late'));
 
   // Check strategy-specific amount first
   if (isEarly && EARLY_BUY_AMOUNT_USDC !== null) {
     return EARLY_BUY_AMOUNT_USDC;
   }
-  if (!isEarly && LATE_BUY_AMOUNT_USDC !== null) {
+  if (isMoonshot) {
+    return MOONSHOT_AMOUNT_USDC;
+  }
+  if (isLate && LATE_BUY_AMOUNT_USDC !== null) {
     return LATE_BUY_AMOUNT_USDC;
   }
 
@@ -62,10 +67,13 @@ const STATS_FILE = process.env.STATS_FILE || path.join('data', 'stats.json');
 const REDEMPTION_LOG_FILE = process.env.REDEMPTION_LOG_FILE || path.join('data', 'redemptions.jsonl');
 
 // ========= Trading Strategy Config =========
+// Late window (default) strategy - always enabled unless explicitly disabled
+const LATE_STRATEGY_ENABLED = (process.env.LATE_STRATEGY_ENABLED || 'true').toLowerCase() === 'true'; // Enable late window strategy
 const BUY_WINDOW_MINUTES = parseInt(process.env.BUY_WINDOW_MINUTES || '13', 10); // Last N minutes to buy
 const NO_BUY_FINAL_MINUTES = parseInt(process.env.NO_BUY_FINAL_MINUTES || '2', 10); // Don't buy in last N minutes
 const STOP_LOSS_MINUTES = parseInt(process.env.STOP_LOSS_MINUTES || '2', 10); // Stop loss active in last N minutes
-const STOP_LOSS_ODDS_THRESHOLD = parseInt(process.env.STOP_LOSS_ODDS_THRESHOLD || '40', 10); // Sell if odds below N%
+const STOP_LOSS_ENABLED = (process.env.STOP_LOSS_ENABLED || 'true').toLowerCase() === 'true'; // Enable stop loss
+const STOP_LOSS_PNL_PCT = parseInt(process.env.STOP_LOSS_PNL_PCT || '-50', 10); // Sell if PnL drops below N%
 const MIN_ODDS = parseInt(process.env.MIN_ODDS || '75', 10); // Minimum odds to buy
 const MAX_ODDS = parseInt(process.env.MAX_ODDS || '95', 10); // Maximum odds to buy
 const MIN_MARKET_AGE_MINUTES = parseInt(process.env.MIN_MARKET_AGE_MINUTES || '10', 10); // Don't buy markets younger than N minutes
@@ -83,9 +91,8 @@ const MOONSHOT_MAX_ODDS = parseInt(process.env.MOONSHOT_MAX_ODDS || '10', 10); /
 const MOONSHOT_AMOUNT_USDC = parseFloat(process.env.MOONSHOT_AMOUNT_USDC || '1'); // Amount to invest in moonshot
 const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_PCT || '100', 10); // Sell at N% profit
 
-// ========= Partial Sell Config =========
-const PARTIAL_SELL_ENABLED = (process.env.PARTIAL_SELL_ENABLED || 'true').toLowerCase() === 'true'; // Enable partial sells at profit target
-const PARTIAL_SELL_PCT = parseInt(process.env.PARTIAL_SELL_PCT || '90', 10); // Sell N% of position at profit target (keep rest riding)
+// ========= Sell Config =========
+// Always sell 100% of positions - no partial sells
 
 // ========= Redemption Config =========
 const AUTO_REDEEM_ENABLED = (process.env.AUTO_REDEEM_ENABLED || 'true').toLowerCase() === 'true'; // Enable automatic redemption
@@ -1273,6 +1280,15 @@ async function runForWallet(wallet, provider) {
     const now = new Date();
     const nowMinutes = now.getMinutes();
 
+    // Check if ANY strategy is enabled
+    const anyStrategyEnabled = EARLY_STRATEGY_ENABLED || LATE_STRATEGY_ENABLED || MOONSHOT_ENABLED;
+    const hasActiveStrategies = anyStrategyEnabled || AUTO_REDEEM_ENABLED;
+
+    // If no strategies enabled and no redemption, always sleep
+    if (!hasActiveStrategies) {
+      return false; // Deep sleep - no trading or redemption enabled
+    }
+
     // Always stay active if we have open positions (need to monitor for profit targets)
     if (wallet) {
       const holdings = getAllHoldings(wallet.address);
@@ -1287,8 +1303,8 @@ async function runForWallet(wallet, provider) {
     // Early contrarian window: first 30 minutes of each hour (if enabled)
     const inEarlyWindow = EARLY_STRATEGY_ENABLED && nowMinutes <= EARLY_WINDOW_MINUTES;
 
-    // Last 13 minutes trading window: minutes 47-60
-    const inLateWindow = nowMinutes >= (60 - BUY_WINDOW_MINUTES);
+    // Last 13 minutes trading window: minutes 47-60 (if late window strategy enabled)
+    const inLateWindow = LATE_STRATEGY_ENABLED && nowMinutes >= (60 - BUY_WINDOW_MINUTES);
 
     return inRedemptionWindow || inEarlyWindow || inLateWindow;
   }
@@ -1342,10 +1358,34 @@ async function runForWallet(wallet, provider) {
     }
 
     if (!isActive) {
+      // Check if all strategies are disabled
+      const allStrategiesDisabled = !EARLY_STRATEGY_ENABLED && !LATE_STRATEGY_ENABLED && !MOONSHOT_ENABLED && !AUTO_REDEEM_ENABLED;
+
+      if (allStrategiesDisabled) {
+        // Deep sleep mode - no strategies enabled
+        if (holdings.length > 0) {
+          logWarn(wallet.address, '⚠️', `💤 DEEP SLEEP: All strategies disabled but ${holdings.length} position(s) exist. Enable strategies to trade.`);
+        } else {
+          // Only log once per hour to avoid spam
+          const shouldLog = nowMinutes === 0 || (nowMinutes % 15 === 0); // Log every 15 minutes
+          if (shouldLog) {
+            logInfo(wallet.address, '💤', `DEEP SLEEP: All trading strategies disabled. Enable EARLY_STRATEGY_ENABLED, LATE_STRATEGY_ENABLED, or MOONSHOT_ENABLED to start trading.`);
+          }
+        }
+        return;
+      }
+
+      // Normal sleep between trading windows
       const nextWakeMs = getNextWakeTime();
       const nextWakeMinutes = Math.floor(nextWakeMs / 60000);
       const nextWakeSeconds = Math.floor((nextWakeMs % 60000) / 1000);
-      logInfo(wallet.address, '💤', `Bot in sleep mode (minute ${nowMinutes}, ${holdings.length} positions) - Next wake in ${nextWakeMinutes}m ${nextWakeSeconds}s`);
+
+      const activeStrategies = [];
+      if (EARLY_STRATEGY_ENABLED) activeStrategies.push('Early');
+      if (LATE_STRATEGY_ENABLED) activeStrategies.push('Late');
+      if (MOONSHOT_ENABLED) activeStrategies.push('Moonshot');
+
+      logInfo(wallet.address, '💤', `Sleep mode (minute ${nowMinutes}, ${holdings.length} positions, strategies: ${activeStrategies.join('+')}) - Wake in ${nextWakeMinutes}m ${nextWakeSeconds}s`);
 
       // Critical warning if we have positions but bot is sleeping during redemption window
       if (inRedemptionWindow && holdings.length > 0) {
@@ -2137,39 +2177,30 @@ async function runForWallet(wallet, provider) {
           logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] [${strategyLabel}] Position Side ${outcomeIndex}: Entry ${entryPrice}% → Now ${currentPrice}% | Balance=${tokenBalance.toString()} tokens | Cost=${costHuman} USDC (PnL unavailable - market may be closed)`);
         }
 
-        // Stop loss: sell if our position's odds drop below threshold in last 2 minutes
-        // Skip if calcSellAmount failed (market likely closed)
-        if (inLastThreeMinutes && !calcSellFailed) {
-          const ourPositionPrice = prices[outcomeIndex];
+        // Stop loss: sell if PnL drops below threshold in last N minutes
+        // Skip if calcSellAmount failed (market likely closed) or if we can't calculate PnL
+        if (STOP_LOSS_ENABLED && inLastThreeMinutes && !calcSellFailed && !Number.isNaN(pnlPct) && pnlPct < STOP_LOSS_PNL_PCT) {
+          logInfo(wallet.address, '🚨', `[${marketAddress.substring(0, 8)}...] Stop loss! PnL ${pnlPct.toFixed(2)}% below threshold ${STOP_LOSS_PNL_PCT}%`);
 
-          if (ourPositionPrice < STOP_LOSS_ODDS_THRESHOLD) {
-            logInfo(wallet.address, '🚨', `[${marketAddress.substring(0, 8)}...] Stop loss! Last ${STOP_LOSS_MINUTES} minutes - our outcome ${outcomeIndex} odds at ${ourPositionPrice}% (below ${STOP_LOSS_ODDS_THRESHOLD}%)`);
-            const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
-            if (!approvedOk) {
-              logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping stop loss sell this tick.');
-              return;
-            }
-            const maxOutcomeTokensToSell = tokenBalance;
-            const returnAmountForSell = positionValue > 0n ? positionValue - (positionValue / 100n) : 0n; // minus 1% safety
-            logInfo(wallet.address, '🧮', `Stop loss sell: maxTokens=${maxOutcomeTokensToSell}, returnAmount=${returnAmountForSell}`);
-            const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
-            if (!gasEst) {
-              logWarn(wallet.address, '🛑', 'Gas estimate sell failed; skipping stop loss sell this tick.');
-              return;
-            }
-            logInfo(wallet.address, '⛽', `Gas estimate sell: ${gasEst}`);
-            const padded = (gasEst * 120n) / 100n + 10000n;
-            const sellOv = await txOverrides(wallet.provider, padded);
-            logInfo(wallet.address, '💸', `Sending stop loss sell transaction: returnAmount=${returnAmountForSell}, outcome=${outcomeIndex}, maxTokens=${maxOutcomeTokensToSell}`);
-            const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
-            logInfo(wallet.address, '🧾', `Stop loss sell tx: ${tx.hash}`);
-            const sellReceipt = await tx.wait(CONFIRMATIONS);
+          const maxOutcomeTokensToSell = tokenBalance;
+          const returnAmountForSell = positionValue > 0n ? positionValue - (positionValue / 100n) : 0n;
+          logInfo(wallet.address, '🧮', `Stop loss sell: maxTokens=${maxOutcomeTokensToSell}, returnAmount=${returnAmountForSell}`);
 
-            // Calculate PNL for stop loss
+          // Check if this strategy should be simulated
+          const isSimulated = shouldSimulateStrategy(holding?.strategy || 'default');
+          if (isSimulated) {
+            logInfo(wallet.address, '🎭', `[SIMULATED STOP LOSS] Skipping real transaction - recording simulated stop loss sell`, holding?.strategy);
+
+            // Create simulated transaction
+            const simTxHash = `0xsim${Date.now().toString(16)}${Math.random().toString(16).substring(2, 10)}`;
+            const simBlockNumber = Math.floor(Date.now() / 1000);
+            const tx = { hash: simTxHash };
+            const sellReceipt = { blockNumber: simBlockNumber, gasUsed: 100000n };
+
             const pnlUSDC = parseFloat(ethers.formatUnits(positionValue - cost, decimals));
-            logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Stop loss sell completed. Odds: ${ourPositionPrice}% (below ${STOP_LOSS_ODDS_THRESHOLD}%)`);
+            logInfo(wallet.address, '✅', `[SIMULATED] Stop loss sell completed. PnL: ${pnlPct.toFixed(2)}%`, holding?.strategy);
 
-            // Log sell trade and update stats
+            // Log simulated stop loss trade
             logTrade({
               type: 'SELL_STOP_LOSS',
               wallet: wallet.address,
@@ -2180,22 +2211,69 @@ async function runForWallet(wallet, provider) {
               returnUSDC: ethers.formatUnits(positionValue, decimals),
               pnlUSDC: pnlUSDC.toFixed(4),
               pnlPercent: pnlPct.toFixed(2),
-              reason: `Stop loss - odds ${ourPositionPrice}% < ${STOP_LOSS_ODDS_THRESHOLD}%`,
+              reason: `Stop loss - PnL ${pnlPct.toFixed(2)}% < ${STOP_LOSS_PNL_PCT}%`,
               txHash: tx.hash,
               blockNumber: sellReceipt.blockNumber,
               gasUsed: sellReceipt.gasUsed.toString()
             });
             updateStats(pnlUSDC);
 
-            // Remove only this strategy's holding, not all holdings for this market
             const strategyToRemove = holding?.strategy || 'default';
             removeHolding(wallet.address, marketAddress, strategyToRemove);
-
-            // Don't mark market as completed - other strategies may still want to trade it
-            // markMarketCompleted(wallet.address, marketAddress);
-            logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed ${strategyToRemove} holding after stop loss`);
+            logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] [SIMULATED] Removed ${strategyToRemove} holding after stop loss`, holding?.strategy);
             return;
           }
+
+          // REAL MODE: Execute actual stop loss
+          const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
+          if (!approvedOk) {
+            logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping stop loss sell this tick.');
+            return;
+          }
+
+          const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
+          if (!gasEst) {
+            logWarn(wallet.address, '🛑', 'Gas estimate sell failed; skipping stop loss sell this tick.');
+            return;
+          }
+          logInfo(wallet.address, '⛽', `Gas estimate sell: ${gasEst}`);
+          const padded = (gasEst * 120n) / 100n + 10000n;
+          const sellOv = await txOverrides(wallet.provider, padded);
+          logInfo(wallet.address, '💸', `Sending stop loss sell transaction: returnAmount=${returnAmountForSell}, outcome=${outcomeIndex}, maxTokens=${maxOutcomeTokensToSell}`);
+          const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
+          logInfo(wallet.address, '🧾', `Stop loss sell tx: ${tx.hash}`);
+          const sellReceipt = await tx.wait(CONFIRMATIONS);
+
+          // Calculate PNL for stop loss
+          const pnlUSDC = parseFloat(ethers.formatUnits(positionValue - cost, decimals));
+          logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Stop loss sell completed. PnL: ${pnlPct.toFixed(2)}%`);
+
+          // Log sell trade and update stats
+          logTrade({
+            type: 'SELL_STOP_LOSS',
+            wallet: wallet.address,
+            marketAddress,
+            marketTitle: marketInfo?.title || 'Unknown',
+            outcome: outcomeIndex,
+            costUSDC: ethers.formatUnits(cost, decimals),
+            returnUSDC: ethers.formatUnits(positionValue, decimals),
+            pnlUSDC: pnlUSDC.toFixed(4),
+            pnlPercent: pnlPct.toFixed(2),
+            reason: `Stop loss - PnL ${pnlPct.toFixed(2)}% < ${STOP_LOSS_PNL_PCT}%`,
+            txHash: tx.hash,
+            blockNumber: sellReceipt.blockNumber,
+            gasUsed: sellReceipt.gasUsed.toString()
+          });
+          updateStats(pnlUSDC);
+
+          // Remove only this strategy's holding, not all holdings for this market
+          const strategyToRemove = holding?.strategy || 'default';
+          removeHolding(wallet.address, marketAddress, strategyToRemove);
+
+          // Don't mark market as completed - other strategies may still want to trade it
+          // markMarketCompleted(wallet.address, marketAddress);
+          logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed ${strategyToRemove} holding after stop loss`);
+          return;
         }
 
         // Determine profit target based on strategy
@@ -2279,7 +2357,7 @@ async function runForWallet(wallet, provider) {
           }
         }
 
-        // Check if we already took profits on this position (for partial sells)
+        // Check if we already took profits on this position
         const alreadyTookProfit = holding?.profitTaken === true;
 
         // Debug logging for sell decision
@@ -2375,16 +2453,8 @@ async function runForWallet(wallet, provider) {
 
         // Only attempt profit-taking if calcSellAmount succeeded (market is active)
         if (!calcSellFailed && pnlAbs > 0n && pnlPct >= profitTarget && !alreadyTookProfit) {
-          // Determine if this is a partial or full sell
-          let sellPercentage = 100;
-          let keepPercentage = 0;
-
-          // Use partial sell configuration
-          const isPartialSell = PARTIAL_SELL_ENABLED;
-          sellPercentage = isPartialSell ? PARTIAL_SELL_PCT : 100;
-          keepPercentage = 100 - sellPercentage;
-
-          logInfo(wallet.address, '🎯', `Profit target reached! PnL=${pnlPct.toFixed(2)}% >= ${profitTarget}% (${strategyType} strategy). Initiating ${sellPercentage}% sell (keeping ${keepPercentage}% riding)...`);
+          // Always sell 100% of position
+          logInfo(wallet.address, '🎯', `Profit target reached! PnL=${pnlPct.toFixed(2)}% >= ${profitTarget}% (${strategyType} strategy). Selling 100% of position...`);
 
           const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
           if (!approvedOk) {
@@ -2392,17 +2462,58 @@ async function runForWallet(wallet, provider) {
             return;
           }
 
-          // Calculate partial sell amounts
-          const tokensToSell = (tokenBalance * BigInt(sellPercentage)) / 100n;
-          const partialPositionValue = (positionValue * BigInt(sellPercentage)) / 100n;
-          const partialCost = (cost * BigInt(sellPercentage)) / 100n;
+          // Sell 100% of position
+          const maxOutcomeTokensToSell = tokenBalance;
+          const returnAmountForSell = positionValue - (positionValue / 100n); // minus 1% safety
 
-          // Per spec: sell with maxOutcomeTokensToSell; returnAmount reduced by 1% fee safety
-          const maxOutcomeTokensToSell = tokensToSell;
-          const returnAmountForSell = partialPositionValue - (partialPositionValue / 100n); // minus 1% safety
+          logInfo(wallet.address, '🧮', `Calculating 100% sell: maxTokens=${maxOutcomeTokensToSell}, returnAmount=${returnAmountForSell} (positionValue=${positionValue} - 1% safety)`);
 
-          logInfo(wallet.address, '🧮', `Calculating ${sellPercentage}% sell: maxTokens=${maxOutcomeTokensToSell} (of ${tokenBalance}), returnAmount=${returnAmountForSell} (positionValue=${partialPositionValue} - 1% safety)`);
+          // SIMULATION MODE: Skip actual transaction, track PnL
+          const isSimulated = shouldSimulateStrategy(strategyType);
+          if (isSimulated) {
+            logInfo(wallet.address, '🎭', `[SIMULATED ${strategyType.toUpperCase()} SELL] Skipping real transaction - recording simulated profit sell`, strategyType);
 
+            // Create simulated transaction hash
+            const simTxHash = `0xsim${Date.now().toString(16)}${Math.random().toString(16).substring(2, 10)}`;
+            const simBlockNumber = Math.floor(Date.now() / 1000);
+
+            const tx = { hash: simTxHash };
+            const profitSellReceipt = { blockNumber: simBlockNumber, gasUsed: 100000n };
+
+            // Calculate PNL for full position
+            const pnlAbsValue = positionValue - cost;
+            const pnlUSDC = parseFloat(ethers.formatUnits(pnlAbsValue, decimals));
+            const pnlAbsHuman = fmtUnitsPrec(pnlAbsValue >= 0n ? pnlAbsValue : -pnlAbsValue, decimals, 4);
+            const signEmoji = pnlAbsValue >= 0n ? '🔺' : '🔻';
+
+            logInfo(wallet.address, '✅', `[SIMULATED] 100% sell completed. PnL: ${signEmoji}${pnlAbsHuman} USDC (${pnlPct.toFixed(2)}%)`, strategyType);
+
+            // Log simulated sell trade
+            logTrade({
+              type: 'SELL_PROFIT',
+              wallet: wallet.address,
+              marketAddress,
+              marketTitle: marketInfo?.title || 'Unknown',
+              outcome: outcomeIndex,
+              costUSDC: ethers.formatUnits(cost, decimals),
+              returnUSDC: ethers.formatUnits(positionValue, decimals),
+              pnlUSDC: pnlUSDC.toFixed(4),
+              pnlPercent: pnlPct.toFixed(2),
+              reason: `Profit target reached ${pnlPct.toFixed(2)}% >= ${profitTarget}% - sold 100%`,
+              txHash: tx.hash,
+              blockNumber: profitSellReceipt.blockNumber,
+              gasUsed: profitSellReceipt.gasUsed.toString()
+            });
+            updateStats(pnlUSDC);
+
+            // Full sell - remove holding
+            const strategyToRemove = holding?.strategy || 'default';
+            removeHolding(wallet.address, marketAddress, strategyToRemove);
+            logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] [SIMULATED] Removed ${strategyToRemove} holding after profit sell`, strategyType);
+            return; // Exit early - no real transaction
+          }
+
+          // REAL MODE: Execute actual sell transaction
           const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
           if (!gasEst) {
             logWarn(wallet.address, '🛑', 'Gas estimate sell failed; skipping sell this tick.');
@@ -2418,61 +2529,39 @@ async function runForWallet(wallet, provider) {
           logInfo(wallet.address, '⏳', `Waiting for ${CONFIRMATIONS} confirmation(s)...`);
           const profitSellReceipt = await tx.wait(CONFIRMATIONS);
 
-          // Calculate PNL for the sold portion
-          const partialPnlAbs = partialPositionValue - partialCost;
-          const pnlUSDC = parseFloat(ethers.formatUnits(partialPnlAbs, decimals));
-          const partialPnlAbsHuman = fmtUnitsPrec(partialPnlAbs >= 0n ? partialPnlAbs : -partialPnlAbs, decimals, 4);
+          // Calculate PNL for full position
+          const pnlAbsValue = positionValue - cost;
+          const pnlUSDC = parseFloat(ethers.formatUnits(pnlAbsValue, decimals));
+          const pnlAbsHuman = fmtUnitsPrec(pnlAbsValue >= 0n ? pnlAbsValue : -pnlAbsValue, decimals, 4);
+          const signEmoji = pnlAbsValue >= 0n ? '🔺' : '🔻';
 
-          logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] ${sellPercentage}% sell completed. PnL on sold portion: ${signEmoji}${partialPnlAbsHuman} USDC (${pnlPct.toFixed(2)}%)`);
+          logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] 100% sell completed. PnL: ${signEmoji}${pnlAbsHuman} USDC (${pnlPct.toFixed(2)}%)`);
 
           // Log sell trade and update stats
           logTrade({
-            type: isPartialSell ? 'SELL_PROFIT_PARTIAL' : 'SELL_PROFIT',
+            type: 'SELL_PROFIT',
             wallet: wallet.address,
             marketAddress,
             marketTitle: marketInfo?.title || 'Unknown',
             outcome: outcomeIndex,
-            costUSDC: ethers.formatUnits(partialCost, decimals),
-            returnUSDC: ethers.formatUnits(partialPositionValue, decimals),
+            costUSDC: ethers.formatUnits(cost, decimals),
+            returnUSDC: ethers.formatUnits(positionValue, decimals),
             pnlUSDC: pnlUSDC.toFixed(4),
             pnlPercent: pnlPct.toFixed(2),
-            sellPercentage: sellPercentage,
-            reason: `Profit target reached ${pnlPct.toFixed(2)}% >= ${profitTarget}% - sold ${sellPercentage}%, keeping ${keepPercentage}%`,
+            reason: `Profit target reached ${pnlPct.toFixed(2)}% >= ${profitTarget}% - sold 100%`,
             txHash: tx.hash,
             blockNumber: profitSellReceipt.blockNumber,
             gasUsed: profitSellReceipt.gasUsed.toString()
           });
           updateStats(pnlUSDC);
 
-          if (keepPercentage > 0) {
-            // Partial sell - update holding to reflect remaining position
-            const remainingTokens = tokenBalance - tokensToSell;
-            const remainingCost = cost - partialCost;
+          // Full sell - remove only this strategy's holding, not all holdings for this market
+          const strategyToRemove = holding?.strategy || 'default';
+          removeHolding(wallet.address, marketAddress, strategyToRemove);
 
-            logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Keeping ${keepPercentage.toFixed(1)}% position (${remainingTokens} tokens, cost=${ethers.formatUnits(remainingCost, decimals)} USDC) - letting it ride!`);
-
-            // Update the holding with remaining amounts
-            const updatedHolding = {
-              ...holding,
-              amount: remainingTokens,
-              cost: remainingCost,
-              profitTaken: true // Flag to prevent re-selling at same profit target
-            };
-            addHolding(wallet.address, updatedHolding);
-          } else {
-            // Full sell - remove only this strategy's holding, not all holdings for this market
-            const strategyToRemove = holding?.strategy || 'default';
-            removeHolding(wallet.address, marketAddress, strategyToRemove);
-
-            // Don't mark market as completed - other strategies may still want to trade it
-            // Only this specific strategy won't re-enter
-            // markMarketCompleted(wallet.address, marketAddress);
-            logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed ${strategyToRemove} holding after profit sell`);
-          }
+          // Don't mark market as completed - other strategies may still want to trade it
+          logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed ${strategyToRemove} holding after profit sell`);
           return;
-        } else if (alreadyTookProfit) {
-          // Already took profits, holding remaining position
-          logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Holding remaining ${100 - PARTIAL_SELL_PCT}% position - PnL=${pnlPct.toFixed(2)}% (profit already taken)`);
         } else {
           logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] Not profitable yet: PnL=${pnlPct.toFixed(2)}% < ${profitTarget}% (${strategyType} strategy)`);
         }
@@ -2509,12 +2598,25 @@ async function runForWallet(wallet, provider) {
 
       // NEW LOGIC: Check if we should use last 13 minutes strategy
       if (inLastThirteenMinutes) {
+        // Check if late strategy is enabled
+        if (!LATE_STRATEGY_ENABLED) {
+          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Late window strategy disabled - skipping`);
+          return;
+        }
+
         // Check if late strategy already has a position
         const lateStrategy = 'default';
         const lateHolding = getHolding(wallet.address, marketAddress, lateStrategy);
         if (lateHolding) {
           logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Late window strategy already has a position - skipping buy`);
           return;
+        }
+
+        // Check if early contrarian has a losing position that was carried over
+        const earlyHolding = getHolding(wallet.address, marketAddress, 'early_contrarian');
+        if (earlyHolding) {
+          // Early contrarian has a position (likely losing, since profitable ones sell at minute 45)
+          logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Early contrarian holding exists on outcome ${earlyHolding.outcomeIndex} - will only buy opposite side`);
         }
 
         // Check if in last 2 minutes - don't buy
@@ -2536,8 +2638,23 @@ async function runForWallet(wallet, provider) {
           return;
         }
 
-        // Buy the side that is in odds range
-        const outcomeToBuy = prices[0] >= MIN_ODDS && prices[0] <= MAX_ODDS ? 0 : 1;
+        // Determine which side is in odds range
+        let outcomeToBuy = prices[0] >= MIN_ODDS && prices[0] <= MAX_ODDS ? 0 : 1;
+
+        // If early contrarian has a position, only buy the opposite side
+        if (earlyHolding) {
+          const earlyOutcome = earlyHolding.outcomeIndex;
+          const oppositeOutcome = earlyOutcome === 0 ? 1 : 0;
+
+          // Check if the side we want to buy matches the early position
+          if (outcomeToBuy === earlyOutcome) {
+            logInfo(wallet.address, '🚫', `[${marketAddress.substring(0, 8)}...] Late window would buy outcome ${outcomeToBuy} but early contrarian already holds same side - skipping to avoid doubling down on losing position`);
+            return;
+          }
+
+          // We're buying the opposite side - this hedges the early position
+          logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Late window buying outcome ${outcomeToBuy} to hedge early contrarian position on outcome ${earlyOutcome}`);
+        }
         const investmentHuman = getBuyAmountForStrategy(lateStrategy);
         logInfo(wallet.address, '🎯', `[${marketAddress.substring(0, 8)}...] Last ${BUY_WINDOW_MINUTES}min strategy: Buying outcome ${outcomeToBuy} at ${prices[outcomeToBuy]}% with $${investmentHuman} USDC`);
 
@@ -2563,13 +2680,18 @@ async function runForWallet(wallet, provider) {
           // Moonshot is always the opposite side of what we just bought
           const moonshotOutcome = outcomeToBuy === 0 ? 1 : 0;
 
-          // Check if we already have a position on the opposite side from early contrarian
-          const allHoldingsForMarket = getHoldingsForMarket(wallet.address, marketAddress);
-          const oppositePositionExists = allHoldingsForMarket.some(h =>
-            h.outcomeIndex === moonshotOutcome && h.strategy !== 'default'
-          );
+          // Check if we already have a moonshot position
+          const moonshotHolding = getHolding(wallet.address, marketAddress, 'moonshot');
+          if (moonshotHolding) {
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping late window moonshot - already have moonshot position`);
+          } else {
+            // Check if we already have a position on the opposite side from early contrarian
+            const allHoldingsForMarket = getHoldingsForMarket(wallet.address, marketAddress);
+            const oppositePositionExists = allHoldingsForMarket.some(h =>
+              h.outcomeIndex === moonshotOutcome && h.strategy !== 'default'
+            );
 
-          if (oppositePositionExists) {
+            if (oppositePositionExists) {
             // Already have opposite side covered (e.g., early contrarian on NO in loss)
             // Minute 45 checkpoint keeps losing positions, so we ride them instead of moonshot
             const existingPosition = allHoldingsForMarket.find(h =>
@@ -2598,6 +2720,7 @@ async function runForWallet(wallet, provider) {
                 logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need ${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
               }
             }
+          }
           }
         }
 
@@ -2643,6 +2766,44 @@ async function runForWallet(wallet, provider) {
           return;
         } else {
           logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] In early window but max odds ${maxPrice}% < ${EARLY_TRIGGER_ODDS}% trigger - waiting`);
+          return;
+        }
+      }
+
+      // Independent Moonshot Strategy: Can trigger even if late window doesn't buy
+      // Moonshot ignores MIN_MARKET_AGE_MINUTES - only cares about last 2 minutes
+      if (MOONSHOT_ENABLED && inMoonshotWindow && !nearDeadlineForBet) {
+        // Check if we already have a moonshot position
+        const moonshotHolding = getHolding(wallet.address, marketAddress, 'moonshot');
+        if (moonshotHolding) {
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Already have moonshot position - skipping`);
+          return;
+        }
+
+        // Find the side with lowest odds (underdog)
+        const minPrice = Math.min(...prices);
+        const underdogSide = prices[0] === minPrice ? 0 : 1;
+        const underdogOdds = prices[underdogSide];
+
+        // Only buy if underdog odds are below threshold
+        if (underdogOdds <= MOONSHOT_MAX_ODDS) {
+          const moonshotStrategy = 'moonshot';
+          const investmentHuman = getBuyAmountForStrategy(moonshotStrategy);
+          const moonshotInvestment = ethers.parseUnits(investmentHuman.toString(), decimals);
+
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Independent moonshot! Underdog side ${underdogSide} at ${underdogOdds}% (<= ${MOONSHOT_MAX_ODDS}%) with $${investmentHuman} USDC`);
+
+          // Check USDC balance for moonshot
+          const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+          if (usdcBal >= moonshotInvestment) {
+            await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, underdogSide, decimals, pid0, pid1, erc1155, moonshotStrategy);
+            return;
+          } else {
+            logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need ${investmentHuman}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
+            return;
+          }
+        } else {
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] In moonshot window but underdog at ${underdogOdds}% (> ${MOONSHOT_MAX_ODDS}% threshold) - waiting`);
           return;
         }
       }
