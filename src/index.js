@@ -27,18 +27,23 @@ const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMO
 
 // Per-strategy buy amounts (overrides BUY_AMOUNT_USDC if set)
 const EARLY_BUY_AMOUNT_USDC = process.env.EARLY_BUY_AMOUNT_USDC ? Number(process.env.EARLY_BUY_AMOUNT_USDC) : null;
+const LATE_CONTRARIAN_BUY_AMOUNT_USDC = process.env.LATE_CONTRARIAN_BUY_AMOUNT_USDC ? Number(process.env.LATE_CONTRARIAN_BUY_AMOUNT_USDC) : null;
 const LATE_BUY_AMOUNT_USDC = process.env.LATE_BUY_AMOUNT_USDC ? Number(process.env.LATE_BUY_AMOUNT_USDC) : null;
 
 // Helper function to get buy amount for a strategy
 function getBuyAmountForStrategy(strategy) {
   // Normalize strategy name
-  const isEarly = strategy && strategy.includes('early');
+  const isEarly = strategy && strategy.includes('early') && !strategy.includes('late_contrarian');
+  const isLateContrarian = strategy && strategy.includes('late_contrarian');
   const isMoonshot = strategy && strategy.includes('moonshot');
-  const isLate = strategy && (strategy === 'default' || strategy.includes('late'));
+  const isLate = strategy && (strategy === 'default' || (strategy.includes('late') && !strategy.includes('contrarian')));
 
   // Check strategy-specific amount first
   if (isEarly && EARLY_BUY_AMOUNT_USDC !== null) {
     return EARLY_BUY_AMOUNT_USDC;
+  }
+  if (isLateContrarian && LATE_CONTRARIAN_BUY_AMOUNT_USDC !== null) {
+    return LATE_CONTRARIAN_BUY_AMOUNT_USDC;
   }
   if (isMoonshot) {
     return MOONSHOT_AMOUNT_USDC;
@@ -83,6 +88,13 @@ const EARLY_STRATEGY_ENABLED = (process.env.EARLY_STRATEGY_ENABLED || 'true').to
 const EARLY_WINDOW_MINUTES = parseInt(process.env.EARLY_WINDOW_MINUTES || '30', 10); // First N minutes for contrarian buys
 const EARLY_TRIGGER_ODDS = parseInt(process.env.EARLY_TRIGGER_ODDS || '70', 10); // Buy opposite side if one side reaches N%
 const EARLY_PROFIT_TARGET_PCT = parseInt(process.env.EARLY_PROFIT_TARGET_PCT || '20', 10); // Sell at N% profit
+
+// ========= Late Contrarian Strategy Config =========
+const LATE_CONTRARIAN_ENABLED = (process.env.LATE_CONTRARIAN_ENABLED || 'false').toLowerCase() === 'true'; // Enable late contrarian strategy
+const LATE_CONTRARIAN_WINDOW_START = parseInt(process.env.LATE_CONTRARIAN_WINDOW_START || '30', 10); // Start at minute N
+const LATE_CONTRARIAN_WINDOW_END = parseInt(process.env.LATE_CONTRARIAN_WINDOW_END || '45', 10); // End at minute N
+const LATE_CONTRARIAN_TRIGGER_ODDS = parseInt(process.env.LATE_CONTRARIAN_TRIGGER_ODDS || '70', 10); // Buy opposite side if one side reaches N%
+const LATE_CONTRARIAN_PROFIT_TARGET_PCT = parseInt(process.env.LATE_CONTRARIAN_PROFIT_TARGET_PCT || '20', 10); // Sell at N% profit
 
 // ========= Moonshot Strategy Config =========
 const MOONSHOT_ENABLED = (process.env.MOONSHOT_ENABLED || 'true').toLowerCase() === 'true'; // Enable moonshot strategy
@@ -1962,6 +1974,7 @@ async function runForWallet(wallet, provider) {
       let inLastTwoMinutes = false;
       let inLastThreeMinutes = false;
       let inEarlyWindow = false;
+      let inLateContrarianWindow = false;
       let inMoonshotWindow = false;
 
       // Early contrarian strategy window check - based on MINUTE OF THE HOUR
@@ -1972,6 +1985,12 @@ async function runForWallet(wallet, provider) {
       if (EARLY_STRATEGY_ENABLED && currentMinuteOfHour >= EARLY_WINDOW_START && currentMinuteOfHour <= EARLY_WINDOW_END) {
         inEarlyWindow = true;
         logInfo(wallet.address, '🌅', `[${marketAddress.substring(0, 8)}...] In early window (minute ${currentMinuteOfHour}, window: ${EARLY_WINDOW_START}-${EARLY_WINDOW_END}) - contrarian strategy active`);
+      }
+
+      // Late contrarian strategy window check - minutes 30-45
+      if (LATE_CONTRARIAN_ENABLED && currentMinuteOfHour >= LATE_CONTRARIAN_WINDOW_START && currentMinuteOfHour <= LATE_CONTRARIAN_WINDOW_END) {
+        inLateContrarianWindow = true;
+        logInfo(wallet.address, '🌆', `[${marketAddress.substring(0, 8)}...] In late contrarian window (minute ${currentMinuteOfHour}, window: ${LATE_CONTRARIAN_WINDOW_START}-${LATE_CONTRARIAN_WINDOW_END}) - contrarian strategy active`);
       }
 
       // Check market age for "too new" restriction
@@ -2291,8 +2310,9 @@ async function runForWallet(wallet, provider) {
           return;
         }
 
-        // Early contrarian strategy: Force sell at minute 45 to clear for late strategy
-        if (strategyType === 'early_contrarian') {
+        // Contrarian strategies: Force sell at minute 45 to clear for late strategy
+        const isContrarianStrategy = strategyType === 'early_contrarian' || strategyType === 'late_contrarian';
+        if (isContrarianStrategy) {
           const now = new Date();
           const currentMinute = now.getMinutes();
 
@@ -2300,7 +2320,8 @@ async function runForWallet(wallet, provider) {
           if (currentMinute === 45) {
             if (!calcSellFailed && pnlAbs > 0n) {
               // In profit - force sell entire position
-              logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] Minute 45 - Force selling early_contrarian position (PnL=${pnlPct.toFixed(2)}%) to clear for late strategy`);
+              const strategyName = strategyType === 'early_contrarian' ? 'early_contrarian' : 'late_contrarian';
+              logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] Minute 45 - Force selling ${strategyName} position (PnL=${pnlPct.toFixed(2)}%) to clear for late strategy`);
 
               const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
               if (!approvedOk) {
@@ -2327,10 +2348,10 @@ async function runForWallet(wallet, provider) {
               const receipt = await tx.wait(CONFIRMATIONS);
 
               const pnlUSDC = parseFloat(ethers.formatUnits(positionValue - cost, decimals));
-              logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Early contrarian force sold at minute 45. PnL=${pnlPct.toFixed(2)}%`);
+              logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] ${strategyName} force sold at minute 45. PnL=${pnlPct.toFixed(2)}%`);
 
               logTrade({
-                type: 'SELL_EARLY_FORCE',
+                type: strategyType === 'early_contrarian' ? 'SELL_EARLY_FORCE' : 'SELL_LATE_CONTRARIAN_FORCE',
                 wallet: wallet.address,
                 marketAddress,
                 marketTitle: marketInfo?.title || 'Unknown',
@@ -2346,12 +2367,13 @@ async function runForWallet(wallet, provider) {
               });
               updateStats(pnlUSDC);
 
-              removeHolding(wallet.address, marketAddress, 'early_contrarian');
-              logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed early_contrarian holding after force sell`);
+              removeHolding(wallet.address, marketAddress, strategyType);
+              logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed ${strategyType} holding after force sell`);
               return;
             } else if (pnlAbs <= 0n) {
               // In loss - keep position, let it ride for potential recovery
-              logInfo(wallet.address, '📉', `[${marketAddress.substring(0, 8)}...] Minute 45 - Early contrarian in loss (PnL=${pnlPct.toFixed(2)}%) - keeping position to ride out`);
+              const displayName = strategyType === 'early_contrarian' ? 'Early contrarian' : 'Late contrarian';
+              logInfo(wallet.address, '📉', `[${marketAddress.substring(0, 8)}...] Minute 45 - ${displayName} in loss (PnL=${pnlPct.toFixed(2)}%) - keeping position to ride out`);
               return;
             }
           }
@@ -2363,11 +2385,12 @@ async function runForWallet(wallet, provider) {
         // Debug logging for sell decision
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Sell check: calcSellFailed=${calcSellFailed}, pnlAbs=${pnlAbs > 0n ? '+' : '-'}, pnlPct=${pnlPct.toFixed(2)}%, profitTarget=${profitTarget}%, alreadyTookProfit=${alreadyTookProfit}, strategy=${strategyType}`);
 
-        // Trailing stop for early_contrarian: Active ONLY between minutes 10-45
+        // Trailing stop for early_contrarian and late_contrarian
         const now = new Date();
         const currentMinute = now.getMinutes();
+        const isContrarian = strategyType === 'early_contrarian' || strategyType === 'late_contrarian';
 
-        if (strategyType === 'early_contrarian' && !calcSellFailed && pnlPct >= profitTarget) {
+        if (isContrarian && !calcSellFailed && pnlPct >= profitTarget) {
           // Only track/trigger trailing stop before minute 45
           if (currentMinute < 45) {
             // Always update peak profit when current profit is higher
@@ -2379,7 +2402,8 @@ async function runForWallet(wallet, provider) {
                 peakPnlPct: pnlPct
               };
               addHolding(wallet.address, updatedHolding);
-              logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] Early contrarian new peak profit: ${pnlPct.toFixed(2)}% (was ${currentPeakPnl.toFixed(2)}%)`);
+              const strategyName = strategyType === 'early_contrarian' ? 'Early contrarian' : 'Late contrarian';
+              logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] ${strategyName} new peak profit: ${pnlPct.toFixed(2)}% (was ${currentPeakPnl.toFixed(2)}%)`);
 
               // Don't sell - let it keep climbing
               return;
@@ -2391,7 +2415,8 @@ async function runForWallet(wallet, provider) {
 
             if (dropFromPeak >= trailingStopThreshold) {
               // Trailing stop triggered - sell entire position
-              logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Trailing stop triggered! Peak=${currentPeakPnl.toFixed(2)}%, Current=${pnlPct.toFixed(2)}%, Drop=${dropFromPeak.toFixed(2)}% (>= ${trailingStopThreshold}%)`);
+              const strategyName = strategyType === 'early_contrarian' ? 'Early contrarian' : 'Late contrarian';
+              logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] ${strategyName} trailing stop triggered! Peak=${currentPeakPnl.toFixed(2)}%, Current=${pnlPct.toFixed(2)}%, Drop=${dropFromPeak.toFixed(2)}% (>= ${trailingStopThreshold}%)`);
 
               const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
               if (!approvedOk) {
@@ -2416,7 +2441,7 @@ async function runForWallet(wallet, provider) {
               const receipt = await tx.wait(CONFIRMATIONS);
 
               const pnlUSDC = parseFloat(ethers.formatUnits(positionValue - cost, decimals));
-              logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Early contrarian sold on trailing stop. Peak=${currentPeakPnl.toFixed(2)}%, Exit=${pnlPct.toFixed(2)}%`);
+              logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] ${strategyName} sold on trailing stop. Peak=${currentPeakPnl.toFixed(2)}%, Exit=${pnlPct.toFixed(2)}%`);
 
               logTrade({
                 type: 'SELL_TRAILING_STOP',
@@ -2429,24 +2454,26 @@ async function runForWallet(wallet, provider) {
                 pnlUSDC: pnlUSDC.toFixed(4),
                 pnlPercent: pnlPct.toFixed(2),
                 peakPnlPercent: currentPeakPnl.toFixed(2),
-                reason: `Trailing stop: Peak ${currentPeakPnl.toFixed(2)}% → ${pnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}%)`,
+                reason: `${strategyName} trailing stop: Peak ${currentPeakPnl.toFixed(2)}% → ${pnlPct.toFixed(2)}% (dropped ${dropFromPeak.toFixed(2)}%)`,
                 txHash: tx.hash,
                 blockNumber: receipt.blockNumber,
                 gasUsed: receipt.gasUsed.toString()
               });
               updateStats(pnlUSDC);
 
-              removeHolding(wallet.address, marketAddress, 'early_contrarian');
-              logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed early_contrarian holding after trailing stop`);
+              removeHolding(wallet.address, marketAddress, strategyType);
+              logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed ${strategyType} holding after trailing stop`);
               return;
             } else {
               // Still within trailing stop range - hold
-              logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] Early contrarian holding: Peak=${currentPeakPnl.toFixed(2)}%, Current=${pnlPct.toFixed(2)}%, Drop=${dropFromPeak.toFixed(2)}% (< ${trailingStopThreshold}% stop)`);
+              const strategyName = strategyType === 'early_contrarian' ? 'Early contrarian' : 'Late contrarian';
+              logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] ${strategyName} holding: Peak=${currentPeakPnl.toFixed(2)}%, Current=${pnlPct.toFixed(2)}%, Drop=${dropFromPeak.toFixed(2)}% (< ${trailingStopThreshold}% stop)`);
               return;
             }
           } else {
             // After minute 45 - no trailing stop, position rides to end if in loss
-            logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] After minute 45 - early contrarian position riding to end (no more sells)`);
+            const strategyName = strategyType === 'early_contrarian' ? 'early contrarian' : 'late contrarian';
+            logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] After minute 45 - ${strategyName} position riding to end (no more sells)`);
             return;
           }
         }
@@ -2766,6 +2793,56 @@ async function runForWallet(wallet, provider) {
           return;
         } else {
           logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] In early window but max odds ${maxPrice}% < ${EARLY_TRIGGER_ODDS}% trigger - waiting`);
+          return;
+        }
+      }
+
+      // Late contrarian strategy: Buy opposite side if one side reaches threshold in minutes 30-45
+      if (inLateContrarianWindow && !tooNewForBet && !nearDeadlineForBet) {
+        // Check if late contrarian strategy already has a position
+        const lateContrarianStrategy = 'late_contrarian';
+        const lateContrarianHolding = getHolding(wallet.address, marketAddress, lateContrarianStrategy);
+        if (lateContrarianHolding) {
+          logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Late contrarian strategy already has a position - skipping buy`);
+          return;
+        }
+
+        // Check if early contrarian already has a position - don't double up
+        const earlyContrarianHolding = getHolding(wallet.address, marketAddress, 'early_contrarian');
+        if (earlyContrarianHolding) {
+          logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Early contrarian position exists - late contrarian skipping (no double contrarian)`);
+          return;
+        }
+
+        // Check if either side has reached the trigger threshold
+        const maxPrice = Math.max(...prices);
+
+        if (maxPrice >= LATE_CONTRARIAN_TRIGGER_ODDS) {
+          // Buy the opposite side (contrarian bet)
+          const dominantSide = prices[0] >= LATE_CONTRARIAN_TRIGGER_ODDS ? 0 : 1;
+          const outcomeToBuy = dominantSide === 0 ? 1 : 0;
+
+          const investmentHuman = getBuyAmountForStrategy(lateContrarianStrategy);
+          logInfo(wallet.address, '🌆', `[${marketAddress.substring(0, 8)}...] Late contrarian: Side ${dominantSide} at ${prices[dominantSide]}% (>= ${LATE_CONTRARIAN_TRIGGER_ODDS}%), buying opposite side ${outcomeToBuy} at ${prices[outcomeToBuy]}% with $${investmentHuman} USDC`);
+
+          const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
+
+          // Check USDC balance
+          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Checking USDC balance...`);
+          const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+          const usdcBalHuman = ethers.formatUnits(usdcBal, decimals);
+          const needHuman = ethers.formatUnits(investment, decimals);
+          logInfo(wallet.address, '💰', `USDC balance=${usdcBalHuman}, need=${needHuman} for buy`);
+          if (usdcBal < investment) {
+            logWarn(wallet.address, '⚠️', `Insufficient USDC balance. Need ${needHuman}, have ${usdcBalHuman}.`);
+            return;
+          }
+
+          // Execute buy with late_contrarian strategy flag
+          await executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, 'late_contrarian');
+          return;
+        } else {
+          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] In late contrarian window but max odds ${maxPrice}% < ${LATE_CONTRARIAN_TRIGGER_ODDS}% trigger - waiting`);
           return;
         }
       }
