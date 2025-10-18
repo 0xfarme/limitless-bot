@@ -71,7 +71,7 @@ const LATE_STRATEGY_ENABLED = (process.env.LATE_STRATEGY_ENABLED || 'true').toLo
 const BUY_WINDOW_MINUTES = parseInt(process.env.BUY_WINDOW_MINUTES || '13', 10); // Last N minutes to buy
 const NO_BUY_FINAL_MINUTES = parseInt(process.env.NO_BUY_FINAL_MINUTES || '2', 10); // Don't buy in last N minutes
 const STOP_LOSS_MINUTES = parseInt(process.env.STOP_LOSS_MINUTES || '2', 10); // Stop loss active in last N minutes
-const STOP_LOSS_ENABLED = (process.env.STOP_LOSS_ENABLED || 'true').toLowerCase() === 'true'; // Enable stop loss
+const STOP_LOSS_ENABLED = (process.env.STOP_LOSS_ENABLED || 'false').toLowerCase() === 'true'; // Enable stop loss
 const STOP_LOSS_PNL_PCT = parseInt(process.env.STOP_LOSS_PNL_PCT || '-50', 10); // Sell if PnL drops below N%
 const MIN_ODDS = parseInt(process.env.MIN_ODDS || '75', 10); // Minimum odds to buy
 const MAX_ODDS = parseInt(process.env.MAX_ODDS || '95', 10); // Maximum odds to buy
