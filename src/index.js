@@ -1259,7 +1259,7 @@ async function runForWallet(wallet, provider) {
     const nowMinutes = now.getMinutes();
 
     // Check if ANY strategy is enabled
-    const anyStrategyEnabled = LATE_STRATEGY_ENABLED || MOONSHOT_ENABLED;
+    const anyStrategyEnabled = LATE_STRATEGY_ENABLED || MOONSHOT_ENABLED || QUICK_SCALP_ENABLED;
     const hasActiveStrategies = anyStrategyEnabled || AUTO_REDEEM_ENABLED;
 
     // If no strategies enabled and no redemption, always sleep
@@ -1281,7 +1281,11 @@ async function runForWallet(wallet, provider) {
     // Last 13 minutes trading window: minutes 47-60 (if late window strategy enabled)
     const inLateWindow = LATE_STRATEGY_ENABLED && nowMinutes >= (60 - BUY_WINDOW_MINUTES);
 
-    return inRedemptionWindow || inLateWindow;
+    // Quick Scalp runs in first 40 minutes of any market (not time-based, market-age-based)
+    // So if enabled, bot needs to stay active to catch new markets
+    const quickScalpActive = QUICK_SCALP_ENABLED;
+
+    return inRedemptionWindow || inLateWindow || quickScalpActive;
   }
 
   // Calculate next wake time
@@ -2582,16 +2586,21 @@ async function runForWallet(wallet, provider) {
     }
   }
 
+  // Flag to control polling
+  let shouldStop = false;
+
   // Smart polling function that adjusts delay based on active/sleep state
   async function smartPoll() {
+    if (shouldStop) return;
+
     await tick();
 
     // Determine next poll time based on bot state
     const holdings = getAllHoldings(wallet.address);
     const isActive = shouldBeActive(wallet);
-    const nowMinutes = new Date().getMinutes();
 
     let nextPollDelay;
+    let reason = '';
 
     if (!isActive && holdings.length === 0) {
       // Bot is sleeping and no positions to monitor - use long sleep until next window
@@ -2604,24 +2613,32 @@ async function runForWallet(wallet, provider) {
       const sleepMinutes = Math.floor(nextPollDelay / 60000);
       const sleepSeconds = Math.floor((nextPollDelay % 60000) / 1000);
 
+      reason = `no positions, outside trading windows`;
       // Only log if sleep is significant (more than 30 seconds)
       if (nextPollDelay > 30000) {
-        logInfo(wallet.address, '😴', `Smart wait mode: Sleeping for ${sleepMinutes}m ${sleepSeconds}s (no positions, outside trading windows)`);
+        logInfo(wallet.address, '😴', `Smart wait mode: Sleeping for ${sleepMinutes}m ${sleepSeconds}s (${reason})`);
       }
     } else if (!isActive && holdings.length > 0) {
       // Bot is sleeping but has positions to monitor - poll more frequently
       nextPollDelay = 30000; // 30 seconds to monitor positions
+      reason = `monitoring ${holdings.length} position(s) outside trading windows`;
     } else {
       // Bot is active - use normal polling interval
       nextPollDelay = POLL_INTERVAL_MS;
+      reason = `active trading window (LATE=${LATE_STRATEGY_ENABLED}, MOONSHOT=${MOONSHOT_ENABLED}, QUICK_SCALP=${QUICK_SCALP_ENABLED})`;
     }
 
     // Schedule next poll
-    setTimeout(smartPoll, nextPollDelay);
+    if (!shouldStop) {
+      setTimeout(smartPoll, nextPollDelay);
+    }
   }
 
   // Start smart polling
   await smartPoll();
+
+  // Return stop function
+  return () => { shouldStop = true; };
 }
 
 async function main() {
@@ -2735,10 +2752,10 @@ async function main() {
     }
   }
 
-  const timers = [];
+  const stopFunctions = [];
   for (const w of wallets) {
-    const timer = await runForWallet(w, provider);
-    timers.push(timer);
+    const stopFn = await runForWallet(w, provider);
+    stopFunctions.push(stopFn);
   }
 
   // Start S3 uploads if enabled
@@ -2746,7 +2763,7 @@ async function main() {
 
   process.on('SIGINT', () => {
     console.log('👋 Shutting down...');
-    timers.forEach(t => clearInterval(t));
+    stopFunctions.forEach(fn => fn());
     stopS3Upload();
     // Give a moment for final S3 upload
     setTimeout(() => {
