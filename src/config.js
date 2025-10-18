@@ -41,16 +41,27 @@ export const MIN_MARKET_AGE_MINUTES = parseInt(process.env.MIN_MARKET_AGE_MINUTE
 export const MIN_ODDS = parseInt(process.env.MIN_ODDS || '75', 10);
 export const MAX_ODDS = parseInt(process.env.MAX_ODDS || '95', 10);
 
+// ========= Time-Based Odds Windows (Late Strategy) =========
+// Enable time-based odds windows (if false, uses simple MIN_ODDS/MAX_ODDS for entire late window)
+export const TIME_BASED_ODDS_ENABLED = (process.env.TIME_BASED_ODDS_ENABLED || 'false').toLowerCase() === 'true';
+
+// Window 1: Earlier late window (e.g., minutes 40-50)
+export const LATE_WINDOW_1_START = parseInt(process.env.LATE_WINDOW_1_START || '40', 10);
+export const LATE_WINDOW_1_END = parseInt(process.env.LATE_WINDOW_1_END || '50', 10);
+export const LATE_WINDOW_1_MIN_ODDS = parseInt(process.env.LATE_WINDOW_1_MIN_ODDS || '70', 10);
+export const LATE_WINDOW_1_MAX_ODDS = parseInt(process.env.LATE_WINDOW_1_MAX_ODDS || '95', 10);
+
+// Window 2: Final late window (e.g., minutes 50-59)
+export const LATE_WINDOW_2_START = parseInt(process.env.LATE_WINDOW_2_START || '50', 10);
+export const LATE_WINDOW_2_END = parseInt(process.env.LATE_WINDOW_2_END || '59', 10);
+export const LATE_WINDOW_2_MIN_ODDS = parseInt(process.env.LATE_WINDOW_2_MIN_ODDS || '75', 10);
+export const LATE_WINDOW_2_MAX_ODDS = parseInt(process.env.LATE_WINDOW_2_MAX_ODDS || '90', 10);
+
 // ========= Stop Loss Settings =========
 export const STOP_LOSS_ENABLED = (process.env.STOP_LOSS_ENABLED || 'true').toLowerCase() === 'true';
 export const STOP_LOSS_PNL_PCT = parseInt(process.env.STOP_LOSS_PNL_PCT || '-50', 10);
 export const STOP_LOSS_MINUTES = parseInt(process.env.STOP_LOSS_MINUTES || '2', 10);
 
-// ========= Early Contrarian Strategy =========
-export const EARLY_STRATEGY_ENABLED = (process.env.EARLY_STRATEGY_ENABLED || 'true').toLowerCase() === 'true';
-export const EARLY_WINDOW_MINUTES = parseInt(process.env.EARLY_WINDOW_MINUTES || '30', 10);
-export const EARLY_TRIGGER_ODDS = parseInt(process.env.EARLY_TRIGGER_ODDS || '70', 10);
-export const EARLY_PROFIT_TARGET_PCT = parseInt(process.env.EARLY_PROFIT_TARGET_PCT || '20', 10);
 
 // ========= Moonshot Strategy =========
 export const MOONSHOT_ENABLED = (process.env.MOONSHOT_ENABLED || 'true').toLowerCase() === 'true';
@@ -64,11 +75,8 @@ export const AUTO_REDEEM_ENABLED = (process.env.AUTO_REDEEM_ENABLED || 'true').t
 export const REDEEM_WINDOW_START = parseInt(process.env.REDEEM_WINDOW_START || '6', 10);
 export const REDEEM_WINDOW_END = parseInt(process.env.REDEEM_WINDOW_END || '10', 10);
 
-// ========= Simulation Mode =========
-export const SIMULATION_MODE = (process.env.SIMULATION_MODE || 'false').toLowerCase() === 'true';
-
 // ========= File Paths =========
-const dataDir = SIMULATION_MODE ? 'simulation' : 'data';
+const dataDir = 'data';
 export const STATE_FILE = process.env.STATE_FILE || path.join(dataDir, 'state.json');
 export const TRADES_LOG_FILE = process.env.TRADES_LOG_FILE || path.join(dataDir, 'trades.jsonl');
 export const STATS_FILE = process.env.STATS_FILE || path.join(dataDir, 'stats.json');
