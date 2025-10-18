@@ -63,6 +63,14 @@ export const STOP_LOSS_PNL_PCT = parseInt(process.env.STOP_LOSS_PNL_PCT || '-50'
 export const STOP_LOSS_MINUTES = parseInt(process.env.STOP_LOSS_MINUTES || '2', 10);
 
 
+// ========= Quick Scalp Strategy (Early Market Arbitrage) =========
+export const QUICK_SCALP_ENABLED = (process.env.QUICK_SCALP_ENABLED || 'false').toLowerCase() === 'true';
+export const QUICK_SCALP_WINDOW_MINUTES = parseInt(process.env.QUICK_SCALP_WINDOW_MINUTES || '40', 10); // Active in first N minutes of market
+export const QUICK_SCALP_MIN_ENTRY_ODDS = parseInt(process.env.QUICK_SCALP_MIN_ENTRY_ODDS || '5', 10); // Min odds to enter (e.g., 5%)
+export const QUICK_SCALP_MAX_ENTRY_ODDS = parseInt(process.env.QUICK_SCALP_MAX_ENTRY_ODDS || '30', 10); // Max odds to enter (e.g., 30%)
+export const QUICK_SCALP_PROFIT_MULTIPLIER = parseFloat(process.env.QUICK_SCALP_PROFIT_MULTIPLIER || '2'); // Sell when odds reach Nx entry (e.g., 2x)
+export const QUICK_SCALP_AMOUNT_USDC = parseFloat(process.env.QUICK_SCALP_AMOUNT_USDC || '10');
+
 // ========= Moonshot Strategy =========
 export const MOONSHOT_ENABLED = (process.env.MOONSHOT_ENABLED || 'true').toLowerCase() === 'true';
 export const MOONSHOT_WINDOW_MINUTES = parseInt(process.env.MOONSHOT_WINDOW_MINUTES || '2', 10);

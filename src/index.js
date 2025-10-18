@@ -32,11 +32,15 @@ const LATE_BUY_AMOUNT_USDC = process.env.LATE_BUY_AMOUNT_USDC ? Number(process.e
 function getBuyAmountForStrategy(strategy) {
   // Normalize strategy name
   const isMoonshot = strategy && strategy.includes('moonshot');
+  const isQuickScalp = strategy && strategy.includes('quick_scalp');
   const isLate = strategy && strategy === 'default';
 
   // Check strategy-specific amount first
   if (isMoonshot) {
     return MOONSHOT_AMOUNT_USDC;
+  }
+  if (isQuickScalp) {
+    return QUICK_SCALP_AMOUNT_USDC;
   }
   if (isLate && LATE_BUY_AMOUNT_USDC !== null) {
     return LATE_BUY_AMOUNT_USDC;
@@ -85,6 +89,14 @@ const LATE_WINDOW_2_START = parseInt(process.env.LATE_WINDOW_2_START || '50', 10
 const LATE_WINDOW_2_END = parseInt(process.env.LATE_WINDOW_2_END || '59', 10);
 const LATE_WINDOW_2_MIN_ODDS = parseInt(process.env.LATE_WINDOW_2_MIN_ODDS || '75', 10);
 const LATE_WINDOW_2_MAX_ODDS = parseInt(process.env.LATE_WINDOW_2_MAX_ODDS || '90', 10);
+
+// ========= Quick Scalp Strategy Config (Early Market Arbitrage) =========
+const QUICK_SCALP_ENABLED = (process.env.QUICK_SCALP_ENABLED || 'false').toLowerCase() === 'true';
+const QUICK_SCALP_WINDOW_MINUTES = parseInt(process.env.QUICK_SCALP_WINDOW_MINUTES || '40', 10); // Active in first N minutes of market
+const QUICK_SCALP_MIN_ENTRY_ODDS = parseInt(process.env.QUICK_SCALP_MIN_ENTRY_ODDS || '5', 10); // Min odds to enter
+const QUICK_SCALP_MAX_ENTRY_ODDS = parseInt(process.env.QUICK_SCALP_MAX_ENTRY_ODDS || '30', 10); // Max odds to enter
+const QUICK_SCALP_PROFIT_MULTIPLIER = parseFloat(process.env.QUICK_SCALP_PROFIT_MULTIPLIER || '2'); // Sell when odds reach Nx entry
+const QUICK_SCALP_AMOUNT_USDC = parseFloat(process.env.QUICK_SCALP_AMOUNT_USDC || '10');
 
 // ========= Moonshot Strategy Config =========
 const MOONSHOT_ENABLED = (process.env.MOONSHOT_ENABLED || 'true').toLowerCase() === 'true'; // Enable moonshot strategy
@@ -2144,6 +2156,70 @@ async function runForWallet(wallet, provider) {
         // Debug logging for sell decision
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Sell check: calcSellFailed=${calcSellFailed}, pnlAbs=${pnlAbs > 0n ? '+' : '-'}, pnlPct=${pnlPct.toFixed(2)}%, profitTarget=${profitTarget}%, alreadyTookProfit=${alreadyTookProfit}, strategy=${strategyType}`);
 
+        // QUICK SCALP SELL LOGIC: Sell when odds reach target multiplier
+        if (strategyType === 'quick_scalp' && !calcSellFailed) {
+          const entryOdds = holding?.entryPrice;
+          const currentOdds = prices[outcomeIndex];
+          const targetOdds = entryOdds * QUICK_SCALP_PROFIT_MULTIPLIER;
+
+          logInfo(wallet.address, '⚡', `[${marketAddress.substring(0, 8)}...] Quick scalp check: Entry ${entryOdds}% → Current ${currentOdds}% (Target: ${targetOdds}% = ${QUICK_SCALP_PROFIT_MULTIPLIER}x entry)`);
+
+          if (currentOdds >= targetOdds) {
+            // Target reached! Sell position
+            logInfo(wallet.address, '💰', `[${marketAddress.substring(0, 8)}...] Quick scalp target reached! ${currentOdds}% >= ${targetOdds}% (${QUICK_SCALP_PROFIT_MULTIPLIER}x from ${entryOdds}%). Selling position...`);
+
+            const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
+            if (!approvedOk) {
+              logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping quick scalp sell this tick.');
+              return;
+            }
+
+            // Sell 100% of position
+            const maxOutcomeTokensToSell = tokenBalance;
+            const returnAmountForSell = positionValue - (positionValue / 100n); // minus 1% safety
+
+            const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
+            if (!gasEst) {
+              logWarn(wallet.address, '🛑', 'Gas estimate sell failed; skipping quick scalp sell this tick.');
+              return;
+            }
+
+            const padded = (gasEst * 120n) / 100n + 10000n;
+            const sellOv = await txOverrides(wallet.provider, padded);
+            const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
+            logInfo(wallet.address, '🧾', `Quick scalp sell tx: ${tx.hash}`);
+            const receipt = await tx.wait(CONFIRMATIONS);
+
+            const pnlUSDC = parseFloat(ethers.formatUnits(positionValue - cost, decimals));
+            const oddsGain = currentOdds - entryOdds;
+            logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Quick scalp sold! Entry ${entryOdds}% → Exit ${currentOdds}% (+${oddsGain.toFixed(1)}% odds gain, PnL=${pnlPct.toFixed(2)}%)`);
+
+            logTrade({
+              type: 'SELL_QUICK_SCALP',
+              wallet: wallet.address,
+              marketAddress,
+              marketTitle: marketInfo?.title || 'Unknown',
+              outcome: outcomeIndex,
+              costUSDC: ethers.formatUnits(cost, decimals),
+              returnUSDC: ethers.formatUnits(positionValue, decimals),
+              pnlUSDC: pnlUSDC.toFixed(4),
+              pnlPercent: pnlPct.toFixed(2),
+              entryOdds: entryOdds,
+              exitOdds: currentOdds,
+              oddsMultiplier: (currentOdds / entryOdds).toFixed(2),
+              reason: `Quick scalp: ${entryOdds}% → ${currentOdds}% (${QUICK_SCALP_PROFIT_MULTIPLIER}x target reached)`,
+              txHash: tx.hash,
+              blockNumber: receipt.blockNumber,
+              gasUsed: receipt.gasUsed.toString()
+            });
+            updateStats(pnlUSDC);
+
+            removeHolding(wallet.address, marketAddress, strategyType);
+            logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed quick_scalp holding after profitable exit`);
+            return;
+          }
+        }
+
         // Only attempt profit-taking if calcSellAmount succeeded (market is active)
         if (!calcSellFailed && pnlAbs > 0n && pnlPct >= profitTarget && !alreadyTookProfit) {
           // Always sell 100% of position
@@ -2244,6 +2320,56 @@ async function runForWallet(wallet, provider) {
       if (!positionIdsValid) {
         logWarn(wallet.address, '🛑', 'Position IDs missing/invalid — skip betting');
         return;
+      }
+
+      // QUICK SCALP STRATEGY: Early market arbitrage (first 40 minutes)
+      if (QUICK_SCALP_ENABLED && marketInfo.createdAt) {
+        const createdMs = new Date(marketInfo.createdAt).getTime();
+        const nowMs = Date.now();
+        const marketAgeMinutes = Math.floor((nowMs - createdMs) / 60000);
+
+        // Check if market is in quick scalp window (first N minutes)
+        if (marketAgeMinutes <= QUICK_SCALP_WINDOW_MINUTES) {
+          // Check if we already have a quick scalp position
+          const quickScalpHolding = getHolding(wallet.address, marketAddress, 'quick_scalp');
+          if (!quickScalpHolding) {
+            // Look for imbalanced odds - find side with odds in entry range
+            const side0Odds = prices[0];
+            const side1Odds = prices[1];
+
+            let targetSide = null;
+            let targetOdds = null;
+
+            // Check if either side is in the entry range
+            if (side0Odds >= QUICK_SCALP_MIN_ENTRY_ODDS && side0Odds <= QUICK_SCALP_MAX_ENTRY_ODDS) {
+              targetSide = 0;
+              targetOdds = side0Odds;
+            } else if (side1Odds >= QUICK_SCALP_MIN_ENTRY_ODDS && side1Odds <= QUICK_SCALP_MAX_ENTRY_ODDS) {
+              targetSide = 1;
+              targetOdds = side1Odds;
+            }
+
+            if (targetSide !== null) {
+              // Found an opportunity! Buy it
+              const investmentHuman = getBuyAmountForStrategy('quick_scalp');
+              const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
+
+              logInfo(wallet.address, '⚡', `[${marketAddress.substring(0, 8)}...] Quick Scalp opportunity! Market age ${marketAgeMinutes}min, buying side ${targetSide} at ${targetOdds}% (entry range: ${QUICK_SCALP_MIN_ENTRY_ODDS}-${QUICK_SCALP_MAX_ENTRY_ODDS}%)`);
+
+              // Check USDC balance
+              const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+              if (usdcBal >= investment) {
+                await executeBuy(wallet, market, usdc, marketAddress, investment, targetSide, decimals, pid0, pid1, erc1155, 'quick_scalp');
+                return; // Exit after quick scalp buy
+              } else {
+                logWarn(wallet.address, '⚠️', `Insufficient USDC for quick scalp. Need ${investmentHuman}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
+              }
+            }
+          } else {
+            // We have a quick scalp position - sell logic will be handled in the position monitoring section
+            logInfo(wallet.address, '⚡', `[${marketAddress.substring(0, 8)}...] Quick scalp position exists (age ${marketAgeMinutes}min) - monitoring for exit`);
+          }
+        }
       }
 
       // NEW LOGIC: Check if we should use last 13 minutes strategy
