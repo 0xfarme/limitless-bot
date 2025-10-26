@@ -109,6 +109,7 @@ const MOONSHOT_WINDOW_MINUTES = parseInt(process.env.MOONSHOT_WINDOW_MINUTES || 
 const MOONSHOT_MAX_ODDS = parseInt(process.env.MOONSHOT_MAX_ODDS || '10', 10); // Only buy if opposite side <= N%
 const MOONSHOT_AMOUNT_USDC = parseFloat(process.env.MOONSHOT_AMOUNT_USDC || '1'); // Amount to invest in moonshot
 const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_PCT || '100', 10); // Sell at N% profit
+const MOONSHOT_FINAL_SECONDS_BUFFER = parseInt(process.env.MOONSHOT_FINAL_SECONDS_BUFFER || '15', 10); // Don't buy in final N seconds
 
 // ========= Sell Config =========
 // Always sell 100% of positions - no partial sells
@@ -2632,15 +2633,15 @@ async function runForWallet(wallet, provider) {
       // Moonshot ignores MIN_MARKET_AGE_MINUTES and nearDeadlineForBet - only cares about MOONSHOT_WINDOW_MINUTES
       // Works in last N minutes based on MOONSHOT_WINDOW_MINUTES parameter
       if (MOONSHOT_ENABLED && inMoonshotWindow) {
-        // Safety check: Don't buy in final 30 seconds to ensure transaction can complete
+        // Safety check: Don't buy in final N seconds to ensure transaction can complete
         if (marketInfo.deadline) {
           const deadlineMs = new Date(marketInfo.deadline).getTime();
           const nowMs = Date.now();
           const remainingMs = deadlineMs - nowMs;
           const remainingSec = Math.floor(remainingMs / 1000);
 
-          if (remainingMs < 30 * 1000) {
-            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot window active but only ${remainingSec}s remaining - too close to deadline for safe transaction`);
+          if (remainingMs < MOONSHOT_FINAL_SECONDS_BUFFER * 1000) {
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot window active but only ${remainingSec}s remaining - too close to deadline (buffer: ${MOONSHOT_FINAL_SECONDS_BUFFER}s)`);
             return;
           }
         }
