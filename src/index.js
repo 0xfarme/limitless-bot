@@ -107,6 +107,8 @@ const QUICK_SCALP_AMOUNT_USDC = parseFloat(process.env.QUICK_SCALP_AMOUNT_USDC |
 const MOONSHOT_ENABLED = (process.env.MOONSHOT_ENABLED || 'true').toLowerCase() === 'true'; // Enable moonshot strategy
 const MOONSHOT_WINDOW_MINUTES = parseInt(process.env.MOONSHOT_WINDOW_MINUTES || '2', 10); // Moonshot triggers in last N minutes
 const MOONSHOT_MAX_ODDS = parseInt(process.env.MOONSHOT_MAX_ODDS || '10', 10); // Only buy if opposite side <= N%
+const MOONSHOT_MIN_LATE_ODDS = parseInt(process.env.MOONSHOT_MIN_LATE_ODDS || '70', 10); // Require late position >= N% to trigger moonshot
+const MOONSHOT_MAX_LATE_ODDS = parseInt(process.env.MOONSHOT_MAX_LATE_ODDS || '95', 10); // Require late position <= N% to trigger moonshot
 const MOONSHOT_AMOUNT_USDC = parseFloat(process.env.MOONSHOT_AMOUNT_USDC || '1'); // Amount to invest in moonshot
 const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_PCT || '100', 10); // Sell at N% profit
 const MOONSHOT_FINAL_SECONDS_BUFFER = parseInt(process.env.MOONSHOT_FINAL_SECONDS_BUFFER || '15', 10); // Don't buy in final N seconds
@@ -2604,17 +2606,22 @@ async function runForWallet(wallet, provider) {
           if (moonshotHolding) {
             logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping late window moonshot - already have moonshot position`);
           } else {
-            // Check if opposite side odds are below configured threshold (true moonshot)
+            // Check late position odds and opposite side odds
             const moonshotOdds = prices[moonshotOutcome];
+            const lateOdds = prices[outcomeToBuy];
 
-            if (moonshotOdds > MOONSHOT_MAX_ODDS) {
+            // First check if late position odds are in acceptable range
+            if (lateOdds < MOONSHOT_MIN_LATE_ODDS) {
+              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Late position too weak: ${lateOdds}% < ${MOONSHOT_MIN_LATE_ODDS}% minimum - skipping moonshot`);
+            } else if (lateOdds > MOONSHOT_MAX_LATE_ODDS) {
+              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Late position too strong: ${lateOdds}% > ${MOONSHOT_MAX_LATE_ODDS}% maximum - skipping moonshot (too extreme)`);
+            } else if (moonshotOdds > MOONSHOT_MAX_ODDS) {
               logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - opposite side at ${moonshotOdds}% (> ${MOONSHOT_MAX_ODDS}% threshold). Not a true moonshot.`);
             } else {
-              // Odds qualify - place moonshot bet
+              // All conditions met - place moonshot bet
               const moonshotStrategy = 'moonshot';
               const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
 
-              const lateOdds = prices[outcomeToBuy];
               logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot hedge! Late position: outcome ${outcomeToBuy} @ ${lateOdds}% → Buying opposite outcome ${moonshotOutcome} @ ${moonshotOdds}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
 
               // Check USDC balance for moonshot
@@ -2674,7 +2681,17 @@ async function runForWallet(wallet, provider) {
 
         logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Late position on outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}% - checking opposite side ${targetSide} @ ${targetOdds}%`);
 
-        // Only buy if target side odds are below threshold
+        // First check if late position odds are in acceptable range
+        if (latePositionOdds < MOONSHOT_MIN_LATE_ODDS) {
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Late position too weak: ${latePositionOdds}% < ${MOONSHOT_MIN_LATE_ODDS}% minimum - skipping moonshot`);
+          return;
+        }
+        if (latePositionOdds > MOONSHOT_MAX_LATE_ODDS) {
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Late position too strong: ${latePositionOdds}% > ${MOONSHOT_MAX_LATE_ODDS}% maximum - skipping moonshot (too extreme)`);
+          return;
+        }
+
+        // Late position is in range, now check if opposite side odds qualify for moonshot
         if (targetOdds <= MOONSHOT_MAX_ODDS) {
           const moonshotStrategy = 'moonshot';
           const investmentHuman = getBuyAmountForStrategy(moonshotStrategy);
@@ -2805,6 +2822,8 @@ async function main() {
   console.log(`   🎯 Late Trading: Minutes ${60 - BUY_WINDOW_MINUTES}-60 (last minute strategy)`);
   if (MOONSHOT_ENABLED) {
     console.log(`   🌙 Moonshot: Last ${MOONSHOT_WINDOW_MINUTES} minutes ($${MOONSHOT_AMOUNT_USDC} contrarian bet on opposite side)`);
+    console.log(`      - Late position range: ${MOONSHOT_MIN_LATE_ODDS}-${MOONSHOT_MAX_LATE_ODDS}% (triggers moonshot)`);
+    console.log(`      - Opposite side max: ${MOONSHOT_MAX_ODDS}% (moonshot entry threshold)`);
   }
 
   // Calculate sleep periods
