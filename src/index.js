@@ -90,6 +90,11 @@ const LATE_WINDOW_2_END = parseInt(process.env.LATE_WINDOW_2_END || '59', 10);
 const LATE_WINDOW_2_MIN_ODDS = parseInt(process.env.LATE_WINDOW_2_MIN_ODDS || '75', 10);
 const LATE_WINDOW_2_MAX_ODDS = parseInt(process.env.LATE_WINDOW_2_MAX_ODDS || '90', 10);
 
+// ========= Scale-In Config (Late Strategy) =========
+const SCALE_IN_ENABLED = (process.env.SCALE_IN_ENABLED || 'false').toLowerCase() === 'true'; // Enable scale-in for late strategy
+const SCALE_IN_POSITIONS = parseInt(process.env.SCALE_IN_POSITIONS || '2', 10); // Number of scale-in positions (2 = split buy into 2 entries)
+const SCALE_IN_DROP_PCT = parseInt(process.env.SCALE_IN_DROP_PCT || '10', 10); // Odds must drop by N% to trigger next scale-in
+
 // ========= Quick Scalp Strategy Config (Early Market Arbitrage) =========
 const QUICK_SCALP_ENABLED = (process.env.QUICK_SCALP_ENABLED || 'false').toLowerCase() === 'true';
 const QUICK_SCALP_WINDOW_MINUTES = parseInt(process.env.QUICK_SCALP_WINDOW_MINUTES || '40', 10); // Active in first N minutes of market
@@ -419,6 +424,29 @@ function addHolding(addr, holding) {
   filtered.push(holding);
   userState.set(addr, { ...prev, holdings: filtered });
   scheduleSave();
+}
+function updateHoldingForScaleIn(addr, marketAddress, strategy, additionalInvestment, newTxHash) {
+  const prev = userState.get(addr) || { holdings: [], completedMarkets: new Set() };
+  const holdings = prev.holdings || [];
+  const holding = holdings.find(h => {
+    const isSameMarket = h.marketAddress.toLowerCase() === marketAddress.toLowerCase();
+    const isSameStrategy = (h.strategy || 'default') === strategy;
+    return isSameMarket && isSameStrategy;
+  });
+
+  if (holding) {
+    // Update existing holding with cumulative values
+    holding.amount = (BigInt(holding.amount) + BigInt(additionalInvestment)).toString();
+    holding.cost = (BigInt(holding.cost) + BigInt(additionalInvestment)).toString();
+    holding.scaleInStep = (holding.scaleInStep || 1) + 1;
+    holding.lastScaleInTxHash = newTxHash;
+    holding.lastScaleInTimestamp = new Date().toISOString();
+
+    userState.set(addr, { ...prev, holdings });
+    scheduleSave();
+    return true;
+  }
+  return false;
 }
 function removeHolding(addr, marketAddress, strategy = null) {
   const prev = userState.get(addr) || { holdings: [], completedMarkets: new Set() };
@@ -1792,7 +1820,13 @@ async function runForWallet(wallet, provider) {
       entryPrice: prices[outcomeToBuy] || 'Unknown',
       buyTimestamp: new Date().toISOString(),
       marketDeadline: marketInfo?.deadline || null,
-      buyTxHash: buyTx.hash
+      buyTxHash: buyTx.hash,
+      // Scale-in tracking
+      scaleInEnabled: SCALE_IN_ENABLED && strategy === 'default',
+      scaleInStep: 1, // Current step (1 = first entry)
+      scaleInTotalSteps: SCALE_IN_POSITIONS,
+      scaleInInitialOdds: prices[outcomeToBuy] || null,
+      scaleInDropPct: SCALE_IN_DROP_PCT
     });
 
     // Log buy trade with detailed information
@@ -2141,6 +2175,84 @@ async function runForWallet(wallet, provider) {
           return;
         }
 
+        // SCALE-IN MONITORING: Check if we should scale in with additional buy
+        if (holding?.scaleInEnabled && holding?.scaleInStep < holding?.scaleInTotalSteps) {
+          const currentStep = holding.scaleInStep || 1;
+          const totalSteps = holding.scaleInTotalSteps || SCALE_IN_POSITIONS;
+          const initialOdds = holding.scaleInInitialOdds;
+          const currentOdds = prices[outcomeIndex];
+          const dropPct = holding.scaleInDropPct || SCALE_IN_DROP_PCT;
+
+          if (initialOdds && currentOdds) {
+            // Calculate how much odds have dropped
+            const oddsDropPct = ((initialOdds - currentOdds) / initialOdds) * 100;
+
+            logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] Scale-in check (step ${currentStep}/${totalSteps}): Initial ${initialOdds}% → Current ${currentOdds}% (${oddsDropPct.toFixed(1)}% drop, threshold: ${dropPct}%)`);
+
+            // If odds have dropped enough, execute scale-in buy
+            if (oddsDropPct >= dropPct) {
+              logInfo(wallet.address, '📈', `[${marketAddress.substring(0, 8)}...] Scale-in triggered! Odds dropped ${oddsDropPct.toFixed(1)}% (>= ${dropPct}%). Buying step ${currentStep + 1}/${totalSteps}...`);
+
+              // Calculate scaled investment for this step
+              const fullAmount = getBuyAmountForStrategy('default');
+              const scaledAmount = fullAmount / totalSteps;
+              const scaleInInvestment = ethers.parseUnits(scaledAmount.toString(), decimals);
+
+              // Check USDC balance
+              const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+              if (usdcBal >= scaleInInvestment) {
+                try {
+                  // Ensure approval
+                  const approvedOk = await ensureErc20Approval(wallet, usdc, marketAddress, scaleInInvestment, decimals);
+                  if (!approvedOk) {
+                    logWarn(wallet.address, '🛑', 'Approval not confirmed for scale-in; skipping this tick.');
+                    return;
+                  }
+
+                  // Execute the scale-in buy
+                  const minOut = scaleInInvestment - (scaleInInvestment / 100n); // 1% slippage
+                  const gasEst = await estimateGasFor(market, wallet, 'buy', [scaleInInvestment, outcomeIndex, minOut]);
+                  if (!gasEst) {
+                    logWarn(wallet.address, '🛑', 'Gas estimate failed for scale-in buy');
+                    return;
+                  }
+
+                  const padded = (gasEst * 120n) / 100n + 10000n;
+                  const buyOv = await txOverrides(wallet.provider, padded);
+                  const buyTx = await market.buy(scaleInInvestment, outcomeIndex, minOut, buyOv);
+                  logInfo(wallet.address, '🧾', `Scale-in buy tx (step ${currentStep + 1}/${totalSteps}): ${buyTx.hash}`);
+
+                  const receipt = await buyTx.wait(CONFIRMATIONS);
+                  logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Scale-in buy confirmed (step ${currentStep + 1}/${totalSteps})`);
+
+                  // Update holding for scale-in (cumulative cost and amount)
+                  updateHoldingForScaleIn(wallet.address, marketAddress, 'default', scaleInInvestment.toString(), buyTx.hash);
+
+                  // Log the scale-in trade
+                  logTrade({
+                    type: 'SCALE_IN',
+                    wallet: wallet.address,
+                    marketAddress,
+                    marketTitle: marketInfo?.title || 'Unknown',
+                    outcome: outcomeIndex,
+                    investmentUSDC: scaledAmount.toFixed(2),
+                    step: `${currentStep + 1}/${totalSteps}`,
+                    currentOdds: currentOdds,
+                    initialOdds: initialOdds,
+                    oddsDropPct: oddsDropPct.toFixed(1),
+                    txHash: buyTx.hash,
+                    blockNumber: receipt.blockNumber
+                  });
+                } catch (err) {
+                  logErr(wallet.address, '💥', `Scale-in buy failed: ${err?.message || err}`);
+                }
+              } else {
+                logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Insufficient USDC for scale-in. Need $${scaledAmount}, have ${ethers.formatUnits(usdcBal, decimals)}`);
+              }
+            }
+          }
+        }
+
         // Determine profit target based on strategy
         const strategyType = holding?.strategy || 'default';
         let profitTarget = TARGET_PROFIT_PCT; // Default for 'default' strategy
@@ -2392,16 +2504,24 @@ async function runForWallet(wallet, provider) {
           return;
         }
 
-        // Check if in last 2 minutes - don't buy
+        // Check if in last 2 minutes - don't buy (but let independent moonshot handle it if enabled)
         if (inLastTwoMinutes) {
-          logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] In last 2 minutes - not buying`);
-          return;
+          if (MOONSHOT_ENABLED && inMoonshotWindow) {
+            logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] In last 2 minutes - skipping late strategy, will check moonshot below`);
+          } else {
+            logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] In last 2 minutes - not buying`);
+          }
+          return; // Exit late strategy block to allow independent moonshot strategy to run
         }
 
         // In last 13 minutes - IGNORE the "too new" check, only check if deadline is too close
         if (nearDeadlineForBet) {
-          logWarn(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Too close to deadline - skipping`);
-          return;
+          if (MOONSHOT_ENABLED && inMoonshotWindow) {
+            logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Near deadline but moonshot window active - skipping late strategy, will check moonshot below`);
+          } else {
+            logWarn(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Too close to deadline - skipping`);
+          }
+          return; // Exit late strategy block to allow independent moonshot strategy to run
         }
 
         // Determine odds range based on time-based windows or default MIN/MAX_ODDS
@@ -2440,9 +2560,18 @@ async function runForWallet(wallet, provider) {
 
         // Determine which side is in odds range
         let outcomeToBuy = prices[0] >= minOddsToUse && prices[0] <= maxOddsToUse ? 0 : 1;
-        const investmentHuman = getBuyAmountForStrategy(lateStrategy);
+
+        // Calculate investment amount (with scale-in support)
+        let investmentHuman = getBuyAmountForStrategy(lateStrategy);
+        if (SCALE_IN_ENABLED) {
+          // Scale the investment amount by the number of positions
+          investmentHuman = investmentHuman / SCALE_IN_POSITIONS;
+          logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] Scale-in enabled: Using $${investmentHuman} USDC (1/${SCALE_IN_POSITIONS} of full position)`);
+        }
+
         const strategyDescription = TIME_BASED_ODDS_ENABLED ? windowDescription : `Last ${BUY_WINDOW_MINUTES}min strategy`;
-        logInfo(wallet.address, '🎯', `[${marketAddress.substring(0, 8)}...] ${strategyDescription}: Buying outcome ${outcomeToBuy} at ${prices[outcomeToBuy]}% with $${investmentHuman} USDC`);
+        const scaleInLabel = SCALE_IN_ENABLED ? ` (scale-in step 1/${SCALE_IN_POSITIONS})` : '';
+        logInfo(wallet.address, '🎯', `[${marketAddress.substring(0, 8)}...] ${strategyDescription}: Buying outcome ${outcomeToBuy} at ${prices[outcomeToBuy]}% with $${investmentHuman} USDC${scaleInLabel}`);
 
         // Continue to buy logic below with this outcome
         const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
@@ -2481,7 +2610,8 @@ async function runForWallet(wallet, provider) {
               const moonshotStrategy = 'moonshot';
               const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
 
-              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot! Bought side ${outcomeToBuy}, now buying opposite side ${moonshotOutcome} at ${moonshotOdds}% with $${MOONSHOT_AMOUNT_USDC} USDC (true moonshot <= ${MOONSHOT_MAX_ODDS}%)`);
+              const lateOdds = prices[outcomeToBuy];
+              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot hedge! Late position: outcome ${outcomeToBuy} @ ${lateOdds}% → Buying opposite outcome ${moonshotOutcome} @ ${moonshotOdds}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
 
               // Check USDC balance for moonshot
               const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
@@ -2497,7 +2627,8 @@ async function runForWallet(wallet, provider) {
         return;
       }
 
-      // Independent Moonshot Strategy: Can trigger even if late window doesn't buy
+      // Independent Moonshot Strategy: ONLY triggers when there's an existing late window position
+      // Always buys the OPPOSITE side as a hedge/contrarian bet
       // Moonshot ignores MIN_MARKET_AGE_MINUTES and nearDeadlineForBet - only cares about MOONSHOT_WINDOW_MINUTES
       // Works in last N minutes based on MOONSHOT_WINDOW_MINUTES parameter
       if (MOONSHOT_ENABLED && inMoonshotWindow) {
@@ -2521,26 +2652,23 @@ async function runForWallet(wallet, provider) {
           return;
         }
 
-        // Check if we have an existing late window (default) position
+        // REQUIREMENT: Moonshot ONLY buys when there's an existing late window position
+        // It always buys the OPPOSITE side as a hedge/contrarian bet
         const lateHolding = getHolding(wallet.address, marketAddress, 'default');
-        let targetSide;
-        let targetOdds;
-        let moonshotReason;
 
-        if (lateHolding) {
-          // We have a late window position - buy the opposite side if it qualifies
-          targetSide = lateHolding.outcomeIndex === 0 ? 1 : 0;
-          targetOdds = prices[targetSide];
-          moonshotReason = `opposite of late window position (outcome ${lateHolding.outcomeIndex})`;
-
-          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Found late window position on outcome ${lateHolding.outcomeIndex} - checking opposite side ${targetSide} at ${targetOdds}%`);
-        } else {
-          // No existing position - find the side with lowest odds (underdog)
-          const minPrice = Math.min(...prices);
-          targetSide = prices[0] === minPrice ? 0 : 1;
-          targetOdds = prices[targetSide];
-          moonshotReason = 'underdog';
+        if (!lateHolding) {
+          // No late window position - skip moonshot
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] No late window position found - moonshot requires existing position to hedge against`);
+          return;
         }
+
+        // We have a late window position - buy the opposite side if it qualifies
+        const targetSide = lateHolding.outcomeIndex === 0 ? 1 : 0;
+        const targetOdds = prices[targetSide];
+        const latePositionOdds = prices[lateHolding.outcomeIndex];
+        const moonshotReason = `opposite of late position (outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}%)`;
+
+        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Late position on outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}% - checking opposite side ${targetSide} @ ${targetOdds}%`);
 
         // Only buy if target side odds are below threshold
         if (targetOdds <= MOONSHOT_MAX_ODDS) {
@@ -2548,7 +2676,7 @@ async function runForWallet(wallet, provider) {
           const investmentHuman = getBuyAmountForStrategy(moonshotStrategy);
           const moonshotInvestment = ethers.parseUnits(investmentHuman.toString(), decimals);
 
-          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot triggered! Buying ${moonshotReason} side ${targetSide} at ${targetOdds}% (<= ${MOONSHOT_MAX_ODDS}%) with $${investmentHuman} USDC`);
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot hedge! Late position: outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}% → Buying opposite outcome ${targetSide} @ ${targetOdds}% with $${investmentHuman} USDC`);
 
           // Check USDC balance for moonshot
           const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
