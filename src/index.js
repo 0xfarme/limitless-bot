@@ -112,6 +112,7 @@ const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_P
 const MOONSHOT_FINAL_SECONDS_BUFFER = parseInt(process.env.MOONSHOT_FINAL_SECONDS_BUFFER || '15', 10); // Don't buy in final N seconds
 
 // ========= Sell Config =========
+const AUTO_PROFIT_SELL_ENABLED = (process.env.AUTO_PROFIT_SELL_ENABLED || 'true').toLowerCase() === 'true'; // Enable automatic profit taking
 // Always sell 100% of positions - no partial sells
 
 // ========= Redemption Config =========
@@ -2337,8 +2338,8 @@ async function runForWallet(wallet, provider) {
           }
         }
 
-        // Only attempt profit-taking if calcSellAmount succeeded (market is active)
-        if (!calcSellFailed && pnlAbs > 0n && pnlPct >= profitTarget && !alreadyTookProfit) {
+        // Only attempt profit-taking if enabled and calcSellAmount succeeded (market is active)
+        if (AUTO_PROFIT_SELL_ENABLED && !calcSellFailed && pnlAbs > 0n && pnlPct >= profitTarget && !alreadyTookProfit) {
           // Always sell 100% of position
           logInfo(wallet.address, '🎯', `Profit target reached! PnL=${pnlPct.toFixed(2)}% >= ${profitTarget}% (${strategyType} strategy). Selling 100% of position...`);
 
@@ -2403,8 +2404,10 @@ async function runForWallet(wallet, provider) {
           // Don't mark market as completed - other strategies may still want to trade it
           logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed ${strategyToRemove} holding after profit sell`);
           return;
-        } else {
+        } else if (AUTO_PROFIT_SELL_ENABLED) {
           logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] Not profitable yet: PnL=${pnlPct.toFixed(2)}% < ${profitTarget}% (${strategyType} strategy)`);
+        } else {
+          logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Holding position: PnL=${pnlPct.toFixed(2)}% (profit selling disabled - will redeem at market close)`);
         }
 
         // Don't return here - continue to check if other strategies can buy
@@ -2787,6 +2790,7 @@ async function main() {
     console.log(`   BUY_AMOUNT_USDC: ${BUY_AMOUNT_USDC} (all strategies)`);
   }
 
+  console.log(`   AUTO_PROFIT_SELL_ENABLED: ${AUTO_PROFIT_SELL_ENABLED}`);
   console.log(`   TARGET_PROFIT_PCT: ${TARGET_PROFIT_PCT}%`);
   console.log(`   SLIPPAGE_BPS: ${SLIPPAGE_BPS}`);
   console.log(`   STRATEGY_MODE: ${STRATEGY_MODE}`);
