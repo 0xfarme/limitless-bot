@@ -1953,9 +1953,14 @@ async function runForWallet(wallet, provider) {
           }
 
           // Check if in moonshot window
-          inMoonshotWindow = remainingMs <= MOONSHOT_WINDOW_MINUTES * 60 * 1000 && remainingMs > 0;
-          if (inMoonshotWindow && MOONSHOT_ENABLED) {
-            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] In moonshot window (last ${MOONSHOT_WINDOW_MINUTES} minutes) - contrarian bets enabled`);
+          const moonshotWindowMs = MOONSHOT_WINDOW_MINUTES * 60 * 1000;
+          inMoonshotWindow = remainingMs <= moonshotWindowMs && remainingMs > 0;
+          if (MOONSHOT_ENABLED) {
+            if (inMoonshotWindow) {
+              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ IN MOONSHOT WINDOW: ${remMin}m remaining <= ${MOONSHOT_WINDOW_MINUTES}min threshold - contrarian bets enabled`);
+            } else {
+              logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Not in moonshot window yet: ${remMin}m remaining > ${MOONSHOT_WINDOW_MINUTES}min threshold`);
+            }
           }
 
           if (remainingMs < 5 * 60 * 1000) {
@@ -2642,7 +2647,12 @@ async function runForWallet(wallet, provider) {
       // Always buys the OPPOSITE side as a hedge/contrarian bet
       // Moonshot ignores MIN_MARKET_AGE_MINUTES and nearDeadlineForBet - only cares about MOONSHOT_WINDOW_MINUTES
       // Works in last N minutes based on MOONSHOT_WINDOW_MINUTES parameter
+
+      // Debug logging for moonshot decision
+      logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Moonshot check: ENABLED=${MOONSHOT_ENABLED}, inWindow=${inMoonshotWindow}, window=${MOONSHOT_WINDOW_MINUTES}min`);
+
       if (MOONSHOT_ENABLED && inMoonshotWindow) {
+        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ MOONSHOT SECTION ENTERED - checking conditions...`);
         // Safety check: Don't buy in final N seconds to ensure transaction can complete
         if (marketInfo.deadline) {
           const deadlineMs = new Date(marketInfo.deadline).getTime();
@@ -2679,20 +2689,26 @@ async function runForWallet(wallet, provider) {
         const latePositionOdds = prices[lateHolding.outcomeIndex];
         const moonshotReason = `opposite of late position (outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}%)`;
 
-        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Late position on outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}% - checking opposite side ${targetSide} @ ${targetOdds}%`);
+        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ FOUND LATE POSITION: outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}%`);
+        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Checking opposite side ${targetSide} @ ${targetOdds}%`);
 
         // First check if late position odds are in acceptable range
         if (latePositionOdds < MOONSHOT_MIN_LATE_ODDS) {
-          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Late position too weak: ${latePositionOdds}% < ${MOONSHOT_MIN_LATE_ODDS}% minimum - skipping moonshot`);
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ❌ SKIP: Late position too weak: ${latePositionOdds}% < ${MOONSHOT_MIN_LATE_ODDS}% minimum`);
           return;
         }
         if (latePositionOdds > MOONSHOT_MAX_LATE_ODDS) {
-          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Late position too strong: ${latePositionOdds}% > ${MOONSHOT_MAX_LATE_ODDS}% maximum - skipping moonshot (too extreme)`);
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ❌ SKIP: Late position too strong: ${latePositionOdds}% > ${MOONSHOT_MAX_LATE_ODDS}% maximum (too extreme)`);
           return;
         }
 
+        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ LATE ODDS IN RANGE: ${latePositionOdds}% is within [${MOONSHOT_MIN_LATE_ODDS}-${MOONSHOT_MAX_LATE_ODDS}%]`);
+
         // Late position is in range, now check if opposite side odds qualify for moonshot
+        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Checking opposite odds: ${targetOdds}% vs ${MOONSHOT_MAX_ODDS}% max`);
+
         if (targetOdds <= MOONSHOT_MAX_ODDS) {
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ OPPOSITE ODDS QUALIFY: ${targetOdds}% <= ${MOONSHOT_MAX_ODDS}%`);
           const moonshotStrategy = 'moonshot';
           const investmentHuman = getBuyAmountForStrategy(moonshotStrategy);
           const moonshotInvestment = ethers.parseUnits(investmentHuman.toString(), decimals);
@@ -2709,8 +2725,15 @@ async function runForWallet(wallet, provider) {
             return;
           }
         } else {
-          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] In moonshot window but target side ${targetSide} at ${targetOdds}% (> ${MOONSHOT_MAX_ODDS}% threshold) - waiting`);
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ❌ SKIP: Opposite side ${targetSide} at ${targetOdds}% (> ${MOONSHOT_MAX_ODDS}% threshold) - waiting for odds to drop`);
           return;
+        }
+      } else {
+        // Moonshot section not entered - log why
+        if (!MOONSHOT_ENABLED) {
+          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Moonshot disabled (MOONSHOT_ENABLED=false)`);
+        } else if (!inMoonshotWindow) {
+          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Not in moonshot window (need last ${MOONSHOT_WINDOW_MINUTES} minutes)`);
         }
       }
 
