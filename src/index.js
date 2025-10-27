@@ -33,6 +33,7 @@ function getBuyAmountForStrategy(strategy) {
   // Normalize strategy name
   const isMoonshot = strategy && strategy.includes('moonshot');
   const isQuickScalp = strategy && strategy.includes('quick_scalp');
+  const isContrarian = strategy && strategy.includes('contrarian');
   const isLate = strategy && strategy === 'default';
 
   // Check strategy-specific amount first
@@ -41,6 +42,9 @@ function getBuyAmountForStrategy(strategy) {
   }
   if (isQuickScalp) {
     return QUICK_SCALP_AMOUNT_USDC;
+  }
+  if (isContrarian) {
+    return CONTRARIAN_AMOUNT_USDC;
   }
   if (isLate && LATE_BUY_AMOUNT_USDC !== null) {
     return LATE_BUY_AMOUNT_USDC;
@@ -112,6 +116,16 @@ const MOONSHOT_MAX_LATE_ODDS = parseInt(process.env.MOONSHOT_MAX_LATE_ODDS || '9
 const MOONSHOT_AMOUNT_USDC = parseFloat(process.env.MOONSHOT_AMOUNT_USDC || '1'); // Amount to invest in moonshot
 const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_PCT || '100', 10); // Sell at N% profit
 const MOONSHOT_FINAL_SECONDS_BUFFER = parseInt(process.env.MOONSHOT_FINAL_SECONDS_BUFFER || '15', 10); // Don't buy in final N seconds
+
+// ========= Contrarian Strategy Config =========
+const CONTRARIAN_ENABLED = (process.env.CONTRARIAN_ENABLED || 'false').toLowerCase() === 'true'; // Enable contrarian strategy
+const CONTRARIAN_BUY_WINDOW_START = parseInt(process.env.CONTRARIAN_BUY_WINDOW_START || '10', 10); // Start buying at minute N
+const CONTRARIAN_BUY_WINDOW_END = parseInt(process.env.CONTRARIAN_BUY_WINDOW_END || '30', 10); // Stop buying at minute N
+const CONTRARIAN_SELL_WINDOW_END = parseInt(process.env.CONTRARIAN_SELL_WINDOW_END || '45', 10); // Stop selling at minute N
+const CONTRARIAN_MIN_ODDS = parseInt(process.env.CONTRARIAN_MIN_ODDS || '85', 10); // Minimum odds on strong side to trigger (buy opposite)
+const CONTRARIAN_MAX_ODDS = parseInt(process.env.CONTRARIAN_MAX_ODDS || '98', 10); // Maximum odds on strong side
+const CONTRARIAN_AMOUNT_USDC = parseFloat(process.env.CONTRARIAN_AMOUNT_USDC || '10'); // Amount to invest
+const CONTRARIAN_PROFIT_TARGET_PCT = parseInt(process.env.CONTRARIAN_PROFIT_TARGET_PCT || '30', 10); // Sell at N% profit
 
 // ========= Sell Config =========
 const AUTO_PROFIT_SELL_ENABLED = (process.env.AUTO_PROFIT_SELL_ENABLED || 'true').toLowerCase() === 'true'; // Enable automatic profit taking
@@ -1291,7 +1305,7 @@ async function runForWallet(wallet, provider) {
     const nowMinutes = now.getMinutes();
 
     // Check if ANY strategy is enabled
-    const anyStrategyEnabled = LATE_STRATEGY_ENABLED || MOONSHOT_ENABLED || QUICK_SCALP_ENABLED;
+    const anyStrategyEnabled = LATE_STRATEGY_ENABLED || MOONSHOT_ENABLED || QUICK_SCALP_ENABLED || CONTRARIAN_ENABLED;
     const hasActiveStrategies = anyStrategyEnabled || AUTO_REDEEM_ENABLED;
 
     // If no strategies enabled and no redemption, always sleep
@@ -1317,7 +1331,11 @@ async function runForWallet(wallet, provider) {
     // So if enabled, bot needs to stay active to catch new markets
     const quickScalpActive = QUICK_SCALP_ENABLED;
 
-    return inRedemptionWindow || inLateWindow || quickScalpActive;
+    // Contrarian runs in minutes 10-45 (not just time-based, also market-age-based for buy window)
+    // So if enabled, bot needs to stay active during this window
+    const contrarianActive = CONTRARIAN_ENABLED && nowMinutes >= CONTRARIAN_BUY_WINDOW_START && nowMinutes <= CONTRARIAN_SELL_WINDOW_END;
+
+    return inRedemptionWindow || inLateWindow || quickScalpActive || contrarianActive;
   }
 
   // Calculate next wake time
@@ -2321,7 +2339,7 @@ async function runForWallet(wallet, provider) {
 
             logTrade({
               type: 'SELL_QUICK_SCALP',
-              wallet: wallet.address,
+              wallet: address,
               marketAddress,
               marketTitle: marketInfo?.title || 'Unknown',
               outcome: outcomeIndex,
@@ -2342,6 +2360,86 @@ async function runForWallet(wallet, provider) {
             removeHolding(wallet.address, marketAddress, strategyType);
             logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed quick_scalp holding after profitable exit`);
             return;
+          }
+        }
+
+        // CONTRARIAN SELL LOGIC: Sell when profitable, hold if losing (active minutes 10-45)
+        if (strategyType === 'contrarian' && !calcSellFailed && marketInfo.createdAt) {
+          const createdMs = new Date(marketInfo.createdAt).getTime();
+          const nowMs = Date.now();
+          const marketAgeMinutes = Math.floor((nowMs - createdMs) / 60000);
+
+          // Only manage contrarian positions within the sell window
+          if (marketAgeMinutes <= CONTRARIAN_SELL_WINDOW_END) {
+            const profitTargetPct = CONTRARIAN_PROFIT_TARGET_PCT;
+            const entryOdds = holding?.entryPrice;
+            const currentOdds = prices[outcomeIndex];
+
+            logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Contrarian position check (age ${marketAgeMinutes}min): Entry ${entryOdds}% → Current ${currentOdds}%, PnL=${pnlPct.toFixed(2)}% (Target: +${profitTargetPct}%)`);
+
+            if (pnlAbs > 0n && pnlPct >= profitTargetPct) {
+              // In profit! Sell position
+              logInfo(wallet.address, '💰', `[${marketAddress.substring(0, 8)}...] Contrarian profit target reached! PnL=${pnlPct.toFixed(2)}% >= ${profitTargetPct}%. Selling position...`);
+
+              const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
+              if (!approvedOk) {
+                logWarn(wallet.address, '🛑', 'Approval not confirmed; skipping contrarian sell this tick.');
+                return;
+              }
+
+              // Sell 100% of position
+              const maxOutcomeTokensToSell = tokenBalance;
+              const returnAmountForSell = positionValue - (positionValue / 100n); // minus 1% safety
+
+              const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
+              if (!gasEst) {
+                logWarn(wallet.address, '🛑', 'Gas estimate sell failed; skipping contrarian sell this tick.');
+                return;
+              }
+
+              const padded = (gasEst * 120n) / 100n + 10000n;
+              const sellOv = await txOverrides(wallet.provider, padded);
+              const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
+              logInfo(wallet.address, '🧾', `Contrarian sell tx: ${tx.hash}`);
+              const receipt = await tx.wait(CONFIRMATIONS);
+
+              const pnlUSDC = parseFloat(ethers.formatUnits(positionValue - cost, decimals));
+              const oddsGain = currentOdds - entryOdds;
+              logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Contrarian sold! Entry ${entryOdds}% → Exit ${currentOdds}% (+${oddsGain.toFixed(1)}% odds gain, PnL=${pnlPct.toFixed(2)}%)`);
+
+              logTrade({
+                type: 'SELL_CONTRARIAN',
+                wallet: wallet.address,
+                marketAddress,
+                marketTitle: marketInfo?.title || 'Unknown',
+                outcome: outcomeIndex,
+                costUSDC: ethers.formatUnits(cost, decimals),
+                returnUSDC: ethers.formatUnits(positionValue, decimals),
+                pnlUSDC: pnlUSDC.toFixed(4),
+                pnlPercent: pnlPct.toFixed(2),
+                entryOdds: entryOdds,
+                exitOdds: currentOdds,
+                oddsChange: oddsGain.toFixed(1),
+                reason: `Contrarian: ${entryOdds}% → ${currentOdds}% (profit target ${profitTargetPct}% reached)`,
+                txHash: tx.hash,
+                blockNumber: receipt.blockNumber,
+                gasUsed: receipt.gasUsed.toString()
+              });
+              updateStats(pnlUSDC);
+
+              removeHolding(wallet.address, marketAddress, strategyType);
+              logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed contrarian holding after profitable exit`);
+              return;
+            } else if (pnlPct < 0) {
+              // In loss - hold and do nothing
+              logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Contrarian position in loss (${pnlPct.toFixed(2)}%) - holding for potential reversal`);
+            } else {
+              // In profit but below target
+              logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] Contrarian in profit (${pnlPct.toFixed(2)}%) but below target (${profitTargetPct}%) - waiting`);
+            }
+          } else {
+            // Past sell window - just hold position
+            logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] Contrarian position past sell window (age ${marketAgeMinutes}min > ${CONTRARIAN_SELL_WINDOW_END}min) - holding until redemption`);
           }
         }
 
@@ -2499,6 +2597,64 @@ async function runForWallet(wallet, provider) {
         }
       }
 
+      // CONTRARIAN STRATEGY: Buy opposite side when odds are extreme (minutes 10-30)
+      if (CONTRARIAN_ENABLED && marketInfo.createdAt) {
+        const createdMs = new Date(marketInfo.createdAt).getTime();
+        const nowMs = Date.now();
+        const marketAgeMinutes = Math.floor((nowMs - createdMs) / 60000);
+
+        // Check if market is in contrarian buy window (minutes 10-30)
+        if (marketAgeMinutes >= CONTRARIAN_BUY_WINDOW_START && marketAgeMinutes <= CONTRARIAN_BUY_WINDOW_END) {
+          // Check if we already have a contrarian position
+          const contrarianHolding = getHolding(wallet.address, marketAddress, 'contrarian');
+          if (!contrarianHolding) {
+            // Look for extreme odds - find strong side and buy opposite
+            const side0Odds = prices[0];
+            const side1Odds = prices[1];
+
+            let strongSide = null;
+            let strongOdds = null;
+            let weakSide = null;
+            let weakOdds = null;
+
+            // Check if either side is in the contrarian trigger range
+            if (side0Odds >= CONTRARIAN_MIN_ODDS && side0Odds <= CONTRARIAN_MAX_ODDS) {
+              strongSide = 0;
+              strongOdds = side0Odds;
+              weakSide = 1;
+              weakOdds = side1Odds;
+            } else if (side1Odds >= CONTRARIAN_MIN_ODDS && side1Odds <= CONTRARIAN_MAX_ODDS) {
+              strongSide = 1;
+              strongOdds = side1Odds;
+              weakSide = 0;
+              weakOdds = side0Odds;
+            }
+
+            if (strongSide !== null) {
+              // Found extreme odds! Buy the opposite (weak) side
+              const investmentHuman = getBuyAmountForStrategy('contrarian');
+              const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
+
+              logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Contrarian opportunity! Market age ${marketAgeMinutes}min, strong side ${strongSide} @ ${strongOdds}%, buying opposite side ${weakSide} @ ${weakOdds}%`);
+
+              // Check USDC balance
+              const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+              if (usdcBal >= investment) {
+                await executeBuy(wallet, market, usdc, marketAddress, investment, weakSide, decimals, pid0, pid1, erc1155, 'contrarian');
+                return; // Exit after contrarian buy
+              } else {
+                logWarn(wallet.address, '⚠️', `Insufficient USDC for contrarian. Need ${investmentHuman}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
+              }
+            } else {
+              logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Contrarian window active (age ${marketAgeMinutes}min) but odds not extreme enough: ${side0Odds}% / ${side1Odds}% (need ${CONTRARIAN_MIN_ODDS}-${CONTRARIAN_MAX_ODDS}%)`);
+            }
+          } else {
+            // We have a contrarian position - sell logic will be handled in the position monitoring section
+            logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Contrarian position exists (age ${marketAgeMinutes}min) - monitoring for exit`);
+          }
+        }
+      }
+
       // NEW LOGIC: Check if we should use last 13 minutes strategy
       if (inLastThirteenMinutes) {
         // Check if late strategy is enabled
@@ -2584,6 +2740,39 @@ async function runForWallet(wallet, provider) {
         // Determine which side is in odds range
         let outcomeToBuy = prices[0] >= minOddsToUse && prices[0] <= maxOddsToUse ? 0 : 1;
 
+        // CHECK FOR CONTRARIAN POSITION CONFLICT
+        // If we have a losing contrarian position, don't buy the same side
+        const contrarianHolding = getHolding(wallet.address, marketAddress, 'contrarian');
+        if (contrarianHolding) {
+          // Check if contrarian position is losing
+          const contrarianCost = BigInt(contrarianHolding.cost || '0');
+          const contrarianTokenId = contrarianHolding.tokenId;
+          const contrarianTokenBalance = await retryRpcCall(async () => await erc1155.balanceOf(wallet.address, contrarianTokenId));
+
+          if (contrarianTokenBalance > 0n) {
+            // Try to get position value
+            let contrarianPositionValue = 0n;
+            try {
+              contrarianPositionValue = await retryRpcCall(async () => await market.calcSellAmount(contrarianTokenBalance, contrarianHolding.outcomeIndex));
+            } catch (e) {
+              // If calc fails, assume position is losing
+              logInfo(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Contrarian position value check failed - assuming losing position`);
+            }
+
+            const contrarianPnl = contrarianPositionValue > contrarianCost ? contrarianPositionValue - contrarianCost : contrarianCost - contrarianPositionValue;
+            const contrarianIsLosing = contrarianPositionValue < contrarianCost;
+
+            if (contrarianIsLosing && contrarianHolding.outcomeIndex === outcomeToBuy) {
+              logInfo(wallet.address, '🚫', `[${marketAddress.substring(0, 8)}...] CONFLICT: Contrarian strategy has a losing position on outcome ${contrarianHolding.outcomeIndex}. Late strategy would buy same side (outcome ${outcomeToBuy}). Skipping to avoid doubling down on losing position.`);
+              return;
+            } else if (!contrarianIsLosing && contrarianHolding.outcomeIndex === outcomeToBuy) {
+              logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Contrarian has winning position on outcome ${contrarianHolding.outcomeIndex}, late strategy buying same side is OK`);
+            } else {
+              logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Contrarian position on outcome ${contrarianHolding.outcomeIndex}, late strategy buying different side (outcome ${outcomeToBuy}) - no conflict`);
+            }
+          }
+        }
+
         // Calculate investment amount (with scale-in support)
         let investmentHuman = getBuyAmountForStrategy(lateStrategy);
         if (SCALE_IN_ENABLED) {
@@ -2635,18 +2824,49 @@ async function runForWallet(wallet, provider) {
             } else if (moonshotOdds > MOONSHOT_MAX_ODDS) {
               logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - opposite side at ${moonshotOdds}% (> ${MOONSHOT_MAX_ODDS}% threshold). Not a true moonshot.`);
             } else {
-              // All conditions met - place moonshot bet
-              const moonshotStrategy = 'moonshot';
-              const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
+              // CHECK FOR CONTRARIAN POSITION CONFLICT before placing moonshot
+              const contrarianHolding = getHolding(wallet.address, marketAddress, 'contrarian');
+              let skipMoonshot = false;
 
-              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot hedge! Late position: outcome ${outcomeToBuy} @ ${lateOdds}% → Buying opposite outcome ${moonshotOutcome} @ ${moonshotOdds}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
+              if (contrarianHolding && contrarianHolding.outcomeIndex === moonshotOutcome) {
+                // Check if contrarian position is losing
+                const contrarianCost = BigInt(contrarianHolding.cost || '0');
+                const contrarianTokenId = contrarianHolding.tokenId;
+                const contrarianTokenBalance = await retryRpcCall(async () => await erc1155.balanceOf(wallet.address, contrarianTokenId));
 
-              // Check USDC balance for moonshot
-              const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
-              if (usdcBalAfter >= moonshotInvestment) {
-                await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy);
-              } else {
-                logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need ${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
+                if (contrarianTokenBalance > 0n) {
+                  let contrarianPositionValue = 0n;
+                  try {
+                    contrarianPositionValue = await retryRpcCall(async () => await market.calcSellAmount(contrarianTokenBalance, contrarianHolding.outcomeIndex));
+                  } catch (e) {
+                    logInfo(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Contrarian position value check failed - assuming losing position`);
+                  }
+
+                  const contrarianIsLosing = contrarianPositionValue < contrarianCost;
+
+                  if (contrarianIsLosing) {
+                    logInfo(wallet.address, '🚫', `[${marketAddress.substring(0, 8)}...] CONFLICT: Contrarian strategy has a losing position on outcome ${contrarianHolding.outcomeIndex}. Moonshot would buy same side (outcome ${moonshotOutcome}). Skipping moonshot.`);
+                    skipMoonshot = true;
+                  } else {
+                    logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Contrarian has winning position on outcome ${contrarianHolding.outcomeIndex}, moonshot buying same side is OK`);
+                  }
+                }
+              }
+
+              if (!skipMoonshot) {
+                // All conditions met - place moonshot bet
+                const moonshotStrategy = 'moonshot';
+                const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
+
+                logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot hedge! Late position: outcome ${outcomeToBuy} @ ${lateOdds}% → Buying opposite outcome ${moonshotOutcome} @ ${moonshotOdds}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
+
+                // Check USDC balance for moonshot
+                const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+                if (usdcBalAfter >= moonshotInvestment) {
+                  await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy);
+                } else {
+                  logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need ${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
+                }
               }
             }
           }
@@ -2658,7 +2878,7 @@ async function runForWallet(wallet, provider) {
         const shouldCheckMoonshot = MOONSHOT_ENABLED && inMoonshotWindow && lateHolding;
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== LATE STRATEGY BLOCK END ======`);
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Decision: MOONSHOT_ENABLED=${MOONSHOT_ENABLED}, inMoonshotWindow=${inMoonshotWindow}, lateHolding=${!!lateHolding}`);
-        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] shouldCheckMoonshot=${shouldCheckMoonshot}`);
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] shouldCheckMoonshot=${!!shouldCheckMoonshot}`);
 
         if (!shouldCheckMoonshot) {
           logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ❌ NOT checking moonshot - returning from late strategy block`);
@@ -2733,6 +2953,36 @@ async function runForWallet(wallet, provider) {
 
         // Late position is in range, now check if opposite side odds qualify for moonshot
         logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Checking opposite odds: ${targetOdds}% vs ${MOONSHOT_MAX_ODDS}% max`);
+
+        // CHECK FOR CONTRARIAN POSITION CONFLICT
+        // If we have a losing contrarian position on the same side as moonshot target, don't buy
+        const contrarianHolding = getHolding(wallet.address, marketAddress, 'contrarian');
+        if (contrarianHolding && contrarianHolding.outcomeIndex === targetSide) {
+          // Check if contrarian position is losing
+          const contrarianCost = BigInt(contrarianHolding.cost || '0');
+          const contrarianTokenId = contrarianHolding.tokenId;
+          const contrarianTokenBalance = await retryRpcCall(async () => await erc1155.balanceOf(wallet.address, contrarianTokenId));
+
+          if (contrarianTokenBalance > 0n) {
+            // Try to get position value
+            let contrarianPositionValue = 0n;
+            try {
+              contrarianPositionValue = await retryRpcCall(async () => await market.calcSellAmount(contrarianTokenBalance, contrarianHolding.outcomeIndex));
+            } catch (e) {
+              // If calc fails, assume position is losing
+              logInfo(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Contrarian position value check failed - assuming losing position`);
+            }
+
+            const contrarianIsLosing = contrarianPositionValue < contrarianCost;
+
+            if (contrarianIsLosing) {
+              logInfo(wallet.address, '🚫', `[${marketAddress.substring(0, 8)}...] CONFLICT: Contrarian strategy has a losing position on outcome ${contrarianHolding.outcomeIndex}. Moonshot would buy same side (outcome ${targetSide}). Skipping to avoid doubling down on losing position.`);
+              return;
+            } else {
+              logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Contrarian has winning position on outcome ${contrarianHolding.outcomeIndex}, moonshot buying same side is OK`);
+            }
+          }
+        }
 
         if (targetOdds <= MOONSHOT_MAX_ODDS) {
           logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ OPPOSITE ODDS QUALIFY: ${targetOdds}% <= ${MOONSHOT_MAX_ODDS}%`);
@@ -2827,7 +3077,7 @@ async function runForWallet(wallet, provider) {
     } else {
       // Bot is active - use normal polling interval
       nextPollDelay = POLL_INTERVAL_MS;
-      reason = `active trading window (LATE=${LATE_STRATEGY_ENABLED}, MOONSHOT=${MOONSHOT_ENABLED}, QUICK_SCALP=${QUICK_SCALP_ENABLED})`;
+      reason = `active trading window (LATE=${LATE_STRATEGY_ENABLED}, MOONSHOT=${MOONSHOT_ENABLED}, QUICK_SCALP=${QUICK_SCALP_ENABLED}, CONTRARIAN=${CONTRARIAN_ENABLED})`;
     }
 
     // Schedule next poll
