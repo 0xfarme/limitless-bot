@@ -119,8 +119,10 @@ const MOONSHOT_FINAL_SECONDS_BUFFER = parseInt(process.env.MOONSHOT_FINAL_SECOND
 
 // ========= Contrarian Strategy Config =========
 const CONTRARIAN_ENABLED = (process.env.CONTRARIAN_ENABLED || 'false').toLowerCase() === 'true'; // Enable contrarian strategy
-const CONTRARIAN_BUY_WINDOW_START = parseInt(process.env.CONTRARIAN_BUY_WINDOW_START || '10', 10); // Start buying at minute N
-const CONTRARIAN_BUY_WINDOW_END = parseInt(process.env.CONTRARIAN_BUY_WINDOW_END || '30', 10); // Stop buying at minute N
+// Parse buy window range (e.g., "10-30")
+const CONTRARIAN_BUY_WINDOW_RANGE = (process.env.CONTRARIAN_BUY_WINDOW_START_END || '10-30').split('-').map(s => parseInt(s.trim(), 10));
+const CONTRARIAN_BUY_WINDOW_START = CONTRARIAN_BUY_WINDOW_RANGE[0] || 10;
+const CONTRARIAN_BUY_WINDOW_END = CONTRARIAN_BUY_WINDOW_RANGE[1] || 30;
 const CONTRARIAN_SELL_WINDOW_END = parseInt(process.env.CONTRARIAN_SELL_WINDOW_END || '45', 10); // Stop selling at minute N
 const CONTRARIAN_MIN_ODDS = parseInt(process.env.CONTRARIAN_MIN_ODDS || '85', 10); // Minimum odds on strong side to trigger (buy opposite)
 const CONTRARIAN_MAX_ODDS = parseInt(process.env.CONTRARIAN_MAX_ODDS || '98', 10); // Maximum odds on strong side
