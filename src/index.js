@@ -2648,7 +2648,11 @@ async function runForWallet(wallet, provider) {
 
         } // End else block - only execute late buy if no existing position
 
-        return;
+        // Only return if we're not going to check moonshot
+        if (!(MOONSHOT_ENABLED && inMoonshotWindow && lateHolding)) {
+          return; // Exit if no moonshot or no late holding to hedge
+        }
+        // Otherwise continue to independent moonshot section below
       }
 
       // Independent Moonshot Strategy: ONLY triggers when there's an existing late window position
