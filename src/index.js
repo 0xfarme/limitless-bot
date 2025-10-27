@@ -2510,16 +2510,22 @@ async function runForWallet(wallet, provider) {
         // Check if late strategy already has a position
         const lateStrategy = 'default';
         const lateHolding = getHolding(wallet.address, marketAddress, lateStrategy);
+
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== LATE STRATEGY CHECK ======`);
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] lateHolding exists: ${!!lateHolding}`);
+
         if (lateHolding) {
+          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Found late position: outcome=${lateHolding.outcomeIndex}, strategy=${lateHolding.strategy}`);
           if (MOONSHOT_ENABLED && inMoonshotWindow) {
-            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Late window strategy already has a position - skipping late buy, will check moonshot below`);
+            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] ✅ Late window strategy already has a position - WILL skip late buy and check moonshot below`);
             // Skip to end of late strategy block to check moonshot
           } else {
-            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Late window strategy already has a position - skipping buy`);
+            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Late window strategy already has a position - skipping buy (no moonshot)`);
             return; // No moonshot, so exit
           }
         } else {
         // Only execute late buy logic if we don't have a position yet
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] No late position - proceeding with late buy logic...`);
 
         // Check if in last 2 minutes - don't buy (but let independent moonshot handle it if enabled)
         if (inLastTwoMinutes) {
@@ -2648,10 +2654,18 @@ async function runForWallet(wallet, provider) {
 
         } // End else block - only execute late buy if no existing position
 
-        // Only return if we're not going to check moonshot
-        if (!(MOONSHOT_ENABLED && inMoonshotWindow && lateHolding)) {
+        // Decision point: should we continue to moonshot or return?
+        const shouldCheckMoonshot = MOONSHOT_ENABLED && inMoonshotWindow && lateHolding;
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== LATE STRATEGY BLOCK END ======`);
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Decision: MOONSHOT_ENABLED=${MOONSHOT_ENABLED}, inMoonshotWindow=${inMoonshotWindow}, lateHolding=${!!lateHolding}`);
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] shouldCheckMoonshot=${shouldCheckMoonshot}`);
+
+        if (!shouldCheckMoonshot) {
+          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ❌ NOT checking moonshot - returning from late strategy block`);
           return; // Exit if no moonshot or no late holding to hedge
         }
+
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ✅ CONTINUING TO MOONSHOT SECTION (not returning)`);
         // Otherwise continue to independent moonshot section below
       }
 
@@ -2661,10 +2675,11 @@ async function runForWallet(wallet, provider) {
       // Works in last N minutes based on MOONSHOT_WINDOW_MINUTES parameter
 
       // Debug logging for moonshot decision
+      logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== INDEPENDENT MOONSHOT SECTION ======`);
       logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Moonshot check: ENABLED=${MOONSHOT_ENABLED}, inWindow=${inMoonshotWindow}, window=${MOONSHOT_WINDOW_MINUTES}min`);
 
       if (MOONSHOT_ENABLED && inMoonshotWindow) {
-        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ MOONSHOT SECTION ENTERED - checking conditions...`);
+        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅✅✅ MOONSHOT SECTION ENTERED - checking conditions... ✅✅✅`);
         // Safety check: Don't buy in final N seconds to ensure transaction can complete
         if (marketInfo.deadline) {
           const deadlineMs = new Date(marketInfo.deadline).getTime();
@@ -2742,12 +2757,15 @@ async function runForWallet(wallet, provider) {
         }
       } else {
         // Moonshot section not entered - log why
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ❌❌❌ MOONSHOT SECTION NOT ENTERED ❌❌❌`);
         if (!MOONSHOT_ENABLED) {
-          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Moonshot disabled (MOONSHOT_ENABLED=false)`);
+          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Reason: Moonshot disabled (MOONSHOT_ENABLED=false)`);
         } else if (!inMoonshotWindow) {
-          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Not in moonshot window (need last ${MOONSHOT_WINDOW_MINUTES} minutes)`);
+          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Reason: Not in moonshot window (need last ${MOONSHOT_WINDOW_MINUTES} minutes)`);
         }
       }
+
+      logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== END MOONSHOT SECTION ======`);
 
       // Not in last 13 minutes - check age/deadline restrictions
       if (tooNewForBet || nearDeadlineForBet) {
