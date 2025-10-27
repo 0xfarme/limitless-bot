@@ -2511,8 +2511,12 @@ async function runForWallet(wallet, provider) {
         const lateStrategy = 'default';
         const lateHolding = getHolding(wallet.address, marketAddress, lateStrategy);
         if (lateHolding) {
-          logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Late window strategy already has a position - skipping buy`);
-          return;
+          if (MOONSHOT_ENABLED && inMoonshotWindow) {
+            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Late window strategy already has a position - skipping late buy, will check moonshot below`);
+          } else {
+            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Late window strategy already has a position - skipping buy`);
+          }
+          return; // Exit late strategy block to allow independent moonshot strategy to run
         }
 
         // Check if in last 2 minutes - don't buy (but let independent moonshot handle it if enabled)
