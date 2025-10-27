@@ -124,8 +124,10 @@ const CONTRARIAN_BUY_WINDOW_RANGE = (process.env.CONTRARIAN_BUY_WINDOW_START_END
 const CONTRARIAN_BUY_WINDOW_START = CONTRARIAN_BUY_WINDOW_RANGE[0] || 10;
 const CONTRARIAN_BUY_WINDOW_END = CONTRARIAN_BUY_WINDOW_RANGE[1] || 30;
 const CONTRARIAN_SELL_WINDOW_END = parseInt(process.env.CONTRARIAN_SELL_WINDOW_END || '45', 10); // Stop selling at minute N
-const CONTRARIAN_MIN_ODDS = parseInt(process.env.CONTRARIAN_MIN_ODDS || '85', 10); // Minimum odds on strong side to trigger (buy opposite)
-const CONTRARIAN_MAX_ODDS = parseInt(process.env.CONTRARIAN_MAX_ODDS || '98', 10); // Maximum odds on strong side
+// Parse odds range (e.g., "85-98")
+const CONTRARIAN_ODDS_RANGE = (process.env.CONTRARIAN_MIN_ODDS_MAX_ODDS || '85-98').split('-').map(s => parseInt(s.trim(), 10));
+const CONTRARIAN_MIN_ODDS = CONTRARIAN_ODDS_RANGE[0] || 85; // Minimum odds on strong side to trigger (buy opposite)
+const CONTRARIAN_MAX_ODDS = CONTRARIAN_ODDS_RANGE[1] || 98; // Maximum odds on strong side
 const CONTRARIAN_AMOUNT_USDC = parseFloat(process.env.CONTRARIAN_AMOUNT_USDC || '10'); // Amount to invest
 const CONTRARIAN_PROFIT_TARGET_PCT = parseInt(process.env.CONTRARIAN_PROFIT_TARGET_PCT || '30', 10); // Sell at N% profit
 
