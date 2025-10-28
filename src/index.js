@@ -106,6 +106,7 @@ const QUICK_SCALP_MIN_ENTRY_ODDS = parseFloat(process.env.QUICK_SCALP_MIN_ENTRY_
 const QUICK_SCALP_MAX_ENTRY_ODDS = parseFloat(process.env.QUICK_SCALP_MAX_ENTRY_ODDS || '30'); // Max odds to enter
 const QUICK_SCALP_PROFIT_MULTIPLIER = parseFloat(process.env.QUICK_SCALP_PROFIT_MULTIPLIER || '2'); // Sell when odds reach Nx entry
 const QUICK_SCALP_AMOUNT_USDC = parseFloat(process.env.QUICK_SCALP_AMOUNT_USDC || '10');
+const QUICK_SCALP_HOLD_MODE = (process.env.QUICK_SCALP_HOLD_MODE || 'false').toLowerCase() === 'true'; // Hold to expiry instead of taking profits
 
 // ========= Moonshot Strategy Config =========
 const MOONSHOT_ENABLED = (process.env.MOONSHOT_ENABLED || 'true').toLowerCase() === 'true'; // Enable moonshot strategy
@@ -2361,8 +2362,8 @@ async function runForWallet(wallet, provider) {
         // Debug logging for sell decision
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Sell check: calcSellFailed=${calcSellFailed}, pnlAbs=${pnlAbs > 0n ? '+' : '-'}, pnlPct=${pnlPct.toFixed(2)}%, profitTarget=${profitTarget}%, alreadyTookProfit=${alreadyTookProfit}, strategy=${strategyType}`);
 
-        // QUICK SCALP SELL LOGIC: Sell when odds reach target multiplier
-        if (strategyType === 'quick_scalp' && !calcSellFailed) {
+        // QUICK SCALP SELL LOGIC: Sell when odds reach target multiplier (unless hold mode is enabled)
+        if (strategyType === 'quick_scalp' && !calcSellFailed && !QUICK_SCALP_HOLD_MODE) {
           const entryOdds = holding?.entryPrice;
           const currentOdds = prices[outcomeIndex];
           const targetOdds = entryOdds * QUICK_SCALP_PROFIT_MULTIPLIER;
@@ -2423,6 +2424,11 @@ async function runForWallet(wallet, provider) {
             logInfo(wallet.address, '🗑️', `[${marketAddress.substring(0, 8)}...] Removed quick_scalp holding after profitable exit`);
             return;
           }
+        } else if (strategyType === 'quick_scalp' && QUICK_SCALP_HOLD_MODE) {
+          // Hold mode - never sell, just log status
+          const entryOdds = holding?.entryPrice;
+          const currentOdds = prices[outcomeIndex];
+          logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Quick scalp HOLD MODE: Entry ${entryOdds}% → Current ${currentOdds}%, PnL=${pnlPct.toFixed(2)}% (holding to expiry)`);
         }
 
         // CONTRARIAN SELL LOGIC: Sell when profitable, hold if losing (active minutes 10-45 of the hour)
@@ -2619,20 +2625,39 @@ async function runForWallet(wallet, provider) {
           // Check if we already have a quick scalp position
           const quickScalpHolding = getHolding(wallet.address, marketAddress, 'quick_scalp');
           if (!quickScalpHolding) {
-            // Look for imbalanced odds - find side with odds in entry range
             const side0Odds = prices[0];
             const side1Odds = prices[1];
 
             let targetSide = null;
             let targetOdds = null;
 
-            // Check if either side is in the entry range
-            if (side0Odds >= QUICK_SCALP_MIN_ENTRY_ODDS && side0Odds <= QUICK_SCALP_MAX_ENTRY_ODDS) {
-              targetSide = 0;
-              targetOdds = side0Odds;
-            } else if (side1Odds >= QUICK_SCALP_MIN_ENTRY_ODDS && side1Odds <= QUICK_SCALP_MAX_ENTRY_ODDS) {
-              targetSide = 1;
-              targetOdds = side1Odds;
+            // HOLD MODE: Buy strong side (for late window hold)
+            // NORMAL MODE: Buy weak side (for quick flip)
+            if (QUICK_SCALP_HOLD_MODE) {
+              // Hold mode: buy the stronger side (higher odds)
+              if (side0Odds >= QUICK_SCALP_MIN_ENTRY_ODDS && side0Odds <= QUICK_SCALP_MAX_ENTRY_ODDS) {
+                // If side 0 is in range and is the stronger side
+                if (side0Odds > side1Odds) {
+                  targetSide = 0;
+                  targetOdds = side0Odds;
+                }
+              }
+              if (side1Odds >= QUICK_SCALP_MIN_ENTRY_ODDS && side1Odds <= QUICK_SCALP_MAX_ENTRY_ODDS) {
+                // If side 1 is in range and is the stronger side (or only side in range)
+                if (side1Odds > side0Odds || targetSide === null) {
+                  targetSide = 1;
+                  targetOdds = side1Odds;
+                }
+              }
+            } else {
+              // Normal mode: buy either side in entry range (underdog betting)
+              if (side0Odds >= QUICK_SCALP_MIN_ENTRY_ODDS && side0Odds <= QUICK_SCALP_MAX_ENTRY_ODDS) {
+                targetSide = 0;
+                targetOdds = side0Odds;
+              } else if (side1Odds >= QUICK_SCALP_MIN_ENTRY_ODDS && side1Odds <= QUICK_SCALP_MAX_ENTRY_ODDS) {
+                targetSide = 1;
+                targetOdds = side1Odds;
+              }
             }
 
             if (targetSide !== null) {
@@ -2640,7 +2665,8 @@ async function runForWallet(wallet, provider) {
               const investmentHuman = getBuyAmountForStrategy('quick_scalp');
               const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
 
-              logInfo(wallet.address, '⚡', `[${marketAddress.substring(0, 8)}...] Quick Scalp opportunity! Market age ${marketAgeMinutes}min, buying side ${targetSide} at ${targetOdds}% (entry range: ${QUICK_SCALP_MIN_ENTRY_ODDS}-${QUICK_SCALP_MAX_ENTRY_ODDS}%)`);
+              const mode = QUICK_SCALP_HOLD_MODE ? 'HOLD' : 'FLIP';
+              logInfo(wallet.address, '⚡', `[${marketAddress.substring(0, 8)}...] Quick Scalp ${mode} opportunity! Market age ${marketAgeMinutes}min, buying side ${targetSide} at ${targetOdds}% (entry range: ${QUICK_SCALP_MIN_ENTRY_ODDS}-${QUICK_SCALP_MAX_ENTRY_ODDS}%)`);
 
               // Check USDC balance
               const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
@@ -2726,8 +2752,11 @@ async function runForWallet(wallet, provider) {
         const lateStrategy = 'default';
         const lateHolding = getHolding(wallet.address, marketAddress, lateStrategy);
 
+        // Check if quick scalp (in hold mode) already has a position
+        const quickScalpHolding = QUICK_SCALP_HOLD_MODE ? getHolding(wallet.address, marketAddress, 'quick_scalp') : null;
+
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== LATE STRATEGY CHECK ======`);
-        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] lateHolding exists: ${!!lateHolding}`);
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] lateHolding exists: ${!!lateHolding}, quickScalpHolding (hold mode): ${!!quickScalpHolding}`);
 
         if (lateHolding) {
           logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Found late position: outcome=${lateHolding.outcomeIndex}, strategy=${lateHolding.strategy}`);
@@ -2736,6 +2765,18 @@ async function runForWallet(wallet, provider) {
             // Skip to end of late strategy block to check moonshot
           } else {
             logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Late window strategy already has a position - skipping buy (no moonshot)`);
+            return; // No moonshot, so exit
+          }
+        } else if (quickScalpHolding) {
+          // Quick scalp (hold mode) has a position - treat it like a late position
+          logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Quick scalp HOLD position exists: outcome=${quickScalpHolding.outcomeIndex}`);
+          if (MOONSHOT_ENABLED && inMoonshotWindow) {
+            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] ✅ Quick scalp hold position exists - WILL skip late buy and check moonshot below`);
+            // Skip to end of late strategy block to check moonshot
+            // Set a reference so moonshot logic can use it
+            const lateHolding = quickScalpHolding; // Treat quick scalp as late position for moonshot
+          } else {
+            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Quick scalp hold position exists - skipping late buy (no moonshot)`);
             return; // No moonshot, so exit
           }
         } else {
