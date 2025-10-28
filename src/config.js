@@ -71,6 +71,7 @@ export const QUICK_SCALP_MAX_ENTRY_ODDS = parseInt(process.env.QUICK_SCALP_MAX_E
 export const QUICK_SCALP_PROFIT_MULTIPLIER = parseFloat(process.env.QUICK_SCALP_PROFIT_MULTIPLIER || '2'); // Sell when odds reach Nx entry (e.g., 2x)
 export const QUICK_SCALP_AMOUNT_USDC = parseFloat(process.env.QUICK_SCALP_AMOUNT_USDC || '10');
 export const QUICK_SCALP_HOLD_MODE = (process.env.QUICK_SCALP_HOLD_MODE || 'false').toLowerCase() === 'true'; // Hold to expiry instead of taking profits
+export const QUICK_SCALP_MAX_TRADES_PER_MARKET = parseInt(process.env.QUICK_SCALP_MAX_TRADES_PER_MARKET || '1', 10); // Max trades per market (default 1 for hold mode)
 
 // ========= Moonshot Strategy =========
 export const MOONSHOT_ENABLED = (process.env.MOONSHOT_ENABLED || 'true').toLowerCase() === 'true';

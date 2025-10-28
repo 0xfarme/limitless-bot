@@ -107,6 +107,7 @@ const QUICK_SCALP_MAX_ENTRY_ODDS = parseFloat(process.env.QUICK_SCALP_MAX_ENTRY_
 const QUICK_SCALP_PROFIT_MULTIPLIER = parseFloat(process.env.QUICK_SCALP_PROFIT_MULTIPLIER || '2'); // Sell when odds reach Nx entry
 const QUICK_SCALP_AMOUNT_USDC = parseFloat(process.env.QUICK_SCALP_AMOUNT_USDC || '10');
 const QUICK_SCALP_HOLD_MODE = (process.env.QUICK_SCALP_HOLD_MODE || 'false').toLowerCase() === 'true'; // Hold to expiry instead of taking profits
+const QUICK_SCALP_MAX_TRADES_PER_MARKET = parseInt(process.env.QUICK_SCALP_MAX_TRADES_PER_MARKET || '1', 10); // Max trades per market (default 1 for hold mode)
 
 // ========= Moonshot Strategy Config =========
 const MOONSHOT_ENABLED = (process.env.MOONSHOT_ENABLED || 'true').toLowerCase() === 'true'; // Enable moonshot strategy
@@ -515,6 +516,10 @@ function getAllHoldings(addr) {
 function countMoonshotPositions(addr, marketAddress) {
   const holdings = getHoldingsForMarket(addr, marketAddress);
   return holdings.filter(h => h.strategy === 'moonshot').length;
+}
+function countQuickScalpPositions(addr, marketAddress) {
+  const holdings = getHoldingsForMarket(addr, marketAddress);
+  return holdings.filter(h => h.strategy === 'quick_scalp').length;
 }
 
 // ========= Position Summary Report =========
@@ -2622,9 +2627,11 @@ async function runForWallet(wallet, provider) {
 
         // Check if market is in quick scalp window (first N minutes)
         if (marketAgeMinutes <= QUICK_SCALP_WINDOW_MINUTES) {
-          // Check if we already have a quick scalp position
-          const quickScalpHolding = getHolding(wallet.address, marketAddress, 'quick_scalp');
-          if (!quickScalpHolding) {
+          // Check if we already have reached max quick scalp positions for this market
+          const quickScalpCount = countQuickScalpPositions(wallet.address, marketAddress);
+          if (quickScalpCount >= QUICK_SCALP_MAX_TRADES_PER_MARKET) {
+            logInfo(wallet.address, '⚡', `[${marketAddress.substring(0, 8)}...] Already have ${quickScalpCount}/${QUICK_SCALP_MAX_TRADES_PER_MARKET} quick scalp positions - skipping`);
+          } else {
             const side0Odds = prices[0];
             const side1Odds = prices[1];
 
@@ -2664,9 +2671,10 @@ async function runForWallet(wallet, provider) {
               // Found an opportunity! Buy it
               const investmentHuman = getBuyAmountForStrategy('quick_scalp');
               const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
+              const tradeNumber = quickScalpCount + 1;
 
               const mode = QUICK_SCALP_HOLD_MODE ? 'HOLD' : 'FLIP';
-              logInfo(wallet.address, '⚡', `[${marketAddress.substring(0, 8)}...] Quick Scalp ${mode} opportunity! Market age ${marketAgeMinutes}min, buying side ${targetSide} at ${targetOdds}% (entry range: ${QUICK_SCALP_MIN_ENTRY_ODDS}-${QUICK_SCALP_MAX_ENTRY_ODDS}%)`);
+              logInfo(wallet.address, '⚡', `[${marketAddress.substring(0, 8)}...] Quick Scalp ${mode} (${tradeNumber}/${QUICK_SCALP_MAX_TRADES_PER_MARKET})! Market age ${marketAgeMinutes}min, buying side ${targetSide} at ${targetOdds}% with $${investmentHuman} (entry range: ${QUICK_SCALP_MIN_ENTRY_ODDS}-${QUICK_SCALP_MAX_ENTRY_ODDS}%)`);
 
               // Check USDC balance
               const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
@@ -2677,9 +2685,6 @@ async function runForWallet(wallet, provider) {
                 logWarn(wallet.address, '⚠️', `Insufficient USDC for quick scalp. Need ${investmentHuman}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
               }
             }
-          } else {
-            // We have a quick scalp position - sell logic will be handled in the position monitoring section
-            logInfo(wallet.address, '⚡', `[${marketAddress.substring(0, 8)}...] Quick scalp position exists (age ${marketAgeMinutes}min) - monitoring for exit`);
           }
         }
       }
