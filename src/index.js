@@ -2399,19 +2399,17 @@ async function runForWallet(wallet, provider) {
           }
         }
 
-        // CONTRARIAN SELL LOGIC: Sell when profitable, hold if losing (active minutes 10-45)
-        if (strategyType === 'contrarian' && !calcSellFailed && marketInfo.createdAt) {
-          const createdMs = new Date(marketInfo.createdAt).getTime();
-          const nowMs = Date.now();
-          const marketAgeMinutes = Math.floor((nowMs - createdMs) / 60000);
+        // CONTRARIAN SELL LOGIC: Sell when profitable, hold if losing (active minutes 10-45 of the hour)
+        if (strategyType === 'contrarian' && !calcSellFailed) {
+          const currentMinute = new Date().getMinutes();
 
-          // Only manage contrarian positions within the active window (10-45 minutes)
-          if (marketAgeMinutes >= CONTRARIAN_BUY_WINDOW_START && marketAgeMinutes <= CONTRARIAN_SELL_WINDOW_END) {
+          // Only manage contrarian positions within the active window (minutes :10-:45 of any hour)
+          if (currentMinute >= CONTRARIAN_BUY_WINDOW_START && currentMinute <= CONTRARIAN_SELL_WINDOW_END) {
             const profitTargetPct = CONTRARIAN_PROFIT_TARGET_PCT;
             const entryOdds = holding?.entryPrice;
             const currentOdds = prices[outcomeIndex];
 
-            logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Contrarian position check (age ${marketAgeMinutes}min): Entry ${entryOdds}% → Current ${currentOdds}%, PnL=${pnlPct.toFixed(2)}% (Target: +${profitTargetPct}%)`);
+            logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Contrarian position check (minute :${currentMinute}): Entry ${entryOdds}% → Current ${currentOdds}%, PnL=${pnlPct.toFixed(2)}% (Target: +${profitTargetPct}%)`);
 
             if (pnlAbs > 0n && pnlPct >= profitTargetPct) {
               // In profit! Sell position
@@ -2475,7 +2473,7 @@ async function runForWallet(wallet, provider) {
             }
           } else {
             // Past sell window - just hold position
-            logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] Contrarian position past sell window (age ${marketAgeMinutes}min > ${CONTRARIAN_SELL_WINDOW_END}min) - holding until redemption`);
+            logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] Contrarian position past sell window (minute :${currentMinute} > :${CONTRARIAN_SELL_WINDOW_END}) - holding until redemption`);
           }
         }
 
@@ -2633,14 +2631,12 @@ async function runForWallet(wallet, provider) {
         }
       }
 
-      // CONTRARIAN STRATEGY: Buy opposite side when odds are extreme (minutes 10-30)
-      if (CONTRARIAN_ENABLED && marketInfo.createdAt) {
-        const createdMs = new Date(marketInfo.createdAt).getTime();
-        const nowMs = Date.now();
-        const marketAgeMinutes = Math.floor((nowMs - createdMs) / 60000);
+      // CONTRARIAN STRATEGY: Buy opposite side when odds are extreme (minutes 10-30 of the hour)
+      if (CONTRARIAN_ENABLED) {
+        const currentMinute = new Date().getMinutes();
 
-        // Check if market is in contrarian buy window (minutes 10-30)
-        if (marketAgeMinutes >= CONTRARIAN_BUY_WINDOW_START && marketAgeMinutes <= CONTRARIAN_BUY_WINDOW_END) {
+        // Check if we're in contrarian buy window (e.g., minutes :10-:30 of any hour)
+        if (currentMinute >= CONTRARIAN_BUY_WINDOW_START && currentMinute <= CONTRARIAN_BUY_WINDOW_END) {
           // Check if we already have a contrarian position
           const contrarianHolding = getHolding(wallet.address, marketAddress, 'contrarian');
           if (!contrarianHolding) {
@@ -2671,7 +2667,7 @@ async function runForWallet(wallet, provider) {
               const investmentHuman = getBuyAmountForStrategy('contrarian');
               const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
 
-              logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Contrarian opportunity! Market age ${marketAgeMinutes}min, strong side ${strongSide} @ ${strongOdds}%, buying opposite side ${weakSide} @ ${weakOdds}%`);
+              logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Contrarian opportunity! Minute :${currentMinute}, strong side ${strongSide} @ ${strongOdds}%, buying opposite side ${weakSide} @ ${weakOdds}%`);
 
               // Check USDC balance
               const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
@@ -2682,11 +2678,11 @@ async function runForWallet(wallet, provider) {
                 logWarn(wallet.address, '⚠️', `Insufficient USDC for contrarian. Need ${investmentHuman}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
               }
             } else {
-              logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Contrarian window active (age ${marketAgeMinutes}min) but odds not extreme enough: ${side0Odds}% / ${side1Odds}% (need ${CONTRARIAN_MIN_ODDS}-${CONTRARIAN_MAX_ODDS}%)`);
+              logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Contrarian window active (minute :${currentMinute}) but odds not extreme enough: ${side0Odds}% / ${side1Odds}% (need ${CONTRARIAN_MIN_ODDS}-${CONTRARIAN_MAX_ODDS}%)`);
             }
           } else {
             // We have a contrarian position - sell logic will be handled in the position monitoring section
-            logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Contrarian position exists (age ${marketAgeMinutes}min) - monitoring for exit`);
+            logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Contrarian position exists (minute :${currentMinute}) - monitoring for exit`);
           }
         }
       }
