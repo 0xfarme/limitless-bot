@@ -2405,8 +2405,8 @@ async function runForWallet(wallet, provider) {
           const nowMs = Date.now();
           const marketAgeMinutes = Math.floor((nowMs - createdMs) / 60000);
 
-          // Only manage contrarian positions within the sell window
-          if (marketAgeMinutes <= CONTRARIAN_SELL_WINDOW_END) {
+          // Only manage contrarian positions within the active window (10-45 minutes)
+          if (marketAgeMinutes >= CONTRARIAN_BUY_WINDOW_START && marketAgeMinutes <= CONTRARIAN_SELL_WINDOW_END) {
             const profitTargetPct = CONTRARIAN_PROFIT_TARGET_PCT;
             const entryOdds = holding?.entryPrice;
             const currentOdds = prices[outcomeIndex];
