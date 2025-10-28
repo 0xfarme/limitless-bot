@@ -1348,20 +1348,50 @@ async function runForWallet(wallet, provider) {
     const nowMinutes = now.getMinutes();
     const nowSeconds = now.getSeconds();
 
-    let nextWakeMinute;
+    // Collect all wake times for enabled strategies
+    const wakeMinutes = [];
 
-    // Determine next active window
-    if (AUTO_REDEEM_ENABLED && nowMinutes < REDEEM_WINDOW_START) {
-      nextWakeMinute = REDEEM_WINDOW_START;
-    } else if (nowMinutes < (60 - BUY_WINDOW_MINUTES)) {
-      nextWakeMinute = 60 - BUY_WINDOW_MINUTES;
-    } else {
-      // Next window is in the next hour
-      if (AUTO_REDEEM_ENABLED) {
-        nextWakeMinute = REDEEM_WINDOW_START + 60;
-      } else {
-        nextWakeMinute = (60 - BUY_WINDOW_MINUTES) + 60;
+    // Quick Scalp runs all the time (market-age based, not time based)
+    if (QUICK_SCALP_ENABLED) {
+      // Stay awake always when quick scalp is enabled
+      return POLL_INTERVAL_MS;
+    }
+
+    // Redemption window
+    if (AUTO_REDEEM_ENABLED) {
+      if (nowMinutes < REDEEM_WINDOW_START) {
+        wakeMinutes.push(REDEEM_WINDOW_START);
+      } else if (nowMinutes > REDEEM_WINDOW_END) {
+        wakeMinutes.push(REDEEM_WINDOW_START + 60); // Next hour
       }
+    }
+
+    // Contrarian window
+    if (CONTRARIAN_ENABLED) {
+      if (nowMinutes < CONTRARIAN_BUY_WINDOW_START) {
+        wakeMinutes.push(CONTRARIAN_BUY_WINDOW_START);
+      } else if (nowMinutes > CONTRARIAN_SELL_WINDOW_END) {
+        wakeMinutes.push(CONTRARIAN_BUY_WINDOW_START + 60); // Next hour
+      }
+    }
+
+    // Late trading window
+    if (LATE_STRATEGY_ENABLED) {
+      const lateWindowStart = 60 - BUY_WINDOW_MINUTES;
+      if (nowMinutes < lateWindowStart) {
+        wakeMinutes.push(lateWindowStart);
+      } else {
+        wakeMinutes.push(lateWindowStart + 60); // Next hour
+      }
+    }
+
+    // Find the earliest wake time
+    let nextWakeMinute;
+    if (wakeMinutes.length === 0) {
+      // No strategies enabled - default to 1 hour
+      nextWakeMinute = nowMinutes + 60;
+    } else {
+      nextWakeMinute = Math.min(...wakeMinutes);
     }
 
     // Calculate seconds until next wake time
@@ -1388,7 +1418,7 @@ async function runForWallet(wallet, provider) {
 
     if (!isActive) {
       // Check if all strategies are disabled
-      const allStrategiesDisabled = !LATE_STRATEGY_ENABLED && !MOONSHOT_ENABLED && !AUTO_REDEEM_ENABLED;
+      const allStrategiesDisabled = !LATE_STRATEGY_ENABLED && !MOONSHOT_ENABLED && !QUICK_SCALP_ENABLED && !CONTRARIAN_ENABLED && !AUTO_REDEEM_ENABLED;
 
       if (allStrategiesDisabled) {
         // Deep sleep mode - no strategies enabled
@@ -1398,7 +1428,7 @@ async function runForWallet(wallet, provider) {
           // Only log once per hour to avoid spam
           const shouldLog = nowMinutes === 0 || (nowMinutes % 15 === 0); // Log every 15 minutes
           if (shouldLog) {
-            logInfo(wallet.address, '💤', `DEEP SLEEP: All trading strategies disabled. Enable LATE_STRATEGY_ENABLED or MOONSHOT_ENABLED to start trading.`);
+            logInfo(wallet.address, '💤', `DEEP SLEEP: All trading strategies disabled. Enable LATE_STRATEGY_ENABLED, MOONSHOT_ENABLED, QUICK_SCALP_ENABLED, or CONTRARIAN_ENABLED to start trading.`);
           }
         }
         return;
@@ -1412,6 +1442,8 @@ async function runForWallet(wallet, provider) {
       const activeStrategies = [];
       if (LATE_STRATEGY_ENABLED) activeStrategies.push('Late');
       if (MOONSHOT_ENABLED) activeStrategies.push('Moonshot');
+      if (QUICK_SCALP_ENABLED) activeStrategies.push('QuickScalp');
+      if (CONTRARIAN_ENABLED) activeStrategies.push('Contrarian');
 
       logInfo(wallet.address, '💤', `Sleep mode (minute ${nowMinutes}, ${holdings.length} positions, strategies: ${activeStrategies.join('+')}) - Wake in ${nextWakeMinutes}m ${nextWakeSeconds}s`);
 
