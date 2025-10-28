@@ -77,8 +77,8 @@ const NO_BUY_FINAL_MINUTES = parseInt(process.env.NO_BUY_FINAL_MINUTES || '2', 1
 const STOP_LOSS_MINUTES = parseInt(process.env.STOP_LOSS_MINUTES || '2', 10); // Stop loss active in last N minutes
 const STOP_LOSS_ENABLED = (process.env.STOP_LOSS_ENABLED || 'false').toLowerCase() === 'true'; // Enable stop loss
 const STOP_LOSS_PNL_PCT = parseInt(process.env.STOP_LOSS_PNL_PCT || '-50', 10); // Sell if PnL drops below N%
-const MIN_ODDS = parseInt(process.env.MIN_ODDS || '75', 10); // Minimum odds to buy
-const MAX_ODDS = parseInt(process.env.MAX_ODDS || '95', 10); // Maximum odds to buy
+const MIN_ODDS = parseFloat(process.env.MIN_ODDS || '75'); // Minimum odds to buy
+const MAX_ODDS = parseFloat(process.env.MAX_ODDS || '95'); // Maximum odds to buy
 const MIN_MARKET_AGE_MINUTES = parseInt(process.env.MIN_MARKET_AGE_MINUTES || '10', 10); // Don't buy markets younger than N minutes
 
 // ========= Time-Based Odds Windows Config =========
@@ -86,13 +86,13 @@ const TIME_BASED_ODDS_ENABLED = (process.env.TIME_BASED_ODDS_ENABLED || 'false')
 // Window 1: Earlier late window
 const LATE_WINDOW_1_START = parseInt(process.env.LATE_WINDOW_1_START || '40', 10);
 const LATE_WINDOW_1_END = parseInt(process.env.LATE_WINDOW_1_END || '50', 10);
-const LATE_WINDOW_1_MIN_ODDS = parseInt(process.env.LATE_WINDOW_1_MIN_ODDS || '70', 10);
-const LATE_WINDOW_1_MAX_ODDS = parseInt(process.env.LATE_WINDOW_1_MAX_ODDS || '95', 10);
+const LATE_WINDOW_1_MIN_ODDS = parseFloat(process.env.LATE_WINDOW_1_MIN_ODDS || '70');
+const LATE_WINDOW_1_MAX_ODDS = parseFloat(process.env.LATE_WINDOW_1_MAX_ODDS || '95');
 // Window 2: Final late window
 const LATE_WINDOW_2_START = parseInt(process.env.LATE_WINDOW_2_START || '50', 10);
 const LATE_WINDOW_2_END = parseInt(process.env.LATE_WINDOW_2_END || '59', 10);
-const LATE_WINDOW_2_MIN_ODDS = parseInt(process.env.LATE_WINDOW_2_MIN_ODDS || '75', 10);
-const LATE_WINDOW_2_MAX_ODDS = parseInt(process.env.LATE_WINDOW_2_MAX_ODDS || '90', 10);
+const LATE_WINDOW_2_MIN_ODDS = parseFloat(process.env.LATE_WINDOW_2_MIN_ODDS || '75');
+const LATE_WINDOW_2_MAX_ODDS = parseFloat(process.env.LATE_WINDOW_2_MAX_ODDS || '90');
 
 // ========= Scale-In Config (Late Strategy) =========
 const SCALE_IN_ENABLED = (process.env.SCALE_IN_ENABLED || 'false').toLowerCase() === 'true'; // Enable scale-in for late strategy
@@ -102,17 +102,18 @@ const SCALE_IN_DROP_PCT = parseInt(process.env.SCALE_IN_DROP_PCT || '10', 10); /
 // ========= Quick Scalp Strategy Config (Early Market Arbitrage) =========
 const QUICK_SCALP_ENABLED = (process.env.QUICK_SCALP_ENABLED || 'false').toLowerCase() === 'true';
 const QUICK_SCALP_WINDOW_MINUTES = parseInt(process.env.QUICK_SCALP_WINDOW_MINUTES || '40', 10); // Active in first N minutes of market
-const QUICK_SCALP_MIN_ENTRY_ODDS = parseInt(process.env.QUICK_SCALP_MIN_ENTRY_ODDS || '5', 10); // Min odds to enter
-const QUICK_SCALP_MAX_ENTRY_ODDS = parseInt(process.env.QUICK_SCALP_MAX_ENTRY_ODDS || '30', 10); // Max odds to enter
+const QUICK_SCALP_MIN_ENTRY_ODDS = parseFloat(process.env.QUICK_SCALP_MIN_ENTRY_ODDS || '5'); // Min odds to enter
+const QUICK_SCALP_MAX_ENTRY_ODDS = parseFloat(process.env.QUICK_SCALP_MAX_ENTRY_ODDS || '30'); // Max odds to enter
 const QUICK_SCALP_PROFIT_MULTIPLIER = parseFloat(process.env.QUICK_SCALP_PROFIT_MULTIPLIER || '2'); // Sell when odds reach Nx entry
 const QUICK_SCALP_AMOUNT_USDC = parseFloat(process.env.QUICK_SCALP_AMOUNT_USDC || '10');
 
 // ========= Moonshot Strategy Config =========
 const MOONSHOT_ENABLED = (process.env.MOONSHOT_ENABLED || 'true').toLowerCase() === 'true'; // Enable moonshot strategy
+const MOONSHOT_INDEPENDENT = (process.env.MOONSHOT_INDEPENDENT || 'false').toLowerCase() === 'true'; // Run moonshot independently (no late position required)
 const MOONSHOT_WINDOW_MINUTES = parseInt(process.env.MOONSHOT_WINDOW_MINUTES || '2', 10); // Moonshot triggers in last N minutes
-const MOONSHOT_MAX_ODDS = parseInt(process.env.MOONSHOT_MAX_ODDS || '10', 10); // Only buy if opposite side <= N%
-const MOONSHOT_MIN_LATE_ODDS = parseInt(process.env.MOONSHOT_MIN_LATE_ODDS || '70', 10); // Require late position >= N% to trigger moonshot
-const MOONSHOT_MAX_LATE_ODDS = parseInt(process.env.MOONSHOT_MAX_LATE_ODDS || '95', 10); // Require late position <= N% to trigger moonshot
+const MOONSHOT_MAX_ODDS = parseFloat(process.env.MOONSHOT_MAX_ODDS || '10'); // Only buy if opposite side <= N%
+const MOONSHOT_MIN_LATE_ODDS = parseFloat(process.env.MOONSHOT_MIN_LATE_ODDS || '70'); // Require late position >= N% to trigger moonshot
+const MOONSHOT_MAX_LATE_ODDS = parseFloat(process.env.MOONSHOT_MAX_LATE_ODDS || '95'); // Require late position <= N% to trigger moonshot
 const MOONSHOT_AMOUNT_USDC = parseFloat(process.env.MOONSHOT_AMOUNT_USDC || '1'); // Amount to invest in moonshot
 const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_PCT || '100', 10); // Sell at N% profit
 const MOONSHOT_FINAL_SECONDS_BUFFER = parseInt(process.env.MOONSHOT_FINAL_SECONDS_BUFFER || '15', 10); // Don't buy in final N seconds
@@ -124,8 +125,8 @@ const CONTRARIAN_BUY_WINDOW_RANGE = (process.env.CONTRARIAN_BUY_WINDOW_START_END
 const CONTRARIAN_BUY_WINDOW_START = CONTRARIAN_BUY_WINDOW_RANGE[0] || 10;
 const CONTRARIAN_BUY_WINDOW_END = CONTRARIAN_BUY_WINDOW_RANGE[1] || 30;
 const CONTRARIAN_SELL_WINDOW_END = parseInt(process.env.CONTRARIAN_SELL_WINDOW_END || '45', 10); // Stop selling at minute N
-// Parse odds range (e.g., "85-98")
-const CONTRARIAN_ODDS_RANGE = (process.env.CONTRARIAN_MIN_ODDS_MAX_ODDS || '85-98').split('-').map(s => parseInt(s.trim(), 10));
+// Parse odds range (e.g., "85-98" or "85.5-98.5")
+const CONTRARIAN_ODDS_RANGE = (process.env.CONTRARIAN_MIN_ODDS_MAX_ODDS || '85-98').split('-').map(s => parseFloat(s.trim()));
 const CONTRARIAN_MIN_ODDS = CONTRARIAN_ODDS_RANGE[0] || 85; // Minimum odds on strong side to trigger (buy opposite)
 const CONTRARIAN_MAX_ODDS = CONTRARIAN_ODDS_RANGE[1] || 98; // Maximum odds on strong side
 const CONTRARIAN_AMOUNT_USDC = parseFloat(process.env.CONTRARIAN_AMOUNT_USDC || '10'); // Amount to invest
@@ -2952,39 +2953,60 @@ async function runForWallet(wallet, provider) {
           return;
         }
 
-        // REQUIREMENT: Moonshot ONLY buys when there's an existing late window position
-        // It always buys the OPPOSITE side as a hedge/contrarian bet
+        // Moonshot can run in two modes:
+        // 1. Hedge mode (default): Requires late position, buys opposite side
+        // 2. Independent mode: Buys lowest odds side without requiring late position
         const lateHolding = getHolding(wallet.address, marketAddress, 'default');
 
-        if (!lateHolding) {
-          // No late window position - skip moonshot
-          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] No late window position found - moonshot requires existing position to hedge against`);
-          return;
+        let targetSide;
+        let targetOdds;
+        let latePositionOdds;
+
+        if (MOONSHOT_INDEPENDENT) {
+          // Independent mode: Buy the lowest odds side (underdog)
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] INDEPENDENT MODE: Looking for underdog side`);
+
+          if (prices[0] < prices[1]) {
+            targetSide = 0;
+            targetOdds = prices[0];
+          } else {
+            targetSide = 1;
+            targetOdds = prices[1];
+          }
+
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Found underdog: outcome ${targetSide} @ ${targetOdds}%`);
+        } else {
+          // Hedge mode: Requires late position
+          if (!lateHolding) {
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] No late window position found - moonshot requires existing position to hedge against (or enable MOONSHOT_INDEPENDENT=true)`);
+            return;
+          }
+
+          // We have a late window position - buy the opposite side if it qualifies
+          targetSide = lateHolding.outcomeIndex === 0 ? 1 : 0;
+          targetOdds = prices[targetSide];
+          latePositionOdds = prices[lateHolding.outcomeIndex];
+
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ FOUND LATE POSITION: outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}%`);
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Checking opposite side ${targetSide} @ ${targetOdds}%`);
         }
 
-        // We have a late window position - buy the opposite side if it qualifies
-        const targetSide = lateHolding.outcomeIndex === 0 ? 1 : 0;
-        const targetOdds = prices[targetSide];
-        const latePositionOdds = prices[lateHolding.outcomeIndex];
-        const moonshotReason = `opposite of late position (outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}%)`;
+        // In hedge mode, check if late position odds are in acceptable range
+        if (!MOONSHOT_INDEPENDENT) {
+          if (latePositionOdds < MOONSHOT_MIN_LATE_ODDS) {
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ❌ SKIP: Late position too weak: ${latePositionOdds}% < ${MOONSHOT_MIN_LATE_ODDS}% minimum`);
+            return;
+          }
+          if (latePositionOdds > MOONSHOT_MAX_LATE_ODDS) {
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ❌ SKIP: Late position too strong: ${latePositionOdds}% > ${MOONSHOT_MAX_LATE_ODDS}% maximum (too extreme)`);
+            return;
+          }
 
-        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ FOUND LATE POSITION: outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}%`);
-        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Checking opposite side ${targetSide} @ ${targetOdds}%`);
-
-        // First check if late position odds are in acceptable range
-        if (latePositionOdds < MOONSHOT_MIN_LATE_ODDS) {
-          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ❌ SKIP: Late position too weak: ${latePositionOdds}% < ${MOONSHOT_MIN_LATE_ODDS}% minimum`);
-          return;
-        }
-        if (latePositionOdds > MOONSHOT_MAX_LATE_ODDS) {
-          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ❌ SKIP: Late position too strong: ${latePositionOdds}% > ${MOONSHOT_MAX_LATE_ODDS}% maximum (too extreme)`);
-          return;
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ LATE ODDS IN RANGE: ${latePositionOdds}% is within [${MOONSHOT_MIN_LATE_ODDS}-${MOONSHOT_MAX_LATE_ODDS}%]`);
         }
 
-        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ LATE ODDS IN RANGE: ${latePositionOdds}% is within [${MOONSHOT_MIN_LATE_ODDS}-${MOONSHOT_MAX_LATE_ODDS}%]`);
-
-        // Late position is in range, now check if opposite side odds qualify for moonshot
-        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Checking opposite odds: ${targetOdds}% vs ${MOONSHOT_MAX_ODDS}% max`);
+        // Check if target odds qualify for moonshot
+        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Checking target odds: ${targetOdds}% vs ${MOONSHOT_MAX_ODDS}% max`);
 
         // CHECK FOR CONTRARIAN POSITION CONFLICT
         // If we have a losing contrarian position on the same side as moonshot target, don't buy
