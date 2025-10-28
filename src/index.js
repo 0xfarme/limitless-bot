@@ -117,6 +117,7 @@ const MOONSHOT_MAX_LATE_ODDS = parseFloat(process.env.MOONSHOT_MAX_LATE_ODDS || 
 const MOONSHOT_AMOUNT_USDC = parseFloat(process.env.MOONSHOT_AMOUNT_USDC || '1'); // Amount to invest in moonshot
 const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_PCT || '100', 10); // Sell at N% profit
 const MOONSHOT_FINAL_SECONDS_BUFFER = parseInt(process.env.MOONSHOT_FINAL_SECONDS_BUFFER || '15', 10); // Don't buy in final N seconds
+const MOONSHOT_MAX_TRADES_PER_MARKET = parseInt(process.env.MOONSHOT_MAX_TRADES_PER_MARKET || '3', 10); // Max number of moonshot trades per market
 
 // ========= Contrarian Strategy Config =========
 const CONTRARIAN_ENABLED = (process.env.CONTRARIAN_ENABLED || 'false').toLowerCase() === 'true'; // Enable contrarian strategy
@@ -509,6 +510,10 @@ function getHoldingsForMarket(addr, marketAddress) {
 function getAllHoldings(addr) {
   const st = userState.get(addr);
   return st && st.holdings ? st.holdings : [];
+}
+function countMoonshotPositions(addr, marketAddress) {
+  const holdings = getHoldingsForMarket(addr, marketAddress);
+  return holdings.filter(h => h.strategy === 'moonshot').length;
 }
 
 // ========= Position Summary Report =========
@@ -2861,10 +2866,10 @@ async function runForWallet(wallet, provider) {
           // Moonshot is always the opposite side of what we just bought
           const moonshotOutcome = outcomeToBuy === 0 ? 1 : 0;
 
-          // Check if we already have a moonshot position
-          const moonshotHolding = getHolding(wallet.address, marketAddress, 'moonshot');
-          if (moonshotHolding) {
-            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping late window moonshot - already have moonshot position`);
+          // Check how many moonshot positions we have for this market
+          const moonshotCount = countMoonshotPositions(wallet.address, marketAddress);
+          if (moonshotCount >= MOONSHOT_MAX_TRADES_PER_MARKET) {
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping late window moonshot - already have ${moonshotCount}/${MOONSHOT_MAX_TRADES_PER_MARKET} moonshot positions`);
           } else {
             // Check late position odds and opposite side odds
             const moonshotOdds = prices[moonshotOutcome];
@@ -2910,16 +2915,19 @@ async function runForWallet(wallet, provider) {
               if (!skipMoonshot) {
                 // All conditions met - place moonshot bet
                 const moonshotStrategy = 'moonshot';
-                const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
+                // Split investment across max trades
+                const splitAmount = MOONSHOT_AMOUNT_USDC / MOONSHOT_MAX_TRADES_PER_MARKET;
+                const moonshotInvestment = ethers.parseUnits(splitAmount.toString(), decimals);
+                const tradeNumber = moonshotCount + 1;
 
-                logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot hedge! Late position: outcome ${outcomeToBuy} @ ${lateOdds}% → Buying opposite outcome ${moonshotOutcome} @ ${moonshotOdds}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
+                logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot hedge (${tradeNumber}/${MOONSHOT_MAX_TRADES_PER_MARKET})! Late position: outcome ${outcomeToBuy} @ ${lateOdds}% → Buying opposite outcome ${moonshotOutcome} @ ${moonshotOdds}% with $${splitAmount.toFixed(2)} USDC`);
 
                 // Check USDC balance for moonshot
                 const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
                 if (usdcBalAfter >= moonshotInvestment) {
                   await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy);
                 } else {
-                  logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need ${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
+                  logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need ${splitAmount.toFixed(2)}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
                 }
               }
             }
@@ -2967,10 +2975,10 @@ async function runForWallet(wallet, provider) {
           }
         }
 
-        // Check if we already have a moonshot position
-        const moonshotHolding = getHolding(wallet.address, marketAddress, 'moonshot');
-        if (moonshotHolding) {
-          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Already have moonshot position - skipping`);
+        // Check how many moonshot positions we have for this market
+        const moonshotCount = countMoonshotPositions(wallet.address, marketAddress);
+        if (moonshotCount >= MOONSHOT_MAX_TRADES_PER_MARKET) {
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Already have ${moonshotCount}/${MOONSHOT_MAX_TRADES_PER_MARKET} moonshot positions - skipping`);
           return;
         }
 
@@ -3067,10 +3075,17 @@ async function runForWallet(wallet, provider) {
         if (targetOdds <= MOONSHOT_MAX_ODDS) {
           logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ OPPOSITE ODDS QUALIFY: ${targetOdds}% <= ${MOONSHOT_MAX_ODDS}%`);
           const moonshotStrategy = 'moonshot';
-          const investmentHuman = getBuyAmountForStrategy(moonshotStrategy);
-          const moonshotInvestment = ethers.parseUnits(investmentHuman.toString(), decimals);
+          // Split investment across max trades
+          const splitAmount = MOONSHOT_AMOUNT_USDC / MOONSHOT_MAX_TRADES_PER_MARKET;
+          const moonshotInvestment = ethers.parseUnits(splitAmount.toString(), decimals);
+          const tradeNumber = moonshotCount + 1;
 
-          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot hedge! Late position: outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}% → Buying opposite outcome ${targetSide} @ ${targetOdds}% with $${investmentHuman} USDC`);
+          // Log appropriate message based on mode
+          if (MOONSHOT_INDEPENDENT) {
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot independent (${tradeNumber}/${MOONSHOT_MAX_TRADES_PER_MARKET})! Buying underdog outcome ${targetSide} @ ${targetOdds}% with $${splitAmount.toFixed(2)} USDC`);
+          } else {
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot hedge (${tradeNumber}/${MOONSHOT_MAX_TRADES_PER_MARKET})! Late position: outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}% → Buying opposite outcome ${targetSide} @ ${targetOdds}% with $${splitAmount.toFixed(2)} USDC`);
+          }
 
           // Check USDC balance for moonshot
           const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
@@ -3078,7 +3093,7 @@ async function runForWallet(wallet, provider) {
             await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, targetSide, decimals, pid0, pid1, erc1155, moonshotStrategy);
             return;
           } else {
-            logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need ${investmentHuman}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
+            logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need ${splitAmount.toFixed(2)}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
             return;
           }
         } else {

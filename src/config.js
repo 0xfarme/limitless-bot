@@ -77,6 +77,7 @@ export const MOONSHOT_WINDOW_MINUTES = parseInt(process.env.MOONSHOT_WINDOW_MINU
 export const MOONSHOT_MAX_ODDS = parseInt(process.env.MOONSHOT_MAX_ODDS || '10', 10);
 export const MOONSHOT_AMOUNT_USDC = parseFloat(process.env.MOONSHOT_AMOUNT_USDC || '1');
 export const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_PCT || '100', 10);
+export const MOONSHOT_MAX_TRADES_PER_MARKET = parseInt(process.env.MOONSHOT_MAX_TRADES_PER_MARKET || '3', 10);
 
 // ========= Redemption Settings =========
 export const AUTO_REDEEM_ENABLED = (process.env.AUTO_REDEEM_ENABLED || 'true').toLowerCase() === 'true';
