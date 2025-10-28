@@ -1256,7 +1256,7 @@ async function runForWallet(wallet, provider) {
   let cachedContracts = new Map(); // marketAddress -> { market, usdc, erc1155, decimals }
   let inactiveMarketsThisHour = new Set(); // Track inactive markets this hour to avoid re-checking
   let currentHourForInactive = -1; // Track which hour for inactive markets
-  let buyingInProgress = new Set(); // Track markets currently being bought in this tick to prevent duplicates
+  let buyingInProgress = new Map(); // Track markets currently being bought with timestamp to prevent duplicates
   let approvedMarkets = new Set(); // Track markets we've already approved USDC for
 
   // Pre-approve USDC for active markets (once per market)
@@ -1455,8 +1455,14 @@ async function runForWallet(wallet, provider) {
       return;
     }
 
-    // Clear buyingInProgress at start of each tick - it's just for preventing concurrent buys within same tick
-    buyingInProgress.clear();
+    // Clean up old locks (older than 60 seconds) - prevents stuck locks while preserving active operations
+    const now = Date.now();
+    for (const [marketKey, timestamp] of buyingInProgress.entries()) {
+      if (now - timestamp > 60000) { // 60 seconds timeout
+        logWarn(wallet.address, '🔓', `Removing stale lock for market ${marketKey.substring(0, 8)}... (locked for ${Math.floor((now - timestamp) / 1000)}s)`);
+        buyingInProgress.delete(marketKey);
+      }
+    }
 
     // Clear inactive markets set every hour and show position summary
     const nowHour = new Date().getHours();
@@ -1798,6 +1804,14 @@ async function runForWallet(wallet, provider) {
 
   // Helper function to execute buy transaction
   async function executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, strategy = 'default') {
+    // CRITICAL SAFETY CHECK: Verify we don't already have a position for this strategy
+    // This prevents race conditions where multiple ticks try to buy the same market
+    const existingHolding = getHolding(wallet.address, marketAddress, strategy);
+    if (existingHolding) {
+      logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] DUPLICATE BUY PREVENTED: Already have ${strategy} position on outcome ${existingHolding.outcomeIndex}. This should not happen!`);
+      return;
+    }
+
     // First, check if we already have a position in this market via API
     try {
       const portfolioData = await fetchPortfolioData(wallet.address);
@@ -2572,12 +2586,13 @@ async function runForWallet(wallet, provider) {
       // Prevent duplicate buys - check if buy is in progress for this market
       const marketKey = marketAddress.toLowerCase();
       if (buyingInProgress.has(marketKey)) {
-        logInfo(wallet.address, '🔒', `[${marketAddress.substring(0, 8)}...] Buy already in progress for this market; skipping.`);
+        const lockedSince = Date.now() - buyingInProgress.get(marketKey);
+        logInfo(wallet.address, '🔒', `[${marketAddress.substring(0, 8)}...] Buy already in progress for this market (${Math.floor(lockedSince / 1000)}s); skipping.`);
         return;
       }
 
       // Mark as buying NOW to prevent race conditions
-      buyingInProgress.add(marketKey);
+      buyingInProgress.set(marketKey, Date.now());
 
       // Use try/finally to ensure buyingInProgress is always cleared
       try {
