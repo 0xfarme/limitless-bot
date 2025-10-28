@@ -1809,8 +1809,14 @@ async function runForWallet(wallet, provider) {
         );
 
         if (existingPosition) {
-          logInfo(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Already have position (${existingPosition.outcomeTokenAmount} tokens, outcome ${existingPosition.outcomeIndex}) - skipping buy to prevent double position`);
-          return;
+          // Check if we're trying to buy the SAME side we already have
+          if (existingPosition.outcomeIndex === outcomeToBuy) {
+            logInfo(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Already have position on outcome ${existingPosition.outcomeIndex} (${existingPosition.outcomeTokenAmount} tokens) - skipping buy to prevent double position on same side`);
+            return;
+          } else {
+            // Buying opposite side is OK (e.g., moonshot hedging)
+            logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Have position on outcome ${existingPosition.outcomeIndex}, buying opposite outcome ${outcomeToBuy} (${strategy} strategy)`);
+          }
         }
       }
     } catch (error) {
@@ -2993,11 +2999,16 @@ async function runForWallet(wallet, provider) {
 
         // In hedge mode, check if late position odds are in acceptable range
         if (!MOONSHOT_INDEPENDENT) {
-          if (latePositionOdds < MOONSHOT_MIN_LATE_ODDS) {
+          // Add small epsilon (0.01) for floating point comparison tolerance
+          const epsilon = 0.01;
+
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Late position odds check: ${latePositionOdds}% vs range [${MOONSHOT_MIN_LATE_ODDS}-${MOONSHOT_MAX_LATE_ODDS}%]`);
+
+          if (latePositionOdds < MOONSHOT_MIN_LATE_ODDS - epsilon) {
             logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ❌ SKIP: Late position too weak: ${latePositionOdds}% < ${MOONSHOT_MIN_LATE_ODDS}% minimum`);
             return;
           }
-          if (latePositionOdds > MOONSHOT_MAX_LATE_ODDS) {
+          if (latePositionOdds > MOONSHOT_MAX_LATE_ODDS + epsilon) {
             logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ❌ SKIP: Late position too strong: ${latePositionOdds}% > ${MOONSHOT_MAX_LATE_ODDS}% maximum (too extreme)`);
             return;
           }
