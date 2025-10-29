@@ -3028,10 +3028,15 @@ async function runForWallet(wallet, provider) {
           return;
         }
 
-        // Moonshot can run in two modes:
-        // 1. Hedge mode (default): Requires late position, buys opposite side
-        // 2. Independent mode: Buys lowest odds side without requiring late position
+        // Moonshot can run in three modes:
+        // 1. Hedge mode with late position: Requires late position, buys opposite side
+        // 2. Hedge mode with quick_scalp hold: Uses early position, buys opposite side
+        // 3. Independent mode: Buys lowest odds side without requiring any position
         const lateHolding = getHolding(wallet.address, marketAddress, 'default');
+        const quickScalpHolding = QUICK_SCALP_HOLD_MODE ? getHolding(wallet.address, marketAddress, 'quick_scalp') : null;
+
+        // Use either late or quick_scalp holding as the position to hedge
+        const existingPosition = lateHolding || quickScalpHolding;
 
         let targetSide;
         let targetOdds;
@@ -3051,18 +3056,22 @@ async function runForWallet(wallet, provider) {
 
           logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Found underdog: outcome ${targetSide} @ ${targetOdds}%`);
         } else {
-          // Hedge mode: Requires late position
-          if (!lateHolding) {
-            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] No late window position found - moonshot requires existing position to hedge against (or enable MOONSHOT_INDEPENDENT=true)`);
+          // Hedge mode: Requires either late or quick_scalp position
+          if (!existingPosition) {
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] No position found (late or quick_scalp) - moonshot requires existing position to hedge against (or enable MOONSHOT_INDEPENDENT=true)`);
             return;
           }
 
-          // We have a late window position - buy the opposite side if it qualifies
-          targetSide = lateHolding.outcomeIndex === 0 ? 1 : 0;
-          targetOdds = prices[targetSide];
-          latePositionOdds = prices[lateHolding.outcomeIndex];
+          // Log which position we're hedging
+          const positionType = lateHolding ? 'late' : 'quick_scalp';
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Found ${positionType} position to hedge: outcome ${existingPosition.outcomeIndex}`);
 
-          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ FOUND LATE POSITION: outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}%`);
+          // We have an existing position - buy the opposite side if it qualifies
+          targetSide = existingPosition.outcomeIndex === 0 ? 1 : 0;
+          targetOdds = prices[targetSide];
+          latePositionOdds = prices[existingPosition.outcomeIndex];
+
+          logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ FOUND POSITION: outcome ${existingPosition.outcomeIndex} @ ${latePositionOdds}%`);
           logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Checking opposite side ${targetSide} @ ${targetOdds}%`);
         }
 
@@ -3130,7 +3139,8 @@ async function runForWallet(wallet, provider) {
           if (MOONSHOT_INDEPENDENT) {
             logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot independent (${tradeNumber}/${MOONSHOT_MAX_TRADES_PER_MARKET})! Buying underdog outcome ${targetSide} @ ${targetOdds}% with $${splitAmount.toFixed(2)} USDC`);
           } else {
-            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot hedge (${tradeNumber}/${MOONSHOT_MAX_TRADES_PER_MARKET})! Late position: outcome ${lateHolding.outcomeIndex} @ ${latePositionOdds}% → Buying opposite outcome ${targetSide} @ ${targetOdds}% with $${splitAmount.toFixed(2)} USDC`);
+            const positionType = lateHolding ? 'late' : 'quick_scalp';
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot hedge (${tradeNumber}/${MOONSHOT_MAX_TRADES_PER_MARKET})! ${positionType} position: outcome ${existingPosition.outcomeIndex} @ ${latePositionOdds}% → Buying opposite outcome ${targetSide} @ ${targetOdds}% with $${splitAmount.toFixed(2)} USDC`);
           }
 
           // Check USDC balance for moonshot
