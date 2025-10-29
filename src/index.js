@@ -2638,23 +2638,27 @@ async function runForWallet(wallet, provider) {
             let targetSide = null;
             let targetOdds = null;
 
-            // HOLD MODE: Buy strong side (for late window hold)
+            // HOLD MODE: Buy weak side (opposite of trending side in 55-85% range)
             // NORMAL MODE: Buy weak side (for quick flip)
             if (QUICK_SCALP_HOLD_MODE) {
-              // Hold mode: buy the stronger side (higher odds)
+              // Hold mode: Find strong side (in range), then buy the OPPOSITE (weak) side
+              let strongSide = null;
+
+              // Check if side 0 is the strong side (in range 55-85%)
               if (side0Odds >= QUICK_SCALP_MIN_ENTRY_ODDS && side0Odds <= QUICK_SCALP_MAX_ENTRY_ODDS) {
-                // If side 0 is in range and is the stronger side
-                if (side0Odds > side1Odds) {
-                  targetSide = 0;
-                  targetOdds = side0Odds;
-                }
+                strongSide = 0;
               }
-              if (side1Odds >= QUICK_SCALP_MIN_ENTRY_ODDS && side1Odds <= QUICK_SCALP_MAX_ENTRY_ODDS) {
-                // If side 1 is in range and is the stronger side (or only side in range)
-                if (side1Odds > side0Odds || targetSide === null) {
-                  targetSide = 1;
-                  targetOdds = side1Odds;
-                }
+              // Check if side 1 is the strong side (in range 55-85%)
+              else if (side1Odds >= QUICK_SCALP_MIN_ENTRY_ODDS && side1Odds <= QUICK_SCALP_MAX_ENTRY_ODDS) {
+                strongSide = 1;
+              }
+
+              // If we found a strong side, buy the opposite (weak) side
+              if (strongSide !== null) {
+                targetSide = strongSide === 0 ? 1 : 0;  // Buy opposite side
+                targetOdds = prices[targetSide];
+                const strongOdds = prices[strongSide];
+                logInfo(wallet.address, '⚡', `[${marketAddress.substring(0, 8)}...] HOLD MODE: Detected strong side ${strongSide} @ ${strongOdds}%, buying weak side ${targetSide} @ ${targetOdds}%`);
               }
             } else {
               // Normal mode: buy either side in entry range (underdog betting)
