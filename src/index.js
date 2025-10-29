@@ -2757,36 +2757,67 @@ async function runForWallet(wallet, provider) {
           return;
         }
 
-        // Check if late strategy already has a position
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== LATE STRATEGY CHECK ======`);
+
+        // FIRST: Determine what side late strategy WOULD buy (based on odds)
+        // Determine odds range based on time-based windows or default MIN/MAX_ODDS
+        let minOddsForCheck = MIN_ODDS;
+        let maxOddsForCheck = MAX_ODDS;
+
+        if (TIME_BASED_ODDS_ENABLED) {
+          const currentMinute = new Date().getMinutes();
+          if (currentMinute >= LATE_WINDOW_1_START && currentMinute <= LATE_WINDOW_1_END) {
+            minOddsForCheck = LATE_WINDOW_1_MIN_ODDS;
+            maxOddsForCheck = LATE_WINDOW_1_MAX_ODDS;
+          } else if (currentMinute >= LATE_WINDOW_2_START && currentMinute <= LATE_WINDOW_2_END) {
+            minOddsForCheck = LATE_WINDOW_2_MIN_ODDS;
+            maxOddsForCheck = LATE_WINDOW_2_MAX_ODDS;
+          }
+        }
+
+        // Check if any side is in range to determine target
+        const maxPrice = Math.max(...prices);
+        let targetOutcomeForLate = null;
+
+        if (maxPrice >= minOddsForCheck && maxPrice <= maxOddsForCheck) {
+          // Determine which side is in odds range
+          targetOutcomeForLate = prices[0] >= minOddsForCheck && prices[0] <= maxOddsForCheck ? 0 : 1;
+          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Late strategy would buy outcome ${targetOutcomeForLate} @ ${prices[targetOutcomeForLate]}%`);
+        }
+
+        // SECOND: Check if we already have a position on THAT specific side
         const lateStrategy = 'default';
         const lateHolding = getHolding(wallet.address, marketAddress, lateStrategy);
-
-        // Check if quick scalp (in hold mode) already has a position
         const quickScalpHolding = QUICK_SCALP_HOLD_MODE ? getHolding(wallet.address, marketAddress, 'quick_scalp') : null;
 
-        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== LATE STRATEGY CHECK ======`);
-        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] lateHolding exists: ${!!lateHolding}, quickScalpHolding (hold mode): ${!!quickScalpHolding}`);
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] lateHolding: ${lateHolding ? `outcome ${lateHolding.outcomeIndex}` : 'none'}, quickScalpHolding: ${quickScalpHolding ? `outcome ${quickScalpHolding.outcomeIndex}` : 'none'}`);
 
-        if (lateHolding) {
-          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Found late position: outcome=${lateHolding.outcomeIndex}, strategy=${lateHolding.strategy}`);
-          if (MOONSHOT_ENABLED && inMoonshotWindow) {
-            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] ✅ Late window strategy already has a position - WILL skip late buy and check moonshot below`);
-            // Skip to end of late strategy block to check moonshot
+        // Check if we have a position on the same side late strategy would buy
+        let hasPositionOnTargetSide = false;
+        let existingPositionForMoonshot = null;
+
+        if (targetOutcomeForLate !== null) {
+          if (lateHolding && lateHolding.outcomeIndex === targetOutcomeForLate) {
+            hasPositionOnTargetSide = true;
+            existingPositionForMoonshot = lateHolding;
+            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Late position already exists on target side ${targetOutcomeForLate} - skipping late buy`);
+          } else if (quickScalpHolding && quickScalpHolding.outcomeIndex === targetOutcomeForLate) {
+            hasPositionOnTargetSide = true;
+            existingPositionForMoonshot = quickScalpHolding;
+            logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Quick scalp position exists on target side ${targetOutcomeForLate} - skipping late buy`);
           } else {
-            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Late window strategy already has a position - skipping buy (no moonshot)`);
-            return; // No moonshot, so exit
+            logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] No position on target side ${targetOutcomeForLate} - late strategy can proceed`);
           }
-        } else if (quickScalpHolding) {
-          // Quick scalp (hold mode) has a position - treat it like a late position
-          logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Quick scalp HOLD position exists: outcome=${quickScalpHolding.outcomeIndex}`);
+        }
+
+        // If we have a position on the target side, skip to moonshot check
+        if (hasPositionOnTargetSide) {
           if (MOONSHOT_ENABLED && inMoonshotWindow) {
-            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] ✅ Quick scalp hold position exists - WILL skip late buy and check moonshot below`);
-            // Skip to end of late strategy block to check moonshot
-            // Set a reference so moonshot logic can use it
-            const lateHolding = quickScalpHolding; // Treat quick scalp as late position for moonshot
+            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] ✅ Position exists on target side - WILL skip late buy and check moonshot below`);
+            // Continue to moonshot section below
           } else {
-            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Quick scalp hold position exists - skipping late buy (no moonshot)`);
-            return; // No moonshot, so exit
+            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Position exists on target side - skipping (no moonshot window)`);
+            return;
           }
         } else {
         // Only execute late buy logic if we don't have a position yet
@@ -2987,9 +3018,10 @@ async function runForWallet(wallet, provider) {
         } // End else block - only execute late buy if no existing position
 
         // Decision point: should we continue to moonshot or return?
-        const shouldCheckMoonshot = MOONSHOT_ENABLED && inMoonshotWindow && lateHolding;
+        // Check for either late or quick scalp holdings since moonshot can hedge both
+        const shouldCheckMoonshot = MOONSHOT_ENABLED && inMoonshotWindow && (lateHolding || quickScalpHolding);
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== LATE STRATEGY BLOCK END ======`);
-        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Decision: MOONSHOT_ENABLED=${MOONSHOT_ENABLED}, inMoonshotWindow=${inMoonshotWindow}, lateHolding=${!!lateHolding}`);
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Decision: MOONSHOT_ENABLED=${MOONSHOT_ENABLED}, inMoonshotWindow=${inMoonshotWindow}, lateHolding=${!!lateHolding}, quickScalpHolding=${!!quickScalpHolding}`);
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] shouldCheckMoonshot=${!!shouldCheckMoonshot}`);
 
         if (!shouldCheckMoonshot) {
