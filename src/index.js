@@ -247,6 +247,10 @@ async function txOverrides(provider, gasLimit) {
 // Updated for multi-market: holdings is now an array of positions
 const userState = new Map(); // key: wallet.address, value: { holdings: [{ marketAddress, outcomeIndex, tokenId: bigint, amount: bigint, cost: bigint }], completedMarkets: Set<string> }
 
+// Pending trades tracker: prevents race conditions where multiple ticks try to buy before transaction confirms
+// key: `${wallet.address}:${marketAddress}:${strategy}`, value: { count: number, timestamps: [] }
+const pendingTrades = new Map();
+
 // Global statistics tracking
 const botStats = {
   totalTrades: 0,
@@ -536,13 +540,50 @@ function getAllHoldings(addr) {
   const st = userState.get(addr);
   return st && st.holdings ? st.holdings : [];
 }
+// Pending trades management
+function getPendingTradeKey(addr, marketAddress, strategy) {
+  return `${addr}:${marketAddress.toLowerCase()}:${strategy}`;
+}
+
+function addPendingTrade(addr, marketAddress, strategy) {
+  const key = getPendingTradeKey(addr, marketAddress, strategy);
+  const existing = pendingTrades.get(key) || { count: 0, timestamps: [] };
+  existing.count++;
+  existing.timestamps.push(Date.now());
+  pendingTrades.set(key, existing);
+}
+
+function removePendingTrade(addr, marketAddress, strategy) {
+  const key = getPendingTradeKey(addr, marketAddress, strategy);
+  const existing = pendingTrades.get(key);
+  if (existing && existing.count > 0) {
+    existing.count--;
+    existing.timestamps.pop();
+    if (existing.count === 0) {
+      pendingTrades.delete(key);
+    } else {
+      pendingTrades.set(key, existing);
+    }
+  }
+}
+
+function getPendingTradeCount(addr, marketAddress, strategy) {
+  const key = getPendingTradeKey(addr, marketAddress, strategy);
+  const existing = pendingTrades.get(key);
+  return existing ? existing.count : 0;
+}
+
 function countMoonshotPositions(addr, marketAddress) {
   const holdings = getHoldingsForMarket(addr, marketAddress);
-  return holdings.filter(h => h.strategy === 'moonshot').length;
+  const confirmed = holdings.filter(h => h.strategy === 'moonshot').length;
+  const pending = getPendingTradeCount(addr, marketAddress, 'moonshot');
+  return confirmed + pending;
 }
 function countQuickScalpPositions(addr, marketAddress) {
   const holdings = getHoldingsForMarket(addr, marketAddress);
-  return holdings.filter(h => h.strategy === 'quick_scalp').length;
+  const confirmed = holdings.filter(h => h.strategy === 'quick_scalp').length;
+  const pending = getPendingTradeCount(addr, marketAddress, 'quick_scalp');
+  return confirmed + pending;
 }
 
 // Get current moonshot time window based on minutes remaining
@@ -1950,25 +1991,31 @@ async function runForWallet(wallet, provider) {
       logInfo(wallet.address, '✅', `Allowance already sufficient (pre-approved), proceeding to buy`);
     }
 
-    // Estimate gas then buy
-    logInfo(wallet.address, '⚡', `Estimating gas for buy transaction...`);
-    const gasEst = await estimateGasFor(market, wallet, 'buy', [investment, outcomeToBuy, minOutcomeTokensToBuy]);
-    if (!gasEst) {
-      logWarn(wallet.address, '🛑', 'Gas estimate buy failed; skipping buy this tick.');
-      return;
-    }
-    logInfo(wallet.address, '⛽', `Gas estimate buy: ${gasEst}`);
-    const padded = (gasEst * 120n) / 100n + 10000n;
-    logInfo(wallet.address, '🔧', `Gas with 20% padding: ${padded}`);
-    const buyOv = await txOverrides(wallet.provider, padded);
-    logInfo(wallet.address, '💸', `Sending buy transaction: investment=${investment}, outcome=${outcomeToBuy}, minTokens=${minOutcomeTokensToBuy}`);
-    const buyTx = await market.buy(investment, outcomeToBuy, minOutcomeTokensToBuy, buyOv);
-    logInfo(wallet.address, '🧾', `Buy tx: ${buyTx.hash}`);
-    logInfo(wallet.address, '⏳', `Waiting for ${CONFIRMATIONS} confirmation(s)...`);
-    const receipt = await buyTx.wait(CONFIRMATIONS);
-    logInfo(wallet.address, '✅', `Buy completed in block ${receipt.blockNumber}, gasUsed=${receipt.gasUsed}`);
+    // Mark trade as pending BEFORE starting transaction to prevent race conditions
+    addPendingTrade(wallet.address, marketAddress, strategy);
+    logInfo(wallet.address, '🔒', `[${marketAddress.substring(0, 8)}...] Marked ${strategy} trade as pending (prevents duplicate buys)`);
 
-    const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
+    try {
+      // Estimate gas then buy
+      logInfo(wallet.address, '⚡', `Estimating gas for buy transaction...`);
+      const gasEst = await estimateGasFor(market, wallet, 'buy', [investment, outcomeToBuy, minOutcomeTokensToBuy]);
+      if (!gasEst) {
+        logWarn(wallet.address, '🛑', 'Gas estimate buy failed; skipping buy this tick.');
+        removePendingTrade(wallet.address, marketAddress, strategy);
+        return;
+      }
+      logInfo(wallet.address, '⛽', `Gas estimate buy: ${gasEst}`);
+      const padded = (gasEst * 120n) / 100n + 10000n;
+      logInfo(wallet.address, '🔧', `Gas with 20% padding: ${padded}`);
+      const buyOv = await txOverrides(wallet.provider, padded);
+      logInfo(wallet.address, '💸', `Sending buy transaction: investment=${investment}, outcome=${outcomeToBuy}, minTokens=${minOutcomeTokensToBuy}`);
+      const buyTx = await market.buy(investment, outcomeToBuy, minOutcomeTokensToBuy, buyOv);
+      logInfo(wallet.address, '🧾', `Buy tx: ${buyTx.hash}`);
+      logInfo(wallet.address, '⏳', `Waiting for ${CONFIRMATIONS} confirmation(s)...`);
+      const receipt = await buyTx.wait(CONFIRMATIONS);
+      logInfo(wallet.address, '✅', `Buy completed in block ${receipt.blockNumber}, gasUsed=${receipt.gasUsed}`);
+
+      const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
     // After buy, record cost basis with full metadata
     logInfo(wallet.address, '💾', `[${marketAddress.substring(0, 8)}...] Recording position: outcome=${outcomeToBuy}, tokenId=${tokenId}, cost=${investment}, strategy=${strategy}`);
     addHolding(wallet.address, {
@@ -2015,24 +2062,34 @@ async function runForWallet(wallet, provider) {
       gasUsed: receipt.gasUsed.toString()
     });
 
-    // Try to confirm on-chain ERC1155 balance
-    try {
-      let balNow = 0n;
-      logInfo(wallet.address, '🔎', `Verifying position balance (tokenId=${tokenId})...`);
-      for (let i = 0; i < 3; i++) {
-        balNow = await safeBalanceOf(erc1155, wallet.address, tokenId);
-        if (balNow > 0n) {
-          logInfo(wallet.address, '🎟️', `Position balance confirmed: ${balNow} (attempt ${i + 1}/3)`);
-          break;
+      // Try to confirm on-chain ERC1155 balance
+      try {
+        let balNow = 0n;
+        logInfo(wallet.address, '🔎', `Verifying position balance (tokenId=${tokenId})...`);
+        for (let i = 0; i < 3; i++) {
+          balNow = await safeBalanceOf(erc1155, wallet.address, tokenId);
+          if (balNow > 0n) {
+            logInfo(wallet.address, '🎟️', `Position balance confirmed: ${balNow} (attempt ${i + 1}/3)`);
+            break;
+          }
+          logInfo(wallet.address, '⏳', `Position balance not yet updated, retrying in 1s (attempt ${i + 1}/3)...`);
+          await delay(1000);
         }
-        logInfo(wallet.address, '⏳', `Position balance not yet updated, retrying in 1s (attempt ${i + 1}/3)...`);
-        await delay(1000);
+        if (balNow === 0n) {
+          logWarn(wallet.address, '⚠️', `Position balance still 0 after 3 attempts (may update later)`);
+        }
+      } catch (e) {
+        logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Failed to read position balance after buy: ${(e && e.message) ? e.message : e}`);
       }
-      if (balNow === 0n) {
-        logWarn(wallet.address, '⚠️', `Position balance still 0 after 3 attempts (may update later)`);
-      }
-    } catch (e) {
-      logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Failed to read position balance after buy: ${(e && e.message) ? e.message : e}`);
+
+      // Transaction completed successfully, remove pending marker
+      removePendingTrade(wallet.address, marketAddress, strategy);
+      logInfo(wallet.address, '🔓', `[${marketAddress.substring(0, 8)}...] Removed ${strategy} trade from pending (transaction complete)`);
+    } catch (error) {
+      // Transaction failed, remove pending marker
+      removePendingTrade(wallet.address, marketAddress, strategy);
+      logWarn(wallet.address, '❌', `[${marketAddress.substring(0, 8)}...] Buy transaction failed, removed from pending: ${error?.message || error}`);
+      throw error; // Re-throw to propagate error
     }
   }
 
