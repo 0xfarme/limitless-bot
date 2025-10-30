@@ -440,13 +440,24 @@ function updateStats(pnlUSDC) {
 function addHolding(addr, holding) {
   const prev = userState.get(addr) || { holdings: [], completedMarkets: new Set() };
   const holdings = prev.holdings || [];
-  // Remove any existing holding for same market+strategy before adding new one
+  // For strategies that allow multiple positions (moonshot, quick_scalp, contrarian), don't remove existing
+  // Only remove duplicates for 'default' strategy to prevent double positions
   const strategy = holding.strategy || 'default';
-  const filtered = holdings.filter(h => {
-    const isSameMarket = h.marketAddress.toLowerCase() === holding.marketAddress.toLowerCase();
-    const isSameStrategy = (h.strategy || 'default') === strategy;
-    return !(isSameMarket && isSameStrategy);
-  });
+  const allowMultiplePositions = ['moonshot', 'quick_scalp', 'contrarian'].includes(strategy);
+
+  let filtered;
+  if (allowMultiplePositions) {
+    // Allow multiple positions for moonshot/quick_scalp/contrarian - don't remove existing
+    filtered = holdings;
+  } else {
+    // For 'default' strategy, remove any existing holding for same market+strategy
+    filtered = holdings.filter(h => {
+      const isSameMarket = h.marketAddress.toLowerCase() === holding.marketAddress.toLowerCase();
+      const isSameStrategy = (h.strategy || 'default') === strategy;
+      return !(isSameMarket && isSameStrategy);
+    });
+  }
+
   filtered.push(holding);
   userState.set(addr, { ...prev, holdings: filtered });
   scheduleSave();
