@@ -259,7 +259,8 @@ function getHourlyFolder() {
 }
 
 function getStateFile(strategy = null) {
-  return path.join(getHourlyFolder(), 'state.json');
+  // State file should persist across hours, not be hourly
+  return path.join('data', 'state.json');
 }
 function getTradesLogFile(strategy = null) {
   return path.join(getHourlyFolder(), 'trades.jsonl');
