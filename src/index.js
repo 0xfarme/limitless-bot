@@ -1964,6 +1964,18 @@ async function runForWallet(wallet, provider) {
 
   async function processMarket(wallet, provider, data) {
     try {
+      // Performance optimization: Cache balances for this tick to avoid duplicate RPC calls
+      const balanceCache = new Map();
+
+      async function getCachedBalance(erc1155, tokenId) {
+        const key = `${tokenId}`;
+        if (balanceCache.has(key)) {
+          return balanceCache.get(key);
+        }
+        const balance = await retryRpcCall(async () => await erc1155.balanceOf(wallet.address, tokenId));
+        balanceCache.set(key, balance);
+        return balance;
+      }
 
       const marketInfo = data.market;
       const marketAddress = ethers.getAddress(marketInfo.address);
@@ -2148,6 +2160,21 @@ async function runForWallet(wallet, provider) {
           addHolding(wallet.address, holding);
           logInfo(wallet.address, '💾', `[${marketAddress.substring(0, 8)}...] Initialized cost basis: ${BUY_AMOUNT_USDC} USDC`);
         }
+
+        // Performance optimization: Skip expensive PnL calculations when not in active windows
+        const currentMinute = new Date().getMinutes();
+        const needsDetailedPnL =
+          (currentMinute >= CONTRARIAN_BUY_WINDOW_START && currentMinute <= CONTRARIAN_SELL_WINDOW_END) ||
+          inLastThirteenMinutes ||
+          inMoonshotWindow;
+
+        if (!needsDetailedPnL && holding.strategy !== 'contrarian') {
+          // Outside active windows and not contrarian - skip detailed PnL, just log we're holding
+          const strategyLabel = (holding.strategy || 'default').toUpperCase();
+          logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] [${strategyLabel}] Holding position (outside active windows) - will check during active window`);
+          // Skip detailed PnL calculation below
+        } else {
+        // Inside active windows OR contrarian position - do detailed PnL calculations
 
         // Position value per provided formula:
         // tokensNeededForCost = calcSellAmount(initialInvestment, outcomeIndex)
@@ -2588,6 +2615,7 @@ async function runForWallet(wallet, provider) {
 
         // Don't return here - continue to check if other strategies can buy
         // The strategy-specific buy checks below will handle whether to buy
+        } // Close else block for detailed PnL calculations
       }
 
       // Check if we should buy with any strategy (independent of existing positions)
@@ -2899,7 +2927,7 @@ async function runForWallet(wallet, provider) {
           // Check if contrarian position is losing
           const contrarianCost = BigInt(contrarianHolding.cost || '0');
           const contrarianTokenId = contrarianHolding.tokenId;
-          const contrarianTokenBalance = await retryRpcCall(async () => await erc1155.balanceOf(wallet.address, contrarianTokenId));
+          const contrarianTokenBalance = await getCachedBalance(erc1155, contrarianTokenId);
 
           if (contrarianTokenBalance > 0n) {
             // Try to get position value
@@ -3182,7 +3210,7 @@ async function runForWallet(wallet, provider) {
           // Check if contrarian position is losing
           const contrarianCost = BigInt(contrarianHolding.cost || '0');
           const contrarianTokenId = contrarianHolding.tokenId;
-          const contrarianTokenBalance = await retryRpcCall(async () => await erc1155.balanceOf(wallet.address, contrarianTokenId));
+          const contrarianTokenBalance = await getCachedBalance(erc1155, contrarianTokenId);
 
           if (contrarianTokenBalance > 0n) {
             // Try to get position value
