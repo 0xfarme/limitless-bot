@@ -3091,6 +3091,17 @@ async function runForWallet(wallet, provider) {
           }
 
           logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Found underdog: outcome ${targetSide} @ ${targetOdds}%`);
+
+          // Check if we already have ANY position on this side
+          const holdings = getHoldingsForMarket(wallet.address, marketAddress);
+          const existingPositionOnTargetSide = holdings.find(h => h.outcomeIndex === targetSide);
+
+          if (existingPositionOnTargetSide) {
+            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Already have ${existingPositionOnTargetSide.strategy} position on target side ${targetSide} - skipping moonshot`);
+            return;
+          }
+
+          logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] No existing position on target side ${targetSide} - moonshot can proceed`);
         } else {
           // Hedge mode: Requires either late or quick_scalp position
           if (!existingPosition) {
