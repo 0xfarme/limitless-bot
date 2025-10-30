@@ -3023,10 +3023,11 @@ async function runForWallet(wallet, provider) {
         } // End else block - only execute late buy if no existing position
 
         // Decision point: should we continue to moonshot or return?
-        // Check for any existing position (late, quick scalp, or contrarian) since moonshot can hedge all
-        const shouldCheckMoonshot = MOONSHOT_ENABLED && inMoonshotWindow && (lateHolding || quickScalpHolding || contrarianHolding);
+        // In independent mode: Always check moonshot when in window (no position required)
+        // In hedge mode: Only check moonshot if there's a position to hedge
+        const shouldCheckMoonshot = MOONSHOT_ENABLED && inMoonshotWindow && (MOONSHOT_INDEPENDENT || lateHolding || quickScalpHolding || contrarianHolding);
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== LATE STRATEGY BLOCK END ======`);
-        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Decision: MOONSHOT_ENABLED=${MOONSHOT_ENABLED}, inMoonshotWindow=${inMoonshotWindow}, lateHolding=${!!lateHolding}, quickScalpHolding=${!!quickScalpHolding}, contrarianHolding=${!!contrarianHolding}`);
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Decision: MOONSHOT_ENABLED=${MOONSHOT_ENABLED}, inMoonshotWindow=${inMoonshotWindow}, MOONSHOT_INDEPENDENT=${MOONSHOT_INDEPENDENT}, lateHolding=${!!lateHolding}, quickScalpHolding=${!!quickScalpHolding}, contrarianHolding=${!!contrarianHolding}`);
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] shouldCheckMoonshot=${!!shouldCheckMoonshot}`);
 
         if (!shouldCheckMoonshot) {
