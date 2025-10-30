@@ -3045,11 +3045,11 @@ async function runForWallet(wallet, provider) {
       // Works in last N minutes based on MOONSHOT_WINDOW_MINUTES parameter
 
       // Debug logging for moonshot decision
-      logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== INDEPENDENT MOONSHOT SECTION ======`);
-      logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Moonshot check: ENABLED=${MOONSHOT_ENABLED}, inWindow=${inMoonshotWindow}, window=${MOONSHOT_WINDOW_MINUTES}min`);
+      logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== MOONSHOT CHECK ======`);
+      logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ENABLED=${MOONSHOT_ENABLED}, inWindow=${inMoonshotWindow}, window=${MOONSHOT_WINDOW_MINUTES}min`);
 
       if (MOONSHOT_ENABLED && inMoonshotWindow) {
-        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅✅✅ MOONSHOT SECTION ENTERED - checking conditions... ✅✅✅`);
+        logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ ENTERING MOONSHOT - checking conditions... ✅`);
         // Safety check: Don't buy in final N seconds to ensure transaction can complete
         if (marketInfo.deadline) {
           const deadlineMs = new Date(marketInfo.deadline).getTime();
@@ -3212,16 +3212,16 @@ async function runForWallet(wallet, provider) {
           return;
         }
       } else {
-        // Moonshot section not entered - log why
-        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ❌❌❌ MOONSHOT SECTION NOT ENTERED ❌❌❌`);
+        // Moonshot not active - log why
+        logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] ⏸️ MOONSHOT SKIPPED`);
         if (!MOONSHOT_ENABLED) {
-          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Reason: Moonshot disabled (MOONSHOT_ENABLED=false)`);
+          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Reason: Disabled (MOONSHOT_ENABLED=false)`);
         } else if (!inMoonshotWindow) {
-          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Reason: Not in moonshot window (need last ${MOONSHOT_WINDOW_MINUTES} minutes)`);
+          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Reason: Not in window (need last ${MOONSHOT_WINDOW_MINUTES} minutes)`);
         }
       }
 
-      logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== END MOONSHOT SECTION ======`);
+      logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== END MOONSHOT CHECK ======`);
 
       // Not in last 13 minutes - check age/deadline restrictions
       if (tooNewForBet || nearDeadlineForBet) {
