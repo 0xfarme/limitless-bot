@@ -1886,7 +1886,7 @@ async function runForWallet(wallet, provider) {
   }
 
   // Helper function to execute buy transaction
-  async function executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, strategy = 'default', moonshotWindow = null, slotAlreadyReserved = false, marketInfo = null, prices = []) {
+  async function executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, strategy = 'default', moonshotWindow = null, marketInfo = null, prices = []) {
     // CRITICAL SAFETY CHECK: Verify we don't already have too many positions for this strategy
     // This prevents race conditions where multiple ticks try to buy the same market
     const allowMultiplePositions = ['moonshot', 'quick_scalp', 'contrarian'].includes(strategy);
@@ -1973,22 +1973,12 @@ async function runForWallet(wallet, provider) {
       logInfo(wallet.address, '✅', `Allowance already sufficient (pre-approved), proceeding to buy`);
     }
 
-    // Mark trade as pending BEFORE starting transaction to prevent race conditions
-    // (unless already reserved atomically for moonshot)
-    if (!slotAlreadyReserved) {
-      addPendingTrade(wallet.address, marketAddress, strategy);
-      logInfo(wallet.address, '🔒', `[${marketAddress.substring(0, 8)}...] Marked ${strategy} trade as pending (prevents duplicate buys)`);
-    } else {
-      logInfo(wallet.address, '🔒', `[${marketAddress.substring(0, 8)}...] Using pre-reserved ${strategy} slot (atomic reservation)`);
-    }
-
     try {
       // Estimate gas then buy
       logInfo(wallet.address, '⚡', `Estimating gas for buy transaction...`);
       const gasEst = await estimateGasFor(market, wallet, 'buy', [investment, outcomeToBuy, minOutcomeTokensToBuy]);
       if (!gasEst) {
         logWarn(wallet.address, '🛑', 'Gas estimate buy failed; skipping buy this tick.');
-        removePendingTrade(wallet.address, marketAddress, strategy);
         return;
       }
       logInfo(wallet.address, '⛽', `Gas estimate buy: ${gasEst}`);
@@ -2069,13 +2059,9 @@ async function runForWallet(wallet, provider) {
         logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Failed to read position balance after buy: ${(e && e.message) ? e.message : e}`);
       }
 
-      // Transaction completed successfully, remove pending marker
-      removePendingTrade(wallet.address, marketAddress, strategy);
-      logInfo(wallet.address, '🔓', `[${marketAddress.substring(0, 8)}...] Removed ${strategy} trade from pending (transaction complete)`);
+      logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Buy transaction completed successfully`);
     } catch (error) {
-      // Transaction failed, remove pending marker
-      removePendingTrade(wallet.address, marketAddress, strategy);
-      logWarn(wallet.address, '❌', `[${marketAddress.substring(0, 8)}...] Buy transaction failed, removed from pending: ${error?.message || error}`);
+      logWarn(wallet.address, '❌', `[${marketAddress.substring(0, 8)}...] Buy transaction failed: ${error?.message || error}`);
       throw error; // Re-throw to propagate error
     }
   }
@@ -2870,7 +2856,7 @@ async function runForWallet(wallet, provider) {
               // Check USDC balance
               const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
               if (usdcBal >= investment) {
-                await executeBuy(wallet, market, usdc, marketAddress, investment, targetSide, decimals, pid0, pid1, erc1155, 'quick_scalp', null, false, marketInfo, prices);
+                await executeBuy(wallet, market, usdc, marketAddress, investment, targetSide, decimals, pid0, pid1, erc1155, 'quick_scalp', null, marketInfo, prices);
                 return; // Exit after quick scalp buy
               } else {
                 logWarn(wallet.address, '⚠️', `Insufficient USDC for quick scalp. Need ${investmentHuman}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
@@ -2927,7 +2913,7 @@ async function runForWallet(wallet, provider) {
               // Check USDC balance
               const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
               if (usdcBal >= investment) {
-                await executeBuy(wallet, market, usdc, marketAddress, investment, weakSide, decimals, pid0, pid1, erc1155, 'contrarian', null, false, marketInfo, prices);
+                await executeBuy(wallet, market, usdc, marketAddress, investment, weakSide, decimals, pid0, pid1, erc1155, 'contrarian', null, marketInfo, prices);
                 return; // Exit after contrarian buy
               } else {
                 logWarn(wallet.address, '⚠️', `Insufficient USDC for contrarian. Need ${investmentHuman}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
@@ -3139,7 +3125,7 @@ async function runForWallet(wallet, provider) {
         }
 
         // Check allowance and execute buy (same as normal flow)
-        await executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, 'default', null, false, marketInfo, prices);
+        await executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, 'default', null, marketInfo, prices);
 
         // After late window buy, check if we should place moonshot contrarian bet
         if (MOONSHOT_ENABLED && inMoonshotWindow) {
@@ -3217,7 +3203,7 @@ async function runForWallet(wallet, provider) {
                   // Check USDC balance for moonshot
                   const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
                   if (usdcBalAfter >= moonshotInvestment) {
-                    await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy, hedgeMoonshotWindow, true, marketInfo, prices);
+                    await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy, hedgeMoonshotWindow, marketInfo, prices);
                   } else {
                     logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need $${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
                   }
@@ -3447,7 +3433,7 @@ async function runForWallet(wallet, provider) {
             logInfo(wallet.address, '🚀', `Amount: $${MOONSHOT_AMOUNT_USDC} USDC`);
             logInfo(wallet.address, '🚀', `Window: ${currentWindow.start}-${currentWindow.end}min (${currentWindow.index})`);
             logInfo(wallet.address, '🔍', `============ END MOONSHOT DECISION ============\n`);
-            await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, targetSide, decimals, pid0, pid1, erc1155, moonshotStrategy, currentWindow, true, marketInfo, prices);
+            await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, targetSide, decimals, pid0, pid1, erc1155, moonshotStrategy, currentWindow, marketInfo, prices);
             return;
           } else {
             logWarn(wallet.address, '❌', `SKIP: Insufficient USDC balance: $${balanceUSDC} < $${MOONSHOT_AMOUNT_USDC}`);
