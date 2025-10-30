@@ -3467,9 +3467,9 @@ async function runForWallet(wallet, provider) {
           // Split investment across max trades
           const splitAmount = parseFloat((MOONSHOT_AMOUNT_USDC / MOONSHOT_MAX_TRADES_PER_MARKET).toFixed(decimals));
           const moonshotInvestment = ethers.parseUnits(splitAmount.toString(), decimals);
-          const tradeNumber = moonshotCount + 1;
+          const currentCount = countMoonshotPositions(wallet.address, marketAddress);
 
-          logInfo(wallet.address, '💰', `Investment: $${splitAmount.toFixed(2)} USDC (${tradeNumber}/${MOONSHOT_MAX_TRADES_PER_MARKET} = $${MOONSHOT_AMOUNT_USDC}/${MOONSHOT_MAX_TRADES_PER_MARKET})`);
+          logInfo(wallet.address, '💰', `Investment: $${splitAmount.toFixed(2)} USDC (${currentCount}/${MOONSHOT_MAX_TRADES_PER_MARKET} = $${MOONSHOT_AMOUNT_USDC}/${MOONSHOT_MAX_TRADES_PER_MARKET})`);
 
           // Check USDC balance for moonshot
           const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
@@ -3481,7 +3481,7 @@ async function runForWallet(wallet, provider) {
             logInfo(wallet.address, '🚀', `Market: ${marketAddress}`);
             logInfo(wallet.address, '🚀', `Side: ${targetSide} @ ${targetOdds}%`);
             logInfo(wallet.address, '🚀', `Amount: $${splitAmount.toFixed(2)} USDC`);
-            logInfo(wallet.address, '🚀', `Trade: ${tradeNumber}/${MOONSHOT_MAX_TRADES_PER_MARKET}`);
+            logInfo(wallet.address, '🚀', `Trade: ${currentCount}/${MOONSHOT_MAX_TRADES_PER_MARKET}`);
             if (MOONSHOT_USE_TIME_WINDOWS && currentWindow) {
               logInfo(wallet.address, '🚀', `Window: ${currentWindow}`);
             }
