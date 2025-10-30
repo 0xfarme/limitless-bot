@@ -2203,6 +2203,30 @@ async function runForWallet(wallet, provider) {
         }
       }
 
+      // EARLY EXIT: Check if any strategy could possibly execute before making RPC calls
+      // This avoids unnecessary contract loading and balance checks
+      const couldContrarian = CONTRARIAN_ENABLED && currentMinute >= CONTRARIAN_BUY_WINDOW_START && currentMinute <= CONTRARIAN_BUY_WINDOW_END;
+      const couldLate = LATE_STRATEGY_ENABLED && inLastThirteenMinutes && !inLastTwoMinutes;
+      const couldMoonshot = MOONSHOT_ENABLED && inMoonshotWindow;
+      const couldQuickScalp = QUICK_SCALP_ENABLED && !tooNewForBet;
+
+      // Check if we might have existing positions that need management (profit taking, stop loss, etc)
+      const localHoldings = getHoldingsForMarket(wallet.address, marketAddress);
+      const mightHavePositions = localHoldings.length > 0;
+
+      const shouldLoadContracts = mightHavePositions || couldContrarian || couldLate || couldMoonshot || couldQuickScalp;
+
+      if (!shouldLoadContracts && !tooNewForBet && !nearDeadlineForBet) {
+        // No strategy could execute and no positions to manage - skip RPC calls entirely
+        const timeRemaining = Math.floor((new Date(marketInfo.deadline).getTime() - Date.now()) / 60000);
+        const strategyStatus = [];
+        if (CONTRARIAN_ENABLED) strategyStatus.push(`Contrarian: :${CONTRARIAN_BUY_WINDOW_START}-:${CONTRARIAN_BUY_WINDOW_END} (now: :${currentMinute})`);
+        if (LATE_STRATEGY_ENABLED) strategyStatus.push(`Late: last ${BUY_WINDOW_MINUTES}min (now: ${timeRemaining}min)`);
+        if (MOONSHOT_ENABLED) strategyStatus.push(`Moonshot: last ${MOONSHOT_WINDOW_MINUTES}min (now: ${timeRemaining}min)`);
+        logInfo(wallet.address, '⏭️', `[${marketAddress.substring(0, 8)}...] Skipping RPC calls - ${strategyStatus.join(' | ')}`);
+        return;
+      }
+
       if (!cachedContracts.has(marketAddress)) {
         try {
           logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Loading contracts...`);
@@ -3451,13 +3475,8 @@ async function runForWallet(wallet, provider) {
         return;
       }
 
-      // Regular buy logic is DISABLED - only using configured strategies (late window + moonshot)
-      const timeRemaining = Math.floor((new Date(marketInfo.deadline).getTime() - Date.now()) / 60000);
-      const strategyStatus = [];
-      if (CONTRARIAN_ENABLED) strategyStatus.push(`Contrarian: :${CONTRARIAN_BUY_WINDOW_START}-:${CONTRARIAN_BUY_WINDOW_END} (now: :${currentMinute})`);
-      if (LATE_STRATEGY_ENABLED) strategyStatus.push(`Late: last ${BUY_WINDOW_MINUTES}min (now: ${timeRemaining}min)`);
-      if (MOONSHOT_ENABLED) strategyStatus.push(`Moonshot: last ${MOONSHOT_WINDOW_MINUTES}min (now: ${timeRemaining}min)`);
-      logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Waiting - ${strategyStatus.join(' | ')}`);
+      // Reached end without executing any strategy (contracts were loaded but conditions not met)
+      logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] No strategy executed - waiting for conditions`);
       return;
       } finally {
         // Always clear the buyingInProgress lock, even if buy failed or returned early
