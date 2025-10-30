@@ -2122,6 +2122,25 @@ async function runForWallet(wallet, provider) {
 
       logInfo(wallet.address, '💹', `[${marketAddress.substring(0, 8)}...] Prediction: YES ${prices[0]}% | NO ${prices[1]}%${assetInfo}`);
 
+      // Log active strategies summary for this evaluation
+      const currentMinute = new Date().getMinutes();
+      const activeStrategies = [];
+      if (CONTRARIAN_ENABLED) {
+        const inContrarianWindow = currentMinute >= CONTRARIAN_BUY_WINDOW_START && currentMinute <= CONTRARIAN_BUY_WINDOW_END;
+        activeStrategies.push(`Contrarian (${inContrarianWindow ? '✅' : '⏸️'} :${CONTRARIAN_BUY_WINDOW_START}-:${CONTRARIAN_BUY_WINDOW_END})`);
+      }
+      if (LATE_STRATEGY_ENABLED) {
+        activeStrategies.push(`Late (⏰ last ${BUY_WINDOW_MINUTES}min)`);
+      }
+      if (MOONSHOT_ENABLED) {
+        const windows = MOONSHOT_WINDOWS.map(w => `${w.start}-${w.end}min`).join(',');
+        activeStrategies.push(`Moonshot (⏰ last ${MOONSHOT_WINDOW_MINUTES}min, windows: ${windows})`);
+      }
+      if (QUICK_SCALP_ENABLED) {
+        activeStrategies.push(`QuickScalp (⚡ early)`);
+      }
+      logInfo(wallet.address, '🎮', `[${marketAddress.substring(0, 8)}...] Active: ${activeStrategies.length > 0 ? activeStrategies.join(' | ') : 'None'}`);
+
       // Pre-compute timing guardrails for buying
       const nowMs = Date.now();
       let tooNewForBet = false;
@@ -2173,9 +2192,7 @@ async function runForWallet(wallet, provider) {
           inMoonshotWindow = remainingMs <= moonshotWindowMs && remainingMs > 0;
           if (MOONSHOT_ENABLED) {
             if (inMoonshotWindow) {
-              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ IN MOONSHOT WINDOW: ${remMin}m remaining <= ${MOONSHOT_WINDOW_MINUTES}min threshold - contrarian bets enabled`);
-            } else {
-              logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Not in moonshot window yet: ${remMin}m remaining > ${MOONSHOT_WINDOW_MINUTES}min threshold`);
+              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] ✅ IN MOONSHOT WINDOW: ${remMin}m remaining <= ${MOONSHOT_WINDOW_MINUTES}min threshold`);
             }
           }
 
@@ -3212,17 +3229,15 @@ async function runForWallet(wallet, provider) {
       // Moonshot ignores MIN_MARKET_AGE_MINUTES and nearDeadlineForBet - only cares about MOONSHOT_WINDOW_MINUTES
       // Works in last N minutes based on MOONSHOT_WINDOW_MINUTES parameter
 
-      // Debug logging for moonshot decision
-      const marketShort = marketAddress.substring(0, 12);
-      logInfo(wallet.address, '🔍', `\n============ MOONSHOT DECISION [${marketShort}] ============`);
-      logInfo(wallet.address, '🔍', `Market: ${marketInfo?.title || 'Unknown'}`);
-      logInfo(wallet.address, '🔍', `Full Address: ${marketAddress}`);
-      logInfo(wallet.address, '🔍', `Prices: [${prices[0]}%, ${prices[1]}%]`);
-      logInfo(wallet.address, '🔍', `Time remaining: ${Math.floor((new Date(marketInfo.deadline).getTime() - Date.now()) / 60000)}m`);
-      logInfo(wallet.address, '🔍', `Config: ENABLED=${MOONSHOT_ENABLED}, INDEPENDENT=${MOONSHOT_INDEPENDENT}, WINDOW=${MOONSHOT_WINDOW_MINUTES}min, MAX_ODDS=${MOONSHOT_MAX_ODDS}%`);
-      logInfo(wallet.address, '🔍', `Status: inMoonshotWindow=${inMoonshotWindow}, nearDeadlineForBet=${nearDeadlineForBet}`);
-
+      // Moonshot evaluation - only show detailed logs if in window
       if (MOONSHOT_ENABLED && inMoonshotWindow) {
+        const marketShort = marketAddress.substring(0, 12);
+        logInfo(wallet.address, '🔍', `\n============ MOONSHOT DECISION [${marketShort}] ============`);
+        logInfo(wallet.address, '🔍', `Market: ${marketInfo?.title || 'Unknown'}`);
+        logInfo(wallet.address, '🔍', `Full Address: ${marketAddress}`);
+        logInfo(wallet.address, '🔍', `Prices: [${prices[0]}%, ${prices[1]}%]`);
+        logInfo(wallet.address, '🔍', `Time remaining: ${Math.floor((new Date(marketInfo.deadline).getTime() - Date.now()) / 60000)}m`);
+        logInfo(wallet.address, '🔍', `Config: ENABLED=${MOONSHOT_ENABLED}, INDEPENDENT=${MOONSHOT_INDEPENDENT}, WINDOW=${MOONSHOT_WINDOW_MINUTES}min, MAX_ODDS=${MOONSHOT_MAX_ODDS}%`);
         logInfo(wallet.address, '🌙', `✅ MOONSHOT WINDOW ACTIVE - Evaluating conditions...`);
         // Safety check: Don't buy in final N seconds to ensure transaction can complete
         if (marketInfo.deadline) {
@@ -3421,14 +3436,13 @@ async function runForWallet(wallet, provider) {
           return;
         }
       } else {
-        // Moonshot not active - log why
+        // Moonshot not active - brief log
         if (!MOONSHOT_ENABLED) {
-          logInfo(wallet.address, '⏸️', `Moonshot DISABLED (MOONSHOT_ENABLED=false)`);
+          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Moonshot: DISABLED`);
         } else if (!inMoonshotWindow) {
           const timeRemaining = Math.floor((new Date(marketInfo.deadline).getTime() - Date.now()) / 60000);
-          logInfo(wallet.address, '⏸️', `Not in moonshot window (${timeRemaining}m remaining > ${MOONSHOT_WINDOW_MINUTES}m threshold)`);
+          logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Moonshot: Not in window (${timeRemaining}m remaining)`);
         }
-        logInfo(wallet.address, '🔍', `============ END MOONSHOT DECISION ============\n`);
       }
 
       // Not in last 13 minutes - check age/deadline restrictions
@@ -3438,7 +3452,12 @@ async function runForWallet(wallet, provider) {
       }
 
       // Regular buy logic is DISABLED - only using configured strategies (late window + moonshot)
-      logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Not in any strategy window - waiting`);
+      const timeRemaining = Math.floor((new Date(marketInfo.deadline).getTime() - Date.now()) / 60000);
+      const strategyStatus = [];
+      if (CONTRARIAN_ENABLED) strategyStatus.push(`Contrarian: :${CONTRARIAN_BUY_WINDOW_START}-:${CONTRARIAN_BUY_WINDOW_END} (now: :${currentMinute})`);
+      if (LATE_STRATEGY_ENABLED) strategyStatus.push(`Late: last ${BUY_WINDOW_MINUTES}min (now: ${timeRemaining}min)`);
+      if (MOONSHOT_ENABLED) strategyStatus.push(`Moonshot: last ${MOONSHOT_WINDOW_MINUTES}min (now: ${timeRemaining}min)`);
+      logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Waiting - ${strategyStatus.join(' | ')}`);
       return;
       } finally {
         // Always clear the buyingInProgress lock, even if buy failed or returned early
