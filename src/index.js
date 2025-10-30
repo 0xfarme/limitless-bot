@@ -120,6 +120,17 @@ const MOONSHOT_AMOUNT_USDC = parseFloat(process.env.MOONSHOT_AMOUNT_USDC || '1')
 const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_PCT || '100', 10); // Sell at N% profit
 const MOONSHOT_FINAL_SECONDS_BUFFER = parseInt(process.env.MOONSHOT_FINAL_SECONDS_BUFFER || '15', 10); // Don't buy in final N seconds
 const MOONSHOT_MAX_TRADES_PER_MARKET = parseInt(process.env.MOONSHOT_MAX_TRADES_PER_MARKET || '3', 10); // Max number of moonshot trades per market
+const MOONSHOT_USE_TIME_WINDOWS = (process.env.MOONSHOT_USE_TIME_WINDOWS || 'false').toLowerCase() === 'true'; // Enable time-based trade windows
+const MOONSHOT_TIME_WINDOWS = process.env.MOONSHOT_TIME_WINDOWS || '53-55,56-58,58-60'; // Time windows in format "min1-min2,min3-min4,..."
+
+// Parse time windows into array of {start, end, index}
+let MOONSHOT_WINDOWS = [];
+if (MOONSHOT_USE_TIME_WINDOWS) {
+  MOONSHOT_WINDOWS = MOONSHOT_TIME_WINDOWS.split(',').map((window, idx) => {
+    const [start, end] = window.trim().split('-').map(s => parseInt(s.trim(), 10));
+    return { start, end, index: idx + 1 };
+  });
+}
 
 // ========= Contrarian Strategy Config =========
 const CONTRARIAN_ENABLED = (process.env.CONTRARIAN_ENABLED || 'false').toLowerCase() === 'true'; // Enable contrarian strategy
@@ -532,6 +543,29 @@ function countMoonshotPositions(addr, marketAddress) {
 function countQuickScalpPositions(addr, marketAddress) {
   const holdings = getHoldingsForMarket(addr, marketAddress);
   return holdings.filter(h => h.strategy === 'quick_scalp').length;
+}
+
+// Get current moonshot time window based on minutes remaining
+function getCurrentMoonshotWindow(minutesRemaining) {
+  if (!MOONSHOT_USE_TIME_WINDOWS || MOONSHOT_WINDOWS.length === 0) {
+    return null; // Time windows disabled
+  }
+
+  for (const window of MOONSHOT_WINDOWS) {
+    // Check if current time is within this window
+    // minutesRemaining counts down (e.g., 60, 59, 58... 1, 0)
+    // So we need to check if it's between start and end
+    if (minutesRemaining <= window.end && minutesRemaining >= window.start) {
+      return window.index;
+    }
+  }
+  return null; // Not in any window
+}
+
+// Check if we already have a moonshot trade in the specified window
+function hasMoonshotTradeInWindow(addr, marketAddress, windowIndex) {
+  const holdings = getHoldingsForMarket(addr, marketAddress);
+  return holdings.some(h => h.strategy === 'moonshot' && h.moonshotWindow === windowIndex);
 }
 
 // ========= Position Summary Report =========
@@ -1826,7 +1860,7 @@ async function runForWallet(wallet, provider) {
   }
 
   // Helper function to execute buy transaction
-  async function executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, strategy = 'default') {
+  async function executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, strategy = 'default', moonshotWindow = null) {
     // CRITICAL SAFETY CHECK: Verify we don't already have too many positions for this strategy
     // This prevents race conditions where multiple ticks try to buy the same market
     const allowMultiplePositions = ['moonshot', 'quick_scalp', 'contrarian'].includes(strategy);
@@ -1949,6 +1983,8 @@ async function runForWallet(wallet, provider) {
       buyTimestamp: new Date().toISOString(),
       marketDeadline: marketInfo?.deadline || null,
       buyTxHash: buyTx.hash,
+      // Moonshot window tracking (if applicable)
+      moonshotWindow: strategy === 'moonshot' ? moonshotWindow : undefined,
       // Scale-in tracking
       scaleInEnabled: SCALE_IN_ENABLED && strategy === 'default',
       scaleInStep: 1, // Current step (1 = first entry)
@@ -3030,7 +3066,27 @@ async function runForWallet(wallet, provider) {
           if (moonshotCount >= MOONSHOT_MAX_TRADES_PER_MARKET) {
             logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping late window moonshot - already have ${moonshotCount}/${MOONSHOT_MAX_TRADES_PER_MARKET} moonshot positions`);
           } else {
-            // Check late position odds and opposite side odds
+            // Time window check (if enabled)
+            let hedgeMoonshotWindow = null;
+            if (MOONSHOT_USE_TIME_WINDOWS) {
+              const remainingMs = new Date(marketInfo.deadline).getTime() - Date.now();
+              const minutesRemaining = Math.floor(remainingMs / 60000);
+              hedgeMoonshotWindow = getCurrentMoonshotWindow(minutesRemaining);
+
+              if (hedgeMoonshotWindow === null) {
+                logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping late window moonshot - not in any configured time window (${minutesRemaining}min remaining)`);
+                // Continue to independent moonshot check below
+              } else if (hasMoonshotTradeInWindow(wallet.address, marketAddress, hedgeMoonshotWindow)) {
+                logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping late window moonshot - already placed trade in window ${hedgeMoonshotWindow}`);
+                // Continue to independent moonshot check below
+              }
+            }
+
+            // Only proceed if window check passed (or windows disabled)
+            const shouldPlaceHedgeMoonshot = !MOONSHOT_USE_TIME_WINDOWS || (hedgeMoonshotWindow !== null && !hasMoonshotTradeInWindow(wallet.address, marketAddress, hedgeMoonshotWindow));
+
+            if (shouldPlaceHedgeMoonshot) {
+              // Check late position odds and opposite side odds
             const moonshotOdds = prices[moonshotOutcome];
             const lateOdds = prices[outcomeToBuy];
 
@@ -3084,12 +3140,13 @@ async function runForWallet(wallet, provider) {
                 // Check USDC balance for moonshot
                 const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
                 if (usdcBalAfter >= moonshotInvestment) {
-                  await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy);
+                  await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy, hedgeMoonshotWindow);
                 } else {
                   logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need ${splitAmount.toFixed(2)}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
                 }
               }
             }
+            } // End shouldPlaceHedgeMoonshot check
           }
         }
 
@@ -3155,6 +3212,29 @@ async function runForWallet(wallet, provider) {
         }
         logInfo(wallet.address, '✅', `Position count check passed: ${moonshotCount} < ${MOONSHOT_MAX_TRADES_PER_MARKET}`);
 
+        // Time window check (if enabled)
+        let currentWindow = null;
+        if (MOONSHOT_USE_TIME_WINDOWS) {
+          const remainingMs = new Date(marketInfo.deadline).getTime() - Date.now();
+          const minutesRemaining = Math.floor(remainingMs / 60000);
+          currentWindow = getCurrentMoonshotWindow(minutesRemaining);
+
+          if (currentWindow === null) {
+            logInfo(wallet.address, '❌', `SKIP: Not in any configured time window (${minutesRemaining}min remaining)`);
+            logInfo(wallet.address, '🔍', `Configured windows: ${MOONSHOT_WINDOWS.map(w => `${w.start}-${w.end}min`).join(', ')}`);
+            logInfo(wallet.address, '🔍', `============ END MOONSHOT DECISION ============\n`);
+            return;
+          }
+
+          // Check if we already have a trade in this window
+          if (hasMoonshotTradeInWindow(wallet.address, marketAddress, currentWindow)) {
+            logInfo(wallet.address, '❌', `SKIP: Already placed trade in window ${currentWindow} (${minutesRemaining}min remaining)`);
+            logInfo(wallet.address, '🔍', `============ END MOONSHOT DECISION ============\n`);
+            return;
+          }
+
+          logInfo(wallet.address, '✅', `Time window check passed: In window ${currentWindow}, no trade placed yet (${minutesRemaining}min remaining)`);
+        }
 
         // Moonshot can run in multiple modes:
         // 1. Hedge mode with late position: Requires late position, buys opposite side
@@ -3294,8 +3374,11 @@ async function runForWallet(wallet, provider) {
             logInfo(wallet.address, '🚀', `Side: ${targetSide} @ ${targetOdds}%`);
             logInfo(wallet.address, '🚀', `Amount: $${splitAmount.toFixed(2)} USDC`);
             logInfo(wallet.address, '🚀', `Trade: ${tradeNumber}/${MOONSHOT_MAX_TRADES_PER_MARKET}`);
+            if (MOONSHOT_USE_TIME_WINDOWS && currentWindow) {
+              logInfo(wallet.address, '🚀', `Window: ${currentWindow}`);
+            }
             logInfo(wallet.address, '🔍', `============ END MOONSHOT DECISION ============\n`);
-            await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, targetSide, decimals, pid0, pid1, erc1155, moonshotStrategy);
+            await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, targetSide, decimals, pid0, pid1, erc1155, moonshotStrategy, currentWindow);
             return;
           } else {
             logWarn(wallet.address, '❌', `SKIP: Insufficient USDC balance: $${balanceUSDC} < $${splitAmount.toFixed(2)}`);
