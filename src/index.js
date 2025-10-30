@@ -2789,8 +2789,9 @@ async function runForWallet(wallet, provider) {
         const lateStrategy = 'default';
         const lateHolding = getHolding(wallet.address, marketAddress, lateStrategy);
         const quickScalpHolding = QUICK_SCALP_HOLD_MODE ? getHolding(wallet.address, marketAddress, 'quick_scalp') : null;
+        const contrarianHolding = getHolding(wallet.address, marketAddress, 'contrarian');
 
-        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] lateHolding: ${lateHolding ? `outcome ${lateHolding.outcomeIndex}` : 'none'}, quickScalpHolding: ${quickScalpHolding ? `outcome ${quickScalpHolding.outcomeIndex}` : 'none'}`);
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] lateHolding: ${lateHolding ? `outcome ${lateHolding.outcomeIndex}` : 'none'}, quickScalpHolding: ${quickScalpHolding ? `outcome ${quickScalpHolding.outcomeIndex}` : 'none'}, contrarianHolding: ${contrarianHolding ? `outcome ${contrarianHolding.outcomeIndex}` : 'none'}`);
 
         // Check if we have a position on the same side late strategy would buy
         let hasPositionOnTargetSide = false;
@@ -2805,6 +2806,10 @@ async function runForWallet(wallet, provider) {
             hasPositionOnTargetSide = true;
             existingPositionForMoonshot = quickScalpHolding;
             logInfo(wallet.address, '💎', `[${marketAddress.substring(0, 8)}...] Quick scalp position exists on target side ${targetOutcomeForLate} - skipping late buy`);
+          } else if (contrarianHolding && contrarianHolding.outcomeIndex === targetOutcomeForLate) {
+            hasPositionOnTargetSide = true;
+            existingPositionForMoonshot = contrarianHolding;
+            logInfo(wallet.address, '🔄', `[${marketAddress.substring(0, 8)}...] Contrarian position exists on target side ${targetOutcomeForLate} - skipping late buy (carrying position to late window)`);
           } else {
             logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] No position on target side ${targetOutcomeForLate} - late strategy can proceed`);
           }
@@ -3018,10 +3023,10 @@ async function runForWallet(wallet, provider) {
         } // End else block - only execute late buy if no existing position
 
         // Decision point: should we continue to moonshot or return?
-        // Check for either late or quick scalp holdings since moonshot can hedge both
-        const shouldCheckMoonshot = MOONSHOT_ENABLED && inMoonshotWindow && (lateHolding || quickScalpHolding);
+        // Check for any existing position (late, quick scalp, or contrarian) since moonshot can hedge all
+        const shouldCheckMoonshot = MOONSHOT_ENABLED && inMoonshotWindow && (lateHolding || quickScalpHolding || contrarianHolding);
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== LATE STRATEGY BLOCK END ======`);
-        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Decision: MOONSHOT_ENABLED=${MOONSHOT_ENABLED}, inMoonshotWindow=${inMoonshotWindow}, lateHolding=${!!lateHolding}, quickScalpHolding=${!!quickScalpHolding}`);
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Decision: MOONSHOT_ENABLED=${MOONSHOT_ENABLED}, inMoonshotWindow=${inMoonshotWindow}, lateHolding=${!!lateHolding}, quickScalpHolding=${!!quickScalpHolding}, contrarianHolding=${!!contrarianHolding}`);
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] shouldCheckMoonshot=${!!shouldCheckMoonshot}`);
 
         if (!shouldCheckMoonshot) {
@@ -3064,15 +3069,17 @@ async function runForWallet(wallet, provider) {
           return;
         }
 
-        // Moonshot can run in three modes:
+        // Moonshot can run in multiple modes:
         // 1. Hedge mode with late position: Requires late position, buys opposite side
         // 2. Hedge mode with quick_scalp hold: Uses early position, buys opposite side
-        // 3. Independent mode: Buys lowest odds side without requiring any position
+        // 3. Hedge mode with contrarian: Hedges contrarian position if carried to late window
+        // 4. Independent mode: Buys lowest odds side without requiring any position
         const lateHolding = getHolding(wallet.address, marketAddress, 'default');
         const quickScalpHolding = QUICK_SCALP_HOLD_MODE ? getHolding(wallet.address, marketAddress, 'quick_scalp') : null;
+        const contrarianHoldingForMoonshot = getHolding(wallet.address, marketAddress, 'contrarian');
 
-        // Use either late or quick_scalp holding as the position to hedge
-        const existingPosition = lateHolding || quickScalpHolding;
+        // Use any existing position (late, quick_scalp, or contrarian) as the position to hedge
+        const existingPosition = lateHolding || quickScalpHolding || contrarianHoldingForMoonshot;
 
         let targetSide;
         let targetOdds;
@@ -3103,14 +3110,14 @@ async function runForWallet(wallet, provider) {
 
           logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] No existing position on target side ${targetSide} - moonshot can proceed`);
         } else {
-          // Hedge mode: Requires either late or quick_scalp position
+          // Hedge mode: Requires either late, quick_scalp, or contrarian position
           if (!existingPosition) {
-            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] No position found (late or quick_scalp) - moonshot requires existing position to hedge against (or enable MOONSHOT_INDEPENDENT=true)`);
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] No position found (late, quick_scalp, or contrarian) - moonshot requires existing position to hedge against (or enable MOONSHOT_INDEPENDENT=true)`);
             return;
           }
 
           // Log which position we're hedging
-          const positionType = lateHolding ? 'late' : 'quick_scalp';
+          const positionType = lateHolding ? 'late' : (quickScalpHolding ? 'quick_scalp' : 'contrarian');
           logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Found ${positionType} position to hedge: outcome ${existingPosition.outcomeIndex}`);
 
           // We have an existing position - buy the opposite side if it qualifies
