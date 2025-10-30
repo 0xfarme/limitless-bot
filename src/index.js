@@ -1827,12 +1827,38 @@ async function runForWallet(wallet, provider) {
 
   // Helper function to execute buy transaction
   async function executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, strategy = 'default') {
-    // CRITICAL SAFETY CHECK: Verify we don't already have a position for this strategy
+    // CRITICAL SAFETY CHECK: Verify we don't already have too many positions for this strategy
     // This prevents race conditions where multiple ticks try to buy the same market
-    const existingHolding = getHolding(wallet.address, marketAddress, strategy);
-    if (existingHolding) {
-      logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] DUPLICATE BUY PREVENTED: Already have ${strategy} position on outcome ${existingHolding.outcomeIndex}. This should not happen!`);
-      return;
+    const allowMultiplePositions = ['moonshot', 'quick_scalp', 'contrarian'].includes(strategy);
+
+    if (allowMultiplePositions) {
+      // For strategies that allow multiple positions, check against the max count
+      let currentCount = 0;
+      let maxCount = 0;
+
+      if (strategy === 'moonshot') {
+        currentCount = countMoonshotPositions(wallet.address, marketAddress);
+        maxCount = MOONSHOT_MAX_TRADES_PER_MARKET;
+      } else if (strategy === 'quick_scalp') {
+        currentCount = countQuickScalpPositions(wallet.address, marketAddress);
+        maxCount = QUICK_SCALP_MAX_TRADES_PER_MARKET;
+      } else if (strategy === 'contrarian') {
+        // Contrarian doesn't have a max trades limit, allow it
+        currentCount = 0;
+        maxCount = 999;
+      }
+
+      if (currentCount >= maxCount) {
+        logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] DUPLICATE BUY PREVENTED: Already have ${currentCount}/${maxCount} ${strategy} positions. This should not happen!`);
+        return;
+      }
+    } else {
+      // For 'default' strategy, check if ANY holding exists
+      const existingHolding = getHolding(wallet.address, marketAddress, strategy);
+      if (existingHolding) {
+        logWarn(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] DUPLICATE BUY PREVENTED: Already have ${strategy} position on outcome ${existingHolding.outcomeIndex}. This should not happen!`);
+        return;
+      }
     }
 
     // First, check if we already have a position in this market via API
