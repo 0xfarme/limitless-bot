@@ -2202,6 +2202,12 @@ async function runForWallet(wallet, provider) {
 
       const shouldLoadContracts = mightHavePositions || couldContrarian || couldLate || couldMoonshot || couldQuickScalp;
 
+      // Debug logging for late strategy
+      if (inLastThirteenMinutes) {
+        const timeRemaining = Math.floor((new Date(marketInfo.deadline).getTime() - Date.now()) / 60000);
+        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] LATE WINDOW DEBUG: inLastThirteenMinutes=${inLastThirteenMinutes}, inLastTwoMinutes=${inLastTwoMinutes}, couldLate=${couldLate}, shouldLoadContracts=${shouldLoadContracts}, timeRemaining=${timeRemaining}min`);
+      }
+
       if (!shouldLoadContracts && !tooNewForBet && !nearDeadlineForBet) {
         // No strategy could execute and no positions to manage - skip RPC calls entirely
         const timeRemaining = Math.floor((new Date(marketInfo.deadline).getTime() - Date.now()) / 60000);
@@ -2857,6 +2863,7 @@ async function runForWallet(wallet, provider) {
               const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
               if (usdcBal >= investment) {
                 await executeBuy(wallet, market, usdc, marketAddress, investment, targetSide, decimals, pid0, pid1, erc1155, 'quick_scalp', null, marketInfo, prices);
+                logInfo(wallet.address, '🚪', `[${marketAddress.substring(0, 8)}...] Exiting after quick scalp buy - late strategy will not run this tick`);
                 return; // Exit after quick scalp buy
               } else {
                 logWarn(wallet.address, '⚠️', `Insufficient USDC for quick scalp. Need ${investmentHuman}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
@@ -2914,6 +2921,7 @@ async function runForWallet(wallet, provider) {
               const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
               if (usdcBal >= investment) {
                 await executeBuy(wallet, market, usdc, marketAddress, investment, weakSide, decimals, pid0, pid1, erc1155, 'contrarian', null, marketInfo, prices);
+                logInfo(wallet.address, '🚪', `[${marketAddress.substring(0, 8)}...] Exiting after contrarian buy - late strategy will not run this tick`);
                 return; // Exit after contrarian buy
               } else {
                 logWarn(wallet.address, '⚠️', `Insufficient USDC for contrarian. Need ${investmentHuman}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
@@ -2930,6 +2938,9 @@ async function runForWallet(wallet, provider) {
 
       // NEW LOGIC: Check if we should use last 13 minutes strategy
       if (inLastThirteenMinutes) {
+        const timeRemaining = Math.floor((new Date(marketInfo.deadline).getTime() - Date.now()) / 60000);
+        logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] Reached late strategy section! Time remaining: ${timeRemaining}min`);
+
         // Check if late strategy is enabled
         if (!LATE_STRATEGY_ENABLED) {
           logInfo(wallet.address, '⏸️', `[${marketAddress.substring(0, 8)}...] Late window strategy disabled - skipping`);
