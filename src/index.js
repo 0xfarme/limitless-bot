@@ -249,6 +249,10 @@ const userState = new Map(); // key: wallet.address, value: { holdings: [{ marke
 // key: `${wallet.address}:${marketAddress}`, value: { bestUnderdogOdds: number, window: number }
 const moonshotBestOdds = new Map();
 
+// Moonshot pending trades: prevents race condition where multiple ticks try to buy before transaction confirms
+// key: `${wallet.address}:${marketAddress}`, value: timestamp when trade was initiated
+const moonshotPendingTrades = new Map();
+
 // Global statistics tracking
 const botStats = {
   totalTrades: 0,
@@ -568,8 +572,27 @@ function clearMoonshotBestOdds(addr, marketAddress) {
 }
 
 function hasMoonshotPosition(addr, marketAddress) {
+  // Check confirmed holdings
   const holdings = getHoldingsForMarket(addr, marketAddress);
-  return holdings.some(h => h.strategy === 'moonshot');
+  const hasConfirmed = holdings.some(h => h.strategy === 'moonshot');
+
+  // Check pending trades (in-flight transactions)
+  const key = `${addr.toLowerCase()}:${marketAddress.toLowerCase()}`;
+  const hasPending = moonshotPendingTrades.has(key);
+
+  return hasConfirmed || hasPending;
+}
+
+function markMoonshotPending(addr, marketAddress) {
+  const key = `${addr.toLowerCase()}:${marketAddress.toLowerCase()}`;
+  moonshotPendingTrades.set(key, Date.now());
+  console.log(`[${addr.substring(0, 8)}] [${marketAddress.substring(0, 8)}] 🔒 Marked moonshot as pending`);
+}
+
+function clearMoonshotPending(addr, marketAddress) {
+  const key = `${addr.toLowerCase()}:${marketAddress.toLowerCase()}`;
+  moonshotPendingTrades.delete(key);
+  console.log(`[${addr.substring(0, 8)}] [${marketAddress.substring(0, 8)}] 🔓 Cleared moonshot pending`);
 }
 
 function countQuickScalpPositions(addr, marketAddress) {
@@ -2060,8 +2083,19 @@ async function runForWallet(wallet, provider) {
       }
 
       logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Buy transaction completed successfully`);
+
+      // Clear moonshot pending marker after successful transaction
+      if (strategy === 'moonshot') {
+        clearMoonshotPending(wallet.address, marketAddress);
+      }
     } catch (error) {
       logWarn(wallet.address, '❌', `[${marketAddress.substring(0, 8)}...] Buy transaction failed: ${error?.message || error}`);
+
+      // Clear moonshot pending marker if transaction failed
+      if (strategy === 'moonshot') {
+        clearMoonshotPending(wallet.address, marketAddress);
+      }
+
       throw error; // Re-throw to propagate error
     }
   }
@@ -3214,6 +3248,8 @@ async function runForWallet(wallet, provider) {
                   // Check USDC balance for moonshot
                   const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
                   if (usdcBalAfter >= moonshotInvestment) {
+                    // Mark as pending BEFORE executing to prevent race conditions
+                    markMoonshotPending(wallet.address, marketAddress);
                     await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy, hedgeMoonshotWindow, marketInfo, prices);
                   } else {
                     logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need $${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
@@ -3444,6 +3480,8 @@ async function runForWallet(wallet, provider) {
             logInfo(wallet.address, '🚀', `Amount: $${MOONSHOT_AMOUNT_USDC} USDC`);
             logInfo(wallet.address, '🚀', `Window: ${currentWindow.start}-${currentWindow.end}min (${currentWindow.index})`);
             logInfo(wallet.address, '🔍', `============ END MOONSHOT DECISION ============\n`);
+            // Mark as pending BEFORE executing to prevent race conditions
+            markMoonshotPending(wallet.address, marketAddress);
             await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, targetSide, decimals, pid0, pid1, erc1155, moonshotStrategy, currentWindow, marketInfo, prices);
             return;
           } else {
