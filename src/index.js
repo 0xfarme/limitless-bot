@@ -1960,6 +1960,11 @@ async function runForWallet(wallet, provider) {
       }
     }
 
+    // Mark moonshot as pending AFTER safety check passes to prevent race conditions
+    if (strategy === 'moonshot') {
+      markMoonshotPending(wallet.address, marketAddress);
+    }
+
     // First, check if we already have a position in this market via API
     try {
       const portfolioData = await fetchPortfolioData(wallet.address);
@@ -3267,8 +3272,6 @@ async function runForWallet(wallet, provider) {
                   // Check USDC balance for moonshot
                   const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
                   if (usdcBalAfter >= moonshotInvestment) {
-                    // Mark as pending BEFORE executing to prevent race conditions
-                    markMoonshotPending(wallet.address, marketAddress);
                     await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy, hedgeMoonshotWindow, marketInfo, prices);
                   } else {
                     logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need $${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
@@ -3499,8 +3502,6 @@ async function runForWallet(wallet, provider) {
             logInfo(wallet.address, '🚀', `Amount: $${MOONSHOT_AMOUNT_USDC} USDC`);
             logInfo(wallet.address, '🚀', `Window: ${currentWindow.start}-${currentWindow.end}min (${currentWindow.index})`);
             logInfo(wallet.address, '🔍', `============ END MOONSHOT DECISION ============\n`);
-            // Mark as pending BEFORE executing to prevent race conditions
-            markMoonshotPending(wallet.address, marketAddress);
             await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, targetSide, decimals, pid0, pid1, erc1155, moonshotStrategy, currentWindow, marketInfo, prices);
             return;
           } else {
