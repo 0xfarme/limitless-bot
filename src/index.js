@@ -578,7 +578,26 @@ function hasMoonshotPosition(addr, marketAddress) {
 
   // Check pending trades (in-flight transactions)
   const key = `${addr.toLowerCase()}:${marketAddress.toLowerCase()}`;
-  const hasPending = moonshotPendingTrades.has(key);
+  const pendingEntry = moonshotPendingTrades.get(key);
+
+  // Auto-cleanup stale pending entries (older than 2 minutes)
+  if (pendingEntry) {
+    const age = Date.now() - pendingEntry;
+    const ageSeconds = Math.floor(age / 1000);
+
+    if (age > 120000) { // 2 minutes
+      console.log(`[${addr.substring(0, 8)}] [${marketAddress.substring(0, 8)}] 🧹 Clearing stale pending marker (${ageSeconds}s old)`);
+      moonshotPendingTrades.delete(key);
+      return hasConfirmed;
+    }
+  }
+
+  const hasPending = pendingEntry !== undefined;
+
+  // Debug logging
+  if (hasConfirmed || hasPending) {
+    console.log(`[${addr.substring(0, 8)}] [${marketAddress.substring(0, 8)}] 🔍 Position check: confirmed=${hasConfirmed}, pending=${hasPending}${hasPending ? ` (${Math.floor((Date.now() - pendingEntry) / 1000)}s ago)` : ''}`);
+  }
 
   return hasConfirmed || hasPending;
 }
@@ -3582,6 +3601,13 @@ async function runForWallet(wallet, provider) {
 
 async function main() {
   console.log('🚀 Starting Limitless bot on Base...');
+
+  // Clear any stale pending moonshot markers from previous runs
+  if (moonshotPendingTrades.size > 0) {
+    console.log(`🧹 Clearing ${moonshotPendingTrades.size} stale pending moonshot marker(s) from previous run`);
+    moonshotPendingTrades.clear();
+  }
+
   console.log(`📋 Configuration:`);
   console.log(`   RPC_URLS: ${RPC_URLS.length} endpoint(s) configured`);
   console.log(`   CHAIN_ID: ${CHAIN_ID}`);
