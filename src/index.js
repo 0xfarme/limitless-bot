@@ -2019,7 +2019,7 @@ async function runForWallet(wallet, provider) {
 
     // Log buy trade with detailed information
     const marketDeadline = marketInfo?.deadline ? new Date(marketInfo.deadline).toISOString() : 'Unknown';
-    const prices = marketInfo?.prices || [];
+    // Note: prices is already passed as a parameter, no need to redeclare
 
     logTrade({
       type: 'BUY',
