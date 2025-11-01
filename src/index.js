@@ -3074,7 +3074,7 @@ async function runForWallet(wallet, provider) {
               const moonshotOutcome = lateHolding.outcomeIndex === 0 ? 1 : 0;
               const moonshotOdds = prices[moonshotOutcome];
 
-              if (moonshotOdds < 10) {
+              if (moonshotOdds < MOONSHOT_MAX_ODDS) {
                 const lateOdds = prices[lateHolding.outcomeIndex];
                 const moonshotStrategy = 'moonshot';
                 const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
@@ -3088,7 +3088,7 @@ async function runForWallet(wallet, provider) {
                   logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need $${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
                 }
               } else {
-                logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - opposite side at ${moonshotOdds}% (need < 10%)`);
+                logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - opposite side at ${moonshotOdds}% (need < ${MOONSHOT_MAX_ODDS}%)`);
               }
             }
             return;
@@ -3219,12 +3219,12 @@ async function runForWallet(wallet, provider) {
           if (hasMoonshotPosition(wallet.address, marketAddress)) {
             logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - already have moonshot position`);
           } else {
-            // Check if opposite side has odds < 10%
+            // Check if opposite side has odds below threshold
             const moonshotOdds = prices[moonshotOutcome];
             const lateOdds = prices[outcomeToBuy];
 
-            if (moonshotOdds >= 10) {
-              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - opposite side at ${moonshotOdds}% (need < 10%)`);
+            if (moonshotOdds >= MOONSHOT_MAX_ODDS) {
+              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - opposite side at ${moonshotOdds}% (need < ${MOONSHOT_MAX_ODDS}%)`);
             } else {
               // CHECK FOR CONTRARIAN POSITION CONFLICT before placing moonshot
               const contrarianHolding = getHolding(wallet.address, marketAddress, 'contrarian');
