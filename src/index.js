@@ -3065,35 +3065,49 @@ async function runForWallet(wallet, provider) {
 
         // If we have a position on the target side, skip to moonshot check
         if (hasPositionOnTargetSide) {
-          if (MOONSHOT_ENABLED && inMoonshotWindow) {
-            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] ✅ Position exists on target side - WILL skip late buy and check moonshot below`);
-            // Continue to moonshot section below
+          if (MOONSHOT_ENABLED) {
+            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] ✅ Position exists on target side - WILL skip late buy and check moonshot`);
+            // Continue to check if we can place moonshot hedge
+
+            const lateHolding = getHolding(wallet.address, marketAddress, 'default');
+            if (lateHolding && !hasMoonshotPosition(wallet.address, marketAddress)) {
+              const moonshotOutcome = lateHolding.outcomeIndex === 0 ? 1 : 0;
+              const moonshotOdds = prices[moonshotOutcome];
+
+              if (moonshotOdds < 10) {
+                const lateOdds = prices[lateHolding.outcomeIndex];
+                const moonshotStrategy = 'moonshot';
+                const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
+
+                logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] 🚀 MOONSHOT HEDGE! Late position: outcome ${lateHolding.outcomeIndex} @ ${lateOdds}% → Buying opposite outcome ${moonshotOutcome} @ ${moonshotOdds}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
+
+                const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+                if (usdcBal >= moonshotInvestment) {
+                  await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy, null, marketInfo, prices);
+                } else {
+                  logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need $${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
+                }
+              } else {
+                logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - opposite side at ${moonshotOdds}% (need < 10%)`);
+              }
+            }
+            return;
           } else {
-            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Position exists on target side - skipping (no moonshot window)`);
+            logInfo(wallet.address, '🛑', `[${marketAddress.substring(0, 8)}...] Position exists on target side - skipping`);
             return;
           }
         } else {
         // Only execute late buy logic if we don't have a position yet
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] No late position - proceeding with late buy logic...`);
 
-        // Check if in last 2 minutes - don't buy (but let independent moonshot handle it if enabled)
+        // Check if in last 2 minutes - don't buy late, but still allow moonshot
         if (inLastTwoMinutes) {
-          if (MOONSHOT_ENABLED && inMoonshotWindow) {
-            logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] In last 2 minutes - skipping late strategy, will check moonshot below`);
-            // Skip late buy logic - jump to closing brace
-          } else {
-            logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] In last 2 minutes - not buying`);
-            return; // Only return when moonshot won't run
-          }
+          logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] In last 2 minutes - skipping late strategy`);
+          return;
         } else if (nearDeadlineForBet) {
         // In last 13 minutes - IGNORE the "too new" check, only check if deadline is too close
-          if (MOONSHOT_ENABLED && inMoonshotWindow) {
-            logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Near deadline but moonshot window active - skipping late strategy, will check moonshot below`);
-            // Skip entire late buy logic below - jump to closing brace of else block
-          } else {
-            logWarn(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Too close to deadline - skipping`);
-            return; // Only return when moonshot won't run
-          }
+          logWarn(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Too close to deadline - skipping`);
+          return;
         } else {
         // Only execute late buy logic if NOT near deadline or moonshot not active
 
@@ -3197,33 +3211,20 @@ async function runForWallet(wallet, provider) {
         await executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, 'default', null, marketInfo, prices);
 
         // After late window buy, check if we should place moonshot contrarian bet
-        if (MOONSHOT_ENABLED && inMoonshotWindow) {
+        if (MOONSHOT_ENABLED) {
           // Moonshot is always the opposite side of what we just bought
           const moonshotOutcome = outcomeToBuy === 0 ? 1 : 0;
 
           // Check if already have moonshot position
           if (hasMoonshotPosition(wallet.address, marketAddress)) {
-            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping late window moonshot - already have moonshot position`);
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - already have moonshot position`);
           } else {
-            // Get current time window
-            const remainingMs = new Date(marketInfo.deadline).getTime() - Date.now();
-            const minutesRemaining = Math.floor(remainingMs / 60000);
-            const hedgeMoonshotWindow = getCurrentMoonshotWindow(minutesRemaining);
-
-            if (hedgeMoonshotWindow === null) {
-              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping late window moonshot - not in configured time window (${minutesRemaining}min remaining)`);
-            } else {
-              // Check late position odds and opposite side odds
+            // Check if opposite side has odds < 10%
             const moonshotOdds = prices[moonshotOutcome];
             const lateOdds = prices[outcomeToBuy];
 
-            // First check if late position odds are in acceptable range
-            if (lateOdds < MOONSHOT_MIN_LATE_ODDS) {
-              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Late position too weak: ${lateOdds}% < ${MOONSHOT_MIN_LATE_ODDS}% minimum - skipping moonshot`);
-            } else if (lateOdds > MOONSHOT_MAX_LATE_ODDS) {
-              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Late position too strong: ${lateOdds}% > ${MOONSHOT_MAX_LATE_ODDS}% maximum - skipping moonshot (too extreme)`);
-            } else if (moonshotOdds > MOONSHOT_MAX_ODDS) {
-              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - opposite side at ${moonshotOdds}% (> ${MOONSHOT_MAX_ODDS}% threshold). Not a true moonshot.`);
+            if (moonshotOdds >= 10) {
+              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - opposite side at ${moonshotOdds}% (need < 10%)`);
             } else {
               // CHECK FOR CONTRARIAN POSITION CONFLICT before placing moonshot
               const contrarianHolding = getHolding(wallet.address, marketAddress, 'contrarian');
@@ -3255,51 +3256,30 @@ async function runForWallet(wallet, provider) {
               }
 
               if (!skipMoonshot) {
-                // Odds improvement check: Only buy if odds are better than previous windows
-                const bestOdds = getMoonshotBestOdds(wallet.address, marketAddress);
-                if (bestOdds && moonshotOdds >= bestOdds.bestUnderdogOdds) {
-                  logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - current odds ${moonshotOdds}% not better than best ${bestOdds.bestUnderdogOdds}% from window ${bestOdds.window}`);
+                // All conditions met - place moonshot bet
+                const moonshotStrategy = 'moonshot';
+                const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
+
+                logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] 🚀 MOONSHOT HEDGE! Late position: outcome ${outcomeToBuy} @ ${lateOdds}% → Buying opposite outcome ${moonshotOutcome} @ ${moonshotOdds}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
+
+                // Check USDC balance for moonshot
+                const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+                if (usdcBalAfter >= moonshotInvestment) {
+                  await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy, null, marketInfo, prices);
                 } else {
-                  // Update best odds for this window
-                  updateMoonshotBestOdds(wallet.address, marketAddress, moonshotOdds, hedgeMoonshotWindow.index);
-
-                  // All conditions met - place moonshot bet
-                  const moonshotStrategy = 'moonshot';
-                  const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
-
-                  logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot hedge! Late position: outcome ${outcomeToBuy} @ ${lateOdds}% → Buying opposite outcome ${moonshotOutcome} @ ${moonshotOdds}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
-
-                  // Check USDC balance for moonshot
-                  const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
-                  if (usdcBalAfter >= moonshotInvestment) {
-                    await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy, hedgeMoonshotWindow, marketInfo, prices);
-                  } else {
-                    logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need $${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
-                  }
+                  logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need $${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
                 }
               }
             }
-            } // End time window check
           }
         }
 
         } // End else block - only execute late buy if no existing position
 
-        // Decision point: should we continue to moonshot or return?
-        // In independent mode: Always check moonshot when in window (no position required)
-        // In hedge mode: Only check moonshot if there's a position to hedge
-        const shouldCheckMoonshot = MOONSHOT_ENABLED && inMoonshotWindow && (MOONSHOT_INDEPENDENT || lateHolding || quickScalpHolding || contrarianHolding);
-        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ====== LATE STRATEGY BLOCK END ======`);
-        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] Decision: MOONSHOT_ENABLED=${MOONSHOT_ENABLED}, inMoonshotWindow=${inMoonshotWindow}, MOONSHOT_INDEPENDENT=${MOONSHOT_INDEPENDENT}, lateHolding=${!!lateHolding}, quickScalpHolding=${!!quickScalpHolding}, contrarianHolding=${!!contrarianHolding}`);
-        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] shouldCheckMoonshot=${!!shouldCheckMoonshot}`);
+        // Moonshot now only runs as hedge after late position (simplified logic above)
+        // No independent moonshot mode - always return after late strategy
+        return;
 
-        if (!shouldCheckMoonshot) {
-          logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ❌ NOT checking moonshot - returning from late strategy block`);
-          return; // Exit if no moonshot or no late holding to hedge
-        }
-
-        logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] ✅ CONTINUING TO MOONSHOT SECTION (not returning)`);
-        // Otherwise continue to independent moonshot section below
         } // Close else block for "NOT near deadline"
       } // Close else block for "no position"
 
