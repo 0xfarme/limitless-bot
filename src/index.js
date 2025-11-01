@@ -111,10 +111,10 @@ const QUICK_SCALP_MAX_TRADES_PER_MARKET = parseInt(process.env.QUICK_SCALP_MAX_T
 
 // ========= Moonshot Strategy Config =========
 const MOONSHOT_ENABLED = (process.env.MOONSHOT_ENABLED || 'true').toLowerCase() === 'true'; // Enable moonshot strategy
-const MOONSHOT_INDEPENDENT = (process.env.MOONSHOT_INDEPENDENT || 'false').toLowerCase() === 'true'; // Run moonshot independently (no late position required)
-const MOONSHOT_WINDOW_MINUTES = parseInt(process.env.MOONSHOT_WINDOW_MINUTES || '2', 10); // Moonshot triggers in last N minutes
+// MOONSHOT_INDEPENDENT removed - moonshot now ALWAYS hedges late positions only (never independent)
+const MOONSHOT_WINDOW_MINUTES = parseInt(process.env.MOONSHOT_WINDOW_MINUTES || '2', 10); // (Legacy - not used in simplified moonshot)
 const MOONSHOT_MAX_ODDS = parseFloat(process.env.MOONSHOT_MAX_ODDS || '10'); // Only buy if opposite side <= N%
-const MOONSHOT_MIN_LATE_ODDS = parseFloat(process.env.MOONSHOT_MIN_LATE_ODDS || '70'); // Require late position >= N% to trigger moonshot
+const MOONSHOT_MIN_LATE_ODDS = parseFloat(process.env.MOONSHOT_MIN_LATE_ODDS || '70'); // (Legacy - not used in simplified moonshot)
 const MOONSHOT_MAX_LATE_ODDS = parseFloat(process.env.MOONSHOT_MAX_LATE_ODDS || '95'); // Require late position <= N% to trigger moonshot
 const MOONSHOT_AMOUNT_USDC = parseFloat(process.env.MOONSHOT_AMOUNT_USDC || '1'); // Amount to invest in moonshot
 const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_PCT || '100', 10); // Sell at N% profit
@@ -1600,14 +1600,42 @@ async function runForWallet(wallet, provider) {
       logPositionsSummary(wallet.address);
     }
 
+    // Check if we need to fetch markets at all
+    const nowMinutes = new Date().getMinutes();
+    const currentMinute = nowMinutes;
+    const inRedemptionWindow = AUTO_REDEEM_ENABLED && nowMinutes >= REDEEM_WINDOW_START && nowMinutes <= REDEEM_WINDOW_END;
+
+    // Calculate remaining time for late strategy check
+    const nowMs = Date.now();
+    const nextHourMs = new Date(Math.ceil(nowMs / 3600000) * 3600000).getTime();
+    const remainingMs = nextHourMs - nowMs;
+    const remainingMinutes = Math.floor(remainingMs / 60000);
+    const inLateWindow = remainingMinutes <= BUY_WINDOW_MINUTES && remainingMinutes > 2;
+
+    // Check if any strategy could be active
+    const couldContrarian = CONTRARIAN_ENABLED && currentMinute >= CONTRARIAN_BUY_WINDOW_START && currentMinute <= CONTRARIAN_BUY_WINDOW_END;
+    const couldLate = LATE_STRATEGY_ENABLED && inLateWindow;
+    const couldQuickScalp = QUICK_SCALP_ENABLED;
+
+    // Check if we have any positions that might need management
+    const myHoldings = getAllHoldings(wallet.address);
+    const hasPositions = myHoldings.length > 0;
+
+    // Skip API calls if no strategies are active and no positions to manage and not in redemption window
+    if (!couldContrarian && !couldLate && !couldQuickScalp && !hasPositions && !inRedemptionWindow) {
+      const statusParts = [];
+      if (CONTRARIAN_ENABLED) statusParts.push(`Contrarian: :${CONTRARIAN_BUY_WINDOW_START}-:${CONTRARIAN_BUY_WINDOW_END} (now: :${currentMinute})`);
+      if (LATE_STRATEGY_ENABLED) statusParts.push(`Late: last ${BUY_WINDOW_MINUTES}min (now: ${remainingMinutes}min)`);
+      if (QUICK_SCALP_ENABLED) statusParts.push(`Quick Scalp: enabled but market age restricted`);
+      if (AUTO_REDEEM_ENABLED) statusParts.push(`Redeem: :${REDEEM_WINDOW_START}-:${REDEEM_WINDOW_END} (now: :${nowMinutes})`);
+
+      logInfo(wallet.address, '⏭️', `Skipping API/RPC calls - no strategies active and no positions | ${statusParts.join(' | ')}`);
+      return; // Skip this poll cycle entirely
+    }
+
     try {
       logInfo(wallet.address, '🔄', `Polling market data (oracles=[${PRICE_ORACLE_IDS.join(', ')}], freq=${FREQUENCY})...`);
       const allMarketsData = await fetchMarkets();
-
-      // Redemption window: Only check for redemptions during configured time window
-      // This allows time for market settlement after closing at :00
-      const nowMinutes = new Date().getMinutes();
-      const inRedemptionWindow = AUTO_REDEEM_ENABLED && nowMinutes >= REDEEM_WINDOW_START && nowMinutes <= REDEEM_WINDOW_END;
 
       // Log redemption window status every tick during the window
       if (AUTO_REDEEM_ENABLED && nowMinutes >= REDEEM_WINDOW_START && nowMinutes <= REDEEM_WINDOW_END) {
@@ -2251,7 +2279,7 @@ async function runForWallet(wallet, provider) {
       // This avoids unnecessary contract loading and balance checks
       const couldContrarian = CONTRARIAN_ENABLED && currentMinute >= CONTRARIAN_BUY_WINDOW_START && currentMinute <= CONTRARIAN_BUY_WINDOW_END;
       const couldLate = LATE_STRATEGY_ENABLED && inLastThirteenMinutes && !inLastTwoMinutes;
-      const couldMoonshot = MOONSHOT_ENABLED && inMoonshotWindow;
+      const couldMoonshot = MOONSHOT_ENABLED && inLastThirteenMinutes; // Moonshot runs during late window
       const couldQuickScalp = QUICK_SCALP_ENABLED && !tooNewForBet;
 
       // Check if we might have existing positions that need management (profit taking, stop loss, etc)
@@ -3234,86 +3262,100 @@ async function runForWallet(wallet, provider) {
         // Check allowance and execute buy (same as normal flow)
         await executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, 'default', null, marketInfo, prices);
 
-        // After late window buy, check if we should place moonshot contrarian bet
-        if (MOONSHOT_ENABLED) {
-          // Moonshot is always the opposite side of what we just bought
-          const moonshotOutcome = outcomeToBuy === 0 ? 1 : 0;
-
-          // Check if already have moonshot position
-          if (hasMoonshotPosition(wallet.address, marketAddress)) {
-            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - already have moonshot position`);
-          } else {
-            // Check if opposite side has odds below threshold
-            const moonshotOdds = prices[moonshotOutcome];
-            const lateOdds = prices[outcomeToBuy];
-
-            if (moonshotOdds >= MOONSHOT_MAX_ODDS) {
-              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Skipping moonshot - opposite side at ${moonshotOdds}% (need < ${MOONSHOT_MAX_ODDS}%)`);
-            } else {
-              // CHECK FOR CONTRARIAN POSITION CONFLICT before placing moonshot
-              const contrarianHolding = getHolding(wallet.address, marketAddress, 'contrarian');
-              let skipMoonshot = false;
-
-              if (contrarianHolding && contrarianHolding.outcomeIndex === moonshotOutcome) {
-                // Check if contrarian position is losing
-                const contrarianCost = BigInt(contrarianHolding.cost || '0');
-                const contrarianTokenId = contrarianHolding.tokenId;
-                const contrarianTokenBalance = await retryRpcCall(async () => await erc1155.balanceOf(wallet.address, contrarianTokenId));
-
-                if (contrarianTokenBalance > 0n) {
-                  let contrarianPositionValue = 0n;
-                  try {
-                    contrarianPositionValue = await retryRpcCall(async () => await market.calcSellAmount(contrarianTokenBalance, contrarianHolding.outcomeIndex));
-                  } catch (e) {
-                    logInfo(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Contrarian position value check failed - assuming losing position`);
-                  }
-
-                  const contrarianIsLosing = contrarianPositionValue < contrarianCost;
-
-                  if (contrarianIsLosing) {
-                    logInfo(wallet.address, '🚫', `[${marketAddress.substring(0, 8)}...] CONFLICT: Contrarian strategy has a losing position on outcome ${contrarianHolding.outcomeIndex}. Moonshot would buy same side (outcome ${moonshotOutcome}). Skipping moonshot.`);
-                    skipMoonshot = true;
-                  } else {
-                    logInfo(wallet.address, '✅', `[${marketAddress.substring(0, 8)}...] Contrarian has winning position on outcome ${contrarianHolding.outcomeIndex}, moonshot buying same side is OK`);
-                  }
-                }
-              }
-
-              if (!skipMoonshot) {
-                // All conditions met - place moonshot bet
-                const moonshotStrategy = 'moonshot';
-                const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
-
-                logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] 🚀 MOONSHOT HEDGE! Late position: outcome ${outcomeToBuy} @ ${lateOdds}% → Buying opposite outcome ${moonshotOutcome} @ ${moonshotOdds}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
-
-                // Check USDC balance for moonshot
-                const usdcBalAfter = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
-                if (usdcBalAfter >= moonshotInvestment) {
-                  await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy, null, marketInfo, prices);
-                } else {
-                  logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need $${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalAfter, decimals)}.`);
-                }
-              }
-            }
-          }
-        }
-
+        // Don't return yet - fall through to moonshot evaluation below
         } // End else block - only execute late buy if no existing position
-
-        // Moonshot now only runs as hedge after late position (simplified logic above)
-        // No independent moonshot mode - always return after late strategy
-        return;
 
         } // Close else block for "NOT near deadline"
       } // Close else block for "no position"
 
-      // Independent Moonshot Strategy: ONLY triggers when there's an existing late window position
-      // Always buys the OPPOSITE side as a hedge/contrarian bet
-      // Moonshot ignores MIN_MARKET_AGE_MINUTES and nearDeadlineForBet - only cares about MOONSHOT_WINDOW_MINUTES
-      // Works in last N minutes based on MOONSHOT_WINDOW_MINUTES parameter
+      // ========================================
+      // MOONSHOT STRATEGY: Hedge Late Positions
+      // ========================================
+      // Runs during the LATE STRATEGY WINDOW (same as late strategy timing) if:
+      // 1. MOONSHOT_ENABLED is true
+      // 2. In late strategy time window (last N minutes based on BUY_WINDOW_MINUTES)
+      // 3. A late position exists
+      // 4. No moonshot position exists yet
+      // 5. More than 15 seconds until market close
+      // 6. Opposite side odds meet MOONSHOT_MAX_ODDS criteria
+      if (MOONSHOT_ENABLED && inLastThirteenMinutes) {
+        // Check if we have a late position to hedge
+        const latePosition = getHolding(wallet.address, marketAddress, 'default');
 
-      // Moonshot evaluation - only show detailed logs if in window
-      if (MOONSHOT_ENABLED && inMoonshotWindow) {
+        if (latePosition) {
+          // Check if already have moonshot position
+          if (!hasMoonshotPosition(wallet.address, marketAddress)) {
+            // Check if we're past 59:45 (15 seconds before the hour)
+            const now = new Date();
+            const currentMinute = now.getMinutes();
+            const currentSecond = now.getSeconds();
+            const timeInSeconds = (currentMinute * 60) + currentSecond;
+            const cutoffTimeInSeconds = (59 * 60) + 45; // 59:45
+
+            if (timeInSeconds <= cutoffTimeInSeconds) {
+              // Calculate opposite side to hedge
+              const moonshotOutcome = latePosition.outcomeIndex === 0 ? 1 : 0;
+              const moonshotOdds = prices[moonshotOutcome];
+              const lateOdds = prices[latePosition.outcomeIndex];
+
+              logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot check: Late position on outcome ${latePosition.outcomeIndex} @ ${lateOdds}%, checking opposite side ${moonshotOutcome} @ ${moonshotOdds}% (need < ${MOONSHOT_MAX_ODDS}%)`);
+
+              // Check if opposite side meets odds criteria
+              if (moonshotOdds < MOONSHOT_MAX_ODDS) {
+                // Check for contrarian position conflict
+                const contrarianHolding = getHolding(wallet.address, marketAddress, 'contrarian');
+                let skipMoonshot = false;
+
+                if (contrarianHolding && contrarianHolding.outcomeIndex === moonshotOutcome) {
+                  // Check if contrarian position is losing
+                  const contrarianCost = BigInt(contrarianHolding.cost || '0');
+                  const contrarianTokenId = contrarianHolding.tokenId;
+                  const contrarianTokenBalance = await retryRpcCall(async () => await erc1155.balanceOf(wallet.address, contrarianTokenId));
+
+                  if (contrarianTokenBalance > 0n) {
+                    let contrarianPositionValue = 0n;
+                    try {
+                      contrarianPositionValue = await retryRpcCall(async () => await market.calcSellAmount(contrarianTokenBalance, contrarianHolding.outcomeIndex));
+                    } catch (e) {
+                      logInfo(wallet.address, '⚠️', `[${marketAddress.substring(0, 8)}...] Contrarian position value check failed - assuming losing position`);
+                    }
+
+                    const contrarianIsLosing = contrarianPositionValue < contrarianCost;
+
+                    if (contrarianIsLosing) {
+                      logInfo(wallet.address, '🚫', `[${marketAddress.substring(0, 8)}...] SKIP MOONSHOT: Contrarian has losing position on outcome ${contrarianHolding.outcomeIndex}. Moonshot would buy same side (outcome ${moonshotOutcome}).`);
+                      skipMoonshot = true;
+                    }
+                  }
+                }
+
+                if (!skipMoonshot) {
+                  // All conditions met - place moonshot bet
+                  const moonshotStrategy = 'moonshot';
+                  const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
+
+                  logInfo(wallet.address, '🚀', `[${marketAddress.substring(0, 8)}...] 🌙 MOONSHOT HEDGE! Late position: outcome ${latePosition.outcomeIndex} @ ${lateOdds}% → Buying opposite outcome ${moonshotOutcome} @ ${moonshotOdds}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
+
+                  // Check USDC balance for moonshot
+                  const usdcBalForMoonshot = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+                  if (usdcBalForMoonshot >= moonshotInvestment) {
+                    await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy, null, marketInfo, prices);
+                  } else {
+                    logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need $${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalForMoonshot, decimals)}.`);
+                  }
+                }
+              } else {
+                logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Moonshot waiting: opposite side ${moonshotOutcome} at ${moonshotOdds}% (need < ${MOONSHOT_MAX_ODDS}%)`);
+              }
+            } else {
+              logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] Moonshot window closed: past 59:45 cutoff (current: ${currentMinute}:${currentSecond.toString().padStart(2, '0')})`);
+            }
+          }
+        }
+      }
+
+      // Skip removed independent moonshot logic
+      if (false && MOONSHOT_ENABLED && inMoonshotWindow) {
         const marketShort = marketAddress.substring(0, 12);
         logInfo(wallet.address, '🔍', `\n============ MOONSHOT DECISION [${marketShort}] ============`);
         logInfo(wallet.address, '🔍', `Market: ${marketInfo?.title || 'Unknown'}`);
@@ -3586,9 +3628,27 @@ async function runForWallet(wallet, provider) {
       nextPollDelay = 30000; // 30 seconds to monitor positions
       reason = `monitoring ${holdings.length} position(s) outside trading windows`;
     } else {
-      // Bot is active - use normal polling interval
-      nextPollDelay = POLL_INTERVAL_MS;
-      reason = `active trading window (LATE=${LATE_STRATEGY_ENABLED}, MOONSHOT=${MOONSHOT_ENABLED}, QUICK_SCALP=${QUICK_SCALP_ENABLED}, CONTRARIAN=${CONTRARIAN_ENABLED})`;
+      // Bot is active - use faster polling for critical windows
+      const nowMs = Date.now();
+      const nextHourMs = new Date(Math.ceil(nowMs / 3600000) * 3600000).getTime();
+      const remainingMs = nextHourMs - nowMs;
+      const remainingMinutes = Math.floor(remainingMs / 60000);
+      const currentMinute = new Date().getMinutes();
+
+      // Use faster polling (5s) during critical windows where odds change rapidly
+      const inLateWindow = remainingMinutes <= BUY_WINDOW_MINUTES;
+      const inContrarianWindow = currentMinute >= CONTRARIAN_BUY_WINDOW_START && currentMinute <= CONTRARIAN_BUY_WINDOW_END;
+      const inCriticalWindow = inLateWindow || inContrarianWindow;
+
+      if (inCriticalWindow) {
+        // Critical trading window - poll every 5 seconds for fastest execution
+        nextPollDelay = 5000;
+        reason = `CRITICAL window (${inLateWindow ? 'Late' : 'Contrarian'}) - fast polling for quick execution`;
+      } else {
+        // Normal active period - use configured interval
+        nextPollDelay = POLL_INTERVAL_MS;
+        reason = `active period (LATE=${LATE_STRATEGY_ENABLED}, MOONSHOT=${MOONSHOT_ENABLED}, QUICK_SCALP=${QUICK_SCALP_ENABLED}, CONTRARIAN=${CONTRARIAN_ENABLED})`;
+      }
     }
 
     // Schedule next poll
