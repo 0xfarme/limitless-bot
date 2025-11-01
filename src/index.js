@@ -111,14 +111,28 @@ const QUICK_SCALP_MAX_TRADES_PER_MARKET = parseInt(process.env.QUICK_SCALP_MAX_T
 
 // ========= Moonshot Strategy Config =========
 const MOONSHOT_ENABLED = (process.env.MOONSHOT_ENABLED || 'true').toLowerCase() === 'true'; // Enable moonshot strategy
-// MOONSHOT_INDEPENDENT removed - moonshot now ALWAYS hedges late positions only (never independent)
-const MOONSHOT_WINDOW_MINUTES = parseInt(process.env.MOONSHOT_WINDOW_MINUTES || '2', 10); // (Legacy - not used in simplified moonshot)
+const MOONSHOT_WINDOW_START_MINUTES = parseInt(process.env.MOONSHOT_WINDOW_START_MINUTES || '12', 10); // Start checking N minutes before deadline
+const MOONSHOT_WINDOW_END_TIME = process.env.MOONSHOT_WINDOW_END_TIME || '59:45'; // Stop checking at MM:SS (e.g., 59:45)
 const MOONSHOT_MAX_ODDS = parseFloat(process.env.MOONSHOT_MAX_ODDS || '10'); // Only buy if opposite side <= N%
-const MOONSHOT_MIN_LATE_ODDS = parseFloat(process.env.MOONSHOT_MIN_LATE_ODDS || '70'); // (Legacy - not used in simplified moonshot)
-const MOONSHOT_MAX_LATE_ODDS = parseFloat(process.env.MOONSHOT_MAX_LATE_ODDS || '95'); // Require late position <= N% to trigger moonshot
 const MOONSHOT_AMOUNT_USDC = parseFloat(process.env.MOONSHOT_AMOUNT_USDC || '1'); // Amount to invest in moonshot
-const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_PCT || '100', 10); // Sell at N% profit
-const MOONSHOT_FINAL_SECONDS_BUFFER = parseInt(process.env.MOONSHOT_FINAL_SECONDS_BUFFER || '15', 10); // Don't buy in final N seconds
+
+// Parse MOONSHOT_WINDOW_END_TIME (format: "MM:SS") to total seconds
+const parseMoonshotEndTime = (timeStr) => {
+  const parts = timeStr.split(':');
+  if (parts.length !== 2) return 59 * 60 + 45; // Default: 59:45
+  const minutes = parseInt(parts[0], 10);
+  const seconds = parseInt(parts[1], 10);
+  if (isNaN(minutes) || isNaN(seconds)) return 59 * 60 + 45;
+  return minutes * 60 + seconds;
+};
+const MOONSHOT_WINDOW_END_SECONDS = parseMoonshotEndTime(MOONSHOT_WINDOW_END_TIME);
+
+// Legacy config (not used)
+const MOONSHOT_WINDOW_MINUTES = parseInt(process.env.MOONSHOT_WINDOW_MINUTES || '2', 10); // (Legacy)
+const MOONSHOT_MIN_LATE_ODDS = parseFloat(process.env.MOONSHOT_MIN_LATE_ODDS || '70'); // (Legacy)
+const MOONSHOT_MAX_LATE_ODDS = parseFloat(process.env.MOONSHOT_MAX_LATE_ODDS || '95'); // (Legacy)
+const MOONSHOT_PROFIT_TARGET_PCT = parseInt(process.env.MOONSHOT_PROFIT_TARGET_PCT || '100', 10); // (Legacy)
+const MOONSHOT_FINAL_SECONDS_BUFFER = parseInt(process.env.MOONSHOT_FINAL_SECONDS_BUFFER || '15', 10); // (Legacy)
 // SIMPLIFIED: Moonshot places 1 trade per time window (no max trades limit)
 const MOONSHOT_TIME_WINDOWS = process.env.MOONSHOT_TIME_WINDOWS || '0-2,2-4'; // Time windows in format "min1-min2,min3-min4,..." (REQUIRED)
 
@@ -2278,7 +2292,12 @@ async function runForWallet(wallet, provider) {
       // This avoids unnecessary contract loading and balance checks
       const couldContrarian = CONTRARIAN_ENABLED && currentMinute >= CONTRARIAN_BUY_WINDOW_START && currentMinute <= CONTRARIAN_BUY_WINDOW_END;
       const couldLate = LATE_STRATEGY_ENABLED && inLastThirteenMinutes && !inLastTwoMinutes;
-      const couldMoonshot = MOONSHOT_ENABLED && inLastThirteenMinutes; // Moonshot runs during late window
+
+      // Check if moonshot window is active (uses independent MOONSHOT_WINDOW_START_MINUTES)
+      const remainingMinutesForMoonshot = Math.floor((new Date(marketInfo.deadline).getTime() - Date.now()) / 60000);
+      const inMoonshotStartWindow = remainingMinutesForMoonshot <= MOONSHOT_WINDOW_START_MINUTES;
+      const couldMoonshot = MOONSHOT_ENABLED && inMoonshotStartWindow;
+
       const couldQuickScalp = QUICK_SCALP_ENABLED && !tooNewForBet;
 
       // Check if we might have existing positions that need management (profit taking, stop loss, etc)
@@ -3270,28 +3289,35 @@ async function runForWallet(wallet, provider) {
       // ========================================
       // MOONSHOT STRATEGY: Hedge Late Positions
       // ========================================
-      // Runs during the LATE STRATEGY WINDOW (same as late strategy timing) if:
+      // Runs during CONFIGURABLE TIME WINDOW if:
       // 1. MOONSHOT_ENABLED is true
-      // 2. In late strategy time window (last N minutes based on BUY_WINDOW_MINUTES)
-      // 3. A late position exists
-      // 4. No moonshot position exists yet
-      // 5. More than 15 seconds until market close
+      // 2. In moonshot window (MOONSHOT_WINDOW_START_MINUTES before deadline)
+      // 3. Before end time (MOONSHOT_WINDOW_END_TIME, e.g., 59:45)
+      // 4. A late position exists
+      // 5. No moonshot position exists yet
       // 6. Opposite side odds meet MOONSHOT_MAX_ODDS criteria
-      if (MOONSHOT_ENABLED && inLastThirteenMinutes) {
-        // Check if we have a late position to hedge
-        const latePosition = getHolding(wallet.address, marketAddress, 'default');
+      if (MOONSHOT_ENABLED) {
+        // Check if in moonshot time window
+        const nowMs = Date.now();
+        const deadlineMs = new Date(marketInfo.deadline).getTime();
+        const remainingMs = deadlineMs - nowMs;
+        const remainingMinutes = Math.floor(remainingMs / 60000);
+        const inMoonshotWindow = remainingMinutes <= MOONSHOT_WINDOW_START_MINUTES;
 
-        if (latePosition) {
-          // Check if already have moonshot position
-          if (!hasMoonshotPosition(wallet.address, marketAddress)) {
-            // Check if we're past 59:45 (15 seconds before the hour)
-            const now = new Date();
-            const currentMinute = now.getMinutes();
-            const currentSecond = now.getSeconds();
-            const timeInSeconds = (currentMinute * 60) + currentSecond;
-            const cutoffTimeInSeconds = (59 * 60) + 45; // 59:45
+        if (inMoonshotWindow) {
+          // Check if before end time (e.g., 59:45)
+          const now = new Date();
+          const currentMinute = now.getMinutes();
+          const currentSecond = now.getSeconds();
+          const timeInSeconds = (currentMinute * 60) + currentSecond;
 
-            if (timeInSeconds <= cutoffTimeInSeconds) {
+          if (timeInSeconds <= MOONSHOT_WINDOW_END_SECONDS) {
+            // Check if we have a late position to hedge
+            const latePosition = getHolding(wallet.address, marketAddress, 'default');
+
+            if (latePosition) {
+              // Check if already have moonshot position
+              if (!hasMoonshotPosition(wallet.address, marketAddress)) {
               // Calculate opposite side to hedge
               const moonshotOutcome = latePosition.outcomeIndex === 0 ? 1 : 0;
               const moonshotOdds = prices[moonshotOutcome];
@@ -3343,12 +3369,14 @@ async function runForWallet(wallet, provider) {
                     logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need $${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBalForMoonshot, decimals)}.`);
                   }
                 }
-              } else {
-                logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Moonshot waiting: opposite side ${moonshotOutcome} at ${moonshotOdds}% (need < ${MOONSHOT_MAX_ODDS}%)`);
+                } else {
+                  logInfo(wallet.address, '⏳', `[${marketAddress.substring(0, 8)}...] Moonshot waiting: opposite side ${moonshotOutcome} at ${moonshotOdds}% (need < ${MOONSHOT_MAX_ODDS}%)`);
+                }
               }
-            } else {
-              logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] Moonshot window closed: past 59:45 cutoff (current: ${currentMinute}:${currentSecond.toString().padStart(2, '0')})`);
             }
+          } else {
+            // Past end time
+            logInfo(wallet.address, '⏰', `[${marketAddress.substring(0, 8)}...] Moonshot window closed: past ${MOONSHOT_WINDOW_END_TIME} cutoff (current: ${currentMinute}:${currentSecond.toString().padStart(2, '0')})`);
           }
         }
       }
