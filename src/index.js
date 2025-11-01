@@ -2218,8 +2218,7 @@ async function runForWallet(wallet, provider) {
         activeStrategies.push(`Late (⏰ last ${BUY_WINDOW_MINUTES}min)`);
       }
       if (MOONSHOT_ENABLED) {
-        const windows = MOONSHOT_WINDOWS.map(w => `${w.start}-${w.end}min`).join(',');
-        activeStrategies.push(`Moonshot (⏰ last ${MOONSHOT_WINDOW_MINUTES}min, windows: ${windows})`);
+        activeStrategies.push(`Moonshot (⏰ last ${MOONSHOT_WINDOW_START_MINUTES}min, ends ${MOONSHOT_WINDOW_END_TIME})`);
       }
       if (QUICK_SCALP_ENABLED) {
         activeStrategies.push(`QuickScalp (⚡ early)`);
@@ -2318,7 +2317,7 @@ async function runForWallet(wallet, provider) {
         const strategyStatus = [];
         if (CONTRARIAN_ENABLED) strategyStatus.push(`Contrarian: :${CONTRARIAN_BUY_WINDOW_START}-:${CONTRARIAN_BUY_WINDOW_END} (now: :${currentMinute})`);
         if (LATE_STRATEGY_ENABLED) strategyStatus.push(`Late: last ${BUY_WINDOW_MINUTES}min (now: ${timeRemaining}min)`);
-        if (MOONSHOT_ENABLED) strategyStatus.push(`Moonshot: last ${MOONSHOT_WINDOW_MINUTES}min (now: ${timeRemaining}min)`);
+        if (MOONSHOT_ENABLED) strategyStatus.push(`Moonshot: last ${MOONSHOT_WINDOW_START_MINUTES}min, ends ${MOONSHOT_WINDOW_END_TIME} (now: ${timeRemaining}min)`);
         logInfo(wallet.address, '⏭️', `[${marketAddress.substring(0, 8)}...] Skipping RPC calls - ${strategyStatus.join(' | ')}`);
         return;
       }
