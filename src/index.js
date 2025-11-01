@@ -1970,6 +1970,15 @@ async function runForWallet(wallet, provider) {
 
   // Helper function to execute buy transaction
   async function executeBuy(wallet, market, usdc, marketAddress, investment, outcomeToBuy, decimals, pid0, pid1, erc1155, strategy = 'default', moonshotWindow = null, marketInfo = null, prices = []) {
+    // ========== TIMING & ODDS TRACKING START ==========
+    const executionStartTime = Date.now();
+    const initialOdds = prices[outcomeToBuy] || 0;
+    const initialOppositeOdds = prices[outcomeToBuy === 0 ? 1 : 0] || 0;
+    const executionStartISO = new Date(executionStartTime).toISOString();
+
+    logInfo(wallet.address, '⏱️', `[${marketAddress.substring(0, 8)}...] 🎯 TRADE START: ${strategy} | Outcome ${outcomeToBuy} @ ${initialOdds}% | Opposite @ ${initialOppositeOdds}% | Start: ${executionStartISO}`);
+    // ===================================================
+
     // CRITICAL SAFETY CHECK: Verify we don't already have too many positions for this strategy
     // This prevents race conditions where multiple ticks try to buy the same market
     const allowMultiplePositions = ['moonshot', 'quick_scalp', 'contrarian'].includes(strategy);
@@ -2078,7 +2087,41 @@ async function runForWallet(wallet, provider) {
       logInfo(wallet.address, '🧾', `Buy tx: ${buyTx.hash}`);
       logInfo(wallet.address, '⏳', `Waiting for ${CONFIRMATIONS} confirmation(s)...`);
       const receipt = await buyTx.wait(CONFIRMATIONS);
+
+      // ========== TIMING & ODDS TRACKING END ==========
+      const executionEndTime = Date.now();
+      const executionTimeMs = executionEndTime - executionStartTime;
+      const executionTimeSec = (executionTimeMs / 1000).toFixed(2);
+      const executionEndISO = new Date(executionEndTime).toISOString();
+
+      // Try to get fresh odds after trade to see if they changed
+      let finalOdds = initialOdds;
+      let finalOppositeOdds = initialOppositeOdds;
+      let oddsChange = 0;
+      let oppositeOddsChange = 0;
+
+      try {
+        // Fetch fresh market data to get updated odds
+        const pid0Amount = await retryRpcCall(async () => await market.outcomeTokenPool(0));
+        const pid1Amount = await retryRpcCall(async () => await market.outcomeTokenPool(1));
+        const total = pid0Amount + pid1Amount;
+        if (total > 0n) {
+          const p0 = Number((pid0Amount * 10000n) / total) / 100;
+          const p1 = Number((pid1Amount * 10000n) / total) / 100;
+          finalOdds = outcomeToBuy === 0 ? p0 : p1;
+          finalOppositeOdds = outcomeToBuy === 0 ? p1 : p0;
+          oddsChange = finalOdds - initialOdds;
+          oppositeOddsChange = finalOppositeOdds - initialOppositeOdds;
+        }
+      } catch (e) {
+        logWarn(wallet.address, '⚠️', `Failed to fetch fresh odds after trade: ${e?.message || e}`);
+      }
+
       logInfo(wallet.address, '✅', `Buy completed in block ${receipt.blockNumber}, gasUsed=${receipt.gasUsed}`);
+      logInfo(wallet.address, '⏱️', `[${marketAddress.substring(0, 8)}...] 🏁 TRADE COMPLETE: ${strategy} | Execution: ${executionTimeSec}s (${executionTimeMs}ms)`);
+      logInfo(wallet.address, '📊', `[${marketAddress.substring(0, 8)}...] ODDS IMPACT: Target side ${initialOdds}% → ${finalOdds}% (${oddsChange >= 0 ? '+' : ''}${oddsChange.toFixed(2)}%) | Opposite ${initialOppositeOdds}% → ${finalOppositeOdds}% (${oppositeOddsChange >= 0 ? '+' : ''}${oppositeOddsChange.toFixed(2)}%)`);
+      logInfo(wallet.address, '🕐', `[${marketAddress.substring(0, 8)}...] Timeline: Start ${executionStartISO} → End ${executionEndISO}`);
+      // =================================================
 
       const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
     // After buy, record cost basis with full metadata
@@ -2124,7 +2167,18 @@ async function runForWallet(wallet, provider) {
       marketDeadline: marketDeadline,
       txHash: buyTx.hash,
       blockNumber: receipt.blockNumber,
-      gasUsed: receipt.gasUsed.toString()
+      gasUsed: receipt.gasUsed.toString(),
+      // Timing and odds tracking
+      executionStartTime: executionStartISO,
+      executionEndTime: executionEndISO,
+      executionTimeMs: executionTimeMs,
+      executionTimeSec: parseFloat(executionTimeSec),
+      initialOdds: initialOdds,
+      finalOdds: finalOdds,
+      oddsChange: parseFloat(oddsChange.toFixed(2)),
+      initialOppositeOdds: initialOppositeOdds,
+      finalOppositeOdds: finalOppositeOdds,
+      oppositeOddsChange: parseFloat(oppositeOddsChange.toFixed(2))
     });
 
       // Try to confirm on-chain ERC1155 balance
