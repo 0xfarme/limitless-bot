@@ -3041,6 +3041,30 @@ async function runForWallet(wallet, provider) {
 
         logInfo(wallet.address, '🔍', `[${marketAddress.substring(0, 8)}...] lateHolding: ${lateHolding ? `outcome ${lateHolding.outcomeIndex}` : 'none'}, quickScalpHolding: ${quickScalpHolding ? `outcome ${quickScalpHolding.outcomeIndex}` : 'none'}, contrarianHolding: ${contrarianHolding ? `outcome ${contrarianHolding.outcomeIndex}` : 'none'}`);
 
+        // MOONSHOT CHECK: If we have a late position, check moonshot regardless of current odds
+        if (MOONSHOT_ENABLED && lateHolding && !hasMoonshotPosition(wallet.address, marketAddress)) {
+          const moonshotOutcome = lateHolding.outcomeIndex === 0 ? 1 : 0;
+          const moonshotOdds = prices[moonshotOutcome];
+          const lateOdds = prices[lateHolding.outcomeIndex];
+
+          if (moonshotOdds < MOONSHOT_MAX_ODDS) {
+            const moonshotStrategy = 'moonshot';
+            const moonshotInvestment = ethers.parseUnits(MOONSHOT_AMOUNT_USDC.toString(), decimals);
+
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] 🚀 MOONSHOT HEDGE! Late position: outcome ${lateHolding.outcomeIndex} @ ${lateOdds}% → Buying opposite outcome ${moonshotOutcome} @ ${moonshotOdds}% with $${MOONSHOT_AMOUNT_USDC} USDC`);
+
+            const usdcBal = await retryRpcCall(async () => await usdc.balanceOf(wallet.address));
+            if (usdcBal >= moonshotInvestment) {
+              await executeBuy(wallet, market, usdc, marketAddress, moonshotInvestment, moonshotOutcome, decimals, pid0, pid1, erc1155, moonshotStrategy, null, marketInfo, prices);
+              return; // Exit after moonshot
+            } else {
+              logWarn(wallet.address, '⚠️', `Insufficient USDC balance for moonshot. Need $${MOONSHOT_AMOUNT_USDC}, have ${ethers.formatUnits(usdcBal, decimals)}.`);
+            }
+          } else {
+            logInfo(wallet.address, '🌙', `[${marketAddress.substring(0, 8)}...] Moonshot check: opposite side at ${moonshotOdds}% (need < ${MOONSHOT_MAX_ODDS}%)`);
+          }
+        }
+
         // Check if we have a position on the same side late strategy would buy
         let hasPositionOnTargetSide = false;
         let existingPositionForMoonshot = null;
