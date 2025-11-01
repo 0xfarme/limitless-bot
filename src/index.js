@@ -1601,9 +1601,8 @@ async function runForWallet(wallet, provider) {
     }
 
     // Check if we need to fetch markets at all
-    const nowMinutes = new Date().getMinutes();
     const currentMinute = nowMinutes;
-    const inRedemptionWindow = AUTO_REDEEM_ENABLED && nowMinutes >= REDEEM_WINDOW_START && nowMinutes <= REDEEM_WINDOW_END;
+    // inRedemptionWindow already declared at line 1551, reuse it
 
     // Calculate remaining time for late strategy check
     const nowMs = Date.now();
